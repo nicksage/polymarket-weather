@@ -1,0 +1,86 @@
+
+Step 1: Provision DigitalOcean droplet
+
+- Ubuntu 22.04 LTS
+- 1 vCPU, 1GB RAM (sufficient for this bot)
+- Add your SSH key during setup
+
+
+Step 2: VPS setup script (deploy/setup.sh)
+
+#!/bin/bash
+# deploy/setup.sh — Run once on a fresh Ubuntu 22.04 VPS
+
+set -e
+
+# Update system
+apt-get update && apt-get upgrade -y
+
+# Install Python 3.10+
+apt-get install -y python3.11 python3.11-venv python3-pip git
+
+# Install Node.js for Claude Code
+curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+apt-get install -y nodejs
+
+# Install Claude Code globally
+npm install -g @anthropic-ai/claude-code
+
+# Create bot user (never run as root)
+useradd -m -s /bin/bash botuser
+usermod -aG sudo botuser
+
+# Create project directory
+mkdir -p /home/botuser/weather-arb-bot
+chown botuser:botuser /home/botuser/weather-arb-bot
+
+echo "VPS setup complete. Now:"
+echo "1. Copy your project files to /home/botuser/weather-arb-bot/"
+echo "2. Copy your .env file"
+echo "3. Run: cd /home/botuser/weather-arb-bot && pip install -r requirements.txt"
+echo "4. Run: sudo cp deploy/weather_bot.service /etc/systemd/system/"
+echo "5. Run: sudo systemctl enable weather_bot && sudo systemctl start weather_bot"
+
+
+Step 3: Systemd service file (deploy/weather_bot.service)
+
+[Unit]
+Description=Polymarket Weather Arbitrage Bot
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=botuser
+WorkingDirectory=/home/botuser/weather-arb-bot/bot
+EnvironmentFile=/home/botuser/weather-arb-bot/.env
+ExecStart=/home/botuser/weather-arb-bot/venv/bin/python main.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=weather-arb-bot
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/botuser/weather-arb-bot/bot/data
+ReadWritePaths=/home/botuser/weather-arb-bot/bot/logs
+
+[Install]
+WantedBy=multi-user.target
+
+
+Step 4: Monitor with journalctl
+
+# Follow live logs
+
+sudo journalctl -u weather-arb-bot -f
+
+# See last 100 lines
+sudo journalctl -u weather-arb-bot -n 100
+
+# Restart after code update
+sudo systemctl restart weather-arb-bot
