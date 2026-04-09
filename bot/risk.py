@@ -1,6 +1,5 @@
 import logging
 from datetime import datetime, timedelta
-
 from config import (
     MAX_POSITION_PCT,
     MAX_TOTAL_EXPOSURE_PCT,
@@ -26,6 +25,7 @@ class RiskCheck:
     def __repr__(self):
         return f"RiskCheck(passed={self.passed}, reason='{self.reason}')"
 
+
 def check_position_size(size_usdc: float, bankroll: float) -> RiskCheck:
     """
     Hard cap: no single position > MAX_POSITION_PCT of bankroll.
@@ -35,6 +35,7 @@ def check_position_size(size_usdc: float, bankroll: float) -> RiskCheck:
     if size_usdc > max_size:
         return RiskCheck(False, f"Position ${size_usdc:.2f} exceeds max ${max_size:.2f}")
     return RiskCheck(True)
+
 
 def check_total_exposure(new_position_size: float, bankroll: float) -> RiskCheck:
     """
@@ -51,6 +52,7 @@ def check_total_exposure(new_position_size: float, bankroll: float) -> RiskCheck
             f"would exceed {MAX_TOTAL_EXPOSURE_PCT*100:.0f}% of bankroll"
         )
     return RiskCheck(True)
+
 
 def check_time_to_expiry(resolution_date_str: str) -> RiskCheck:
     """
@@ -72,6 +74,7 @@ def check_time_to_expiry(resolution_date_str: str) -> RiskCheck:
         # If we can't parse the date, skip the contract
         return RiskCheck(False, "Could not parse resolution date")
 
+
 def check_liquidity(liquidity_usd: float) -> RiskCheck:
     """
     Skip contracts with less than MIN_LIQUIDITY_USD in the order book.
@@ -83,6 +86,7 @@ def check_liquidity(liquidity_usd: float) -> RiskCheck:
             f"Liquidity ${liquidity_usd:.0f} below minimum ${MIN_LIQUIDITY_USD:.0f}"
         )
     return RiskCheck(True)
+
 
 def check_model_disagreement(disagreement: float) -> RiskCheck:
     """
@@ -96,6 +100,7 @@ def check_model_disagreement(disagreement: float) -> RiskCheck:
             f"Model disagreement {disagreement:.3f} > {MAX_SOURCE_DISAGREEMENT:.3f}"
         )
     return RiskCheck(True)
+
 
 def check_daily_drawdown(bankroll: float) -> RiskCheck:
     """
@@ -111,6 +116,7 @@ def check_daily_drawdown(bankroll: float) -> RiskCheck:
             f"{MAX_DAILY_DRAWDOWN_PCT*100:.0f}% of bankroll (${MAX_DAILY_DRAWDOWN_PCT*bankroll:.2f})"
         )
     return RiskCheck(True)
+
 
 def run_all_checks(signal: dict, bankroll: float) -> tuple[bool, list[str]]:
     """
@@ -138,8 +144,7 @@ def run_all_checks(signal: dict, bankroll: float) -> tuple[bool, list[str]]:
     for check in checks:
         if not check:
             failures.append(check.reason)
-            logger.info(f"Risk check FAILED for {signal.get('contract_id', 'unknown')}: {check.
-              reason}")
+            logger.info(f"Risk check FAILED for {signal.get('contract_id', 'unknown')}: {check.reason}")
 
     all_passed = len(failures) == 0
     if all_passed:

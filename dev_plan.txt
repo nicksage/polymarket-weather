@@ -1,0 +1,50 @@
+#########################################################################################
+UPDATES / DETAILS:
+
+1. Exit position logic/position monitoring - 
+-----------------------------------------------------------------------------------------
+> This is a gap in the current code. There is no position monitoring loop. Polymarket weather contracts are binary and self-resolving — when the resolution date passes, the contract settles at 1.0 (YES wins) or 0.0 (NO wins), and your USDC is returned automatically on-chain. The bot doesn't need to send an exit order.
+> update_position_outcome() in db.py exists to record the exit price, exit time, and P&L
+> This function is not used yet, nobody calls it — there is no resolver/monitor loop that checks contract outcomes and updates the DB. This is a missing piece.
+
+Short answer: positions are not monitored after entry. There is no loop, scheduler job, or resolver that:
+
+Checks whether a contract has resolved
+Reads the final outcome from the CLOB API
+Calls update_position_outcome() to close the position in the DB
+What exists:
+
+get_open_positions() in db.py — fetches all status='open' rows (used by risk.py for exposure calculations)
+update_position_outcome() in db.py — ready to close a position given exit_price, exit_time, pnl
+get_open_orders() in execution.py — fetches live orders from CLOB API
+What's missing: a resolver.py or scheduled job that polls open positions, checks Polymarket for resolution status, and calls update_position_outcome(). This is the next critical feature to build.
+
+
+
+#########################################################################################
+KNOWN ISSUES:
+1. parse_contract_metadata() only handles ~12 US cities. It needs geocoding API integration. international markets (Shanghai, Tokyo, Paris) will get None from NWS and rely solely on Open-Meteo + NOAA
+2. Brier score weights in config are hardcoded defaults, not calibrated from real data yet.
+3. get_noaa_probability() uses base rates, not actual forecasts (NOAA doesn't offer free forecasts).
+4. No position resolver — open positions are never closed in the DB
+5. No outcome tracking — signals.outcome and signals.pnl are never written after resolution
+
+#########################################################################################
+TO DO LIST: 
+1: Integrate the update_position_outcome() function for exit/update logic
+2. Update the 
+
+
+#########################################################################################
+QUESTIONS: 
+1. How does APScheduler work?
+2. How is ensemble probability calculated?
+3. Does get_bankroll() read from money in Polymarket account, or the set amount in .env file?
+4. List of known cities in CITY_COORDS (Shanghai, London, Tokyo, etc.) seems limited and is listed as know issue. How to resolve?
+5. Where are disgreement edge threshood stored?
+
+
+#########################################################################################
+
+
+

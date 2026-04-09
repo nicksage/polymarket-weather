@@ -1,0 +1,30 @@
+
+INITIAL SETUP 
+
+[ ] 1. npm install -g @anthropic-ai/claude-code
+[ ] 2. mkdir ~/weather-arb-bot && cd ~/weather-arb-bot && claude
+[ ] 3. Prompt Claude Code: "Scaffold a Python project structure with bot/, tests/, deploy/ directories and create an empty requirements.txt"
+[ ] 4. Use the prompts in Section 2 to build each module in order: config.py -> db.py -> weather.py -> polymarket.py -> edge.py -> sizing.py -> execution.py -> risk.py -> main.py -> dashboard.py
+[ ] 5. Get NOAA API token (free, 2 minutes): https://www.ncdc.noaa.gov/cdo-web/token
+[ ] 6. Copy .env.example to .env, set PAPER_TRADE=True, add NOAA token
+[ ] 7. pip install -r requirements.txt
+[ ] 8. python main.py --dry-run (verify no crashes, check logs/)
+[ ] 9. streamlit run bot/dashboard.py (verify dashboard loads)
+[ ] 10. Let bot run in paper mode for 2 weeks, review signals vs outcomes
+[ ] 11. If Brier score < 0.20 on paper trades, consider enabling live trading with small bankroll
+[ ] 12. Set PAPER_TRADE=False, BANKROLL_USDC=100 for live testing with real but small capital
+
+HOW TO RUN BOT & DASHBOARD:
+
+# full both with scheduler
+python main.py
+
+# single run then exit
+python main.py --dry-run
+
+# start monitoring UI
+streamlit run dashboard.py
+streamlit run dashboard.py --server.port 8501
+
+# run all tests
+pytest ../tests/

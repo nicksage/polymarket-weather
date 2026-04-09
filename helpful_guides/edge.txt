@@ -1,0 +1,41 @@
+
+model_p, market_p, and ev — Plain English
+market_p — What the crowd thinks
+This is the current YES price on Polymarket, expressed as a probability.
+
+If market_p = 0.43, that means the market collectively believes there is a 43% chance the event happens (e.g., "29°C or higher in Shanghai today").
+
+It's directly readable as a probability because Polymarket is a binary market — a YES share costs $0.43 and pays $1.00 if it resolves YES. The price is the implied probability.
+
+model_p — What the weather models think
+This is your ensemble forecast — the weighted blend of NWS, Open-Meteo, NOAA, and Tomorrow.io — expressed as a probability of the same event.
+
+If model_p = 0.72, your weather models collectively say there is a 72% chance the event happens.
+
+ev — Expected profit per dollar wagered
+EV (Expected Value) is how much you expect to make per $1 bet, given the gap between your model and the market.
+
+model says 72%, market prices it at 43% → bet YES
+EV = 0.72 × (1 - 0.43) - 0.28 × 0.43
+   = 0.72 × 0.57  -  0.28 × 0.43
+   = 0.410        -  0.120
+   = +0.29
+An EV of +0.29 means: for every $1 wagered, you expect to profit $0.29 on average over many trades.
+
+Reading a signal as "what are the chances of X happening?"
+Yes — this framing is exactly right, and these numbers map directly to it:
+
+Contract:    "Will Shanghai reach 29°C or higher on April 9?"
+
+market_p  =  0.43  →  "The crowd says 43% chance YES"
+model_p   =  0.72  →  "Your weather models say 72% chance YES"
+edge      =  0.29  →  "You think the market is underpricing this by 29pp"
+ev        =  0.29  →  "You expect +$0.29 profit per $1 bet on YES"
+signal    =  BUY YES
+
+The entire bet is: "I think X is more likely to happen than the market believes."
+
+When model_p > market_p → bet YES (market underestimates the chance it happens)
+When model_p < market_p → bet NO (market overestimates the chance it happens)
+
+The edge threshold (EDGE_THRESHOLD=0.07) means you only act when the disagreement is ≥ 7 percentage points — small gaps aren't worth the transaction cost and model noise.

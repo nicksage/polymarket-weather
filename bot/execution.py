@@ -113,6 +113,7 @@ def execute_signal(signal: dict, client: ClobClient | None = None) -> dict:
     
     return result
 
+
 def cancel_order(order_id: str, client: ClobClient) -> bool:
     """Cancel an open order by ID."""
     if PAPER_TRADE:

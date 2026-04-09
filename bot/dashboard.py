@@ -6,14 +6,16 @@ import plotly.express as px
 import plotly.graph_objects as go
 from config import DB_PATH
 
-'''
+"""
+#########################################
 
 Running the Dashboard
 
 cd ~/weather-arb-bot/bot
-streamlit run dashboard.py --server.port 8501\
+streamlit run dashboard.py --server.port 8501
 
-'''
+#########################################
+"""
 
 st.set_page_config(
     page_title="Weather Arb Dashboard",
@@ -30,12 +32,14 @@ def load_signals() -> pd.DataFrame:
     conn.close()
     return df
 
+
 @st.cache_data(ttl=60)
 def load_positions() -> pd.DataFrame:
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql("SELECT * FROM positions ORDER BY entry_time DESC", conn)
     conn.close()
     return df
+
 
 # Load data
 signals_df = load_signals()

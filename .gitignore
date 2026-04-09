@@ -1,0 +1,32 @@
+.gitignore
+
+# Environment and secrets
+.env
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Data and logs
+bot/data/
+logs/
+*.db
+*.log
+
+SHIESTY FINANCE
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

@@ -6,44 +6,52 @@ from datetime import datetime
 
 from config import LOG_LEVEL, PAPER_TRADE, DB_PATH
 from db import init_db
-from core_weather.edge import run_edge_scan
-from core_weather.edgerisk import run_all_checks
-from core_weather.edgeexecution import get_clob_client, execute_signal
-from core_weather.edgesizing import get_bankroll
+from edge import run_edge_scan
+from risk import run_all_checks
+from execution import get_clob_client, execute_signal
+from sizing import get_bankroll
+
+# Ensure logs directory exists before FileHandler is created
+os.makedirs("logs", exist_ok=True)
 
 # Configure structured logging
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s",
-    handlers=[        
+    handlers=[
         logging.StreamHandler(),
         logging.FileHandler("logs/bot.log"),
     ],
 )
 logger = logging.getLogger("main")
 
-def discovery_run():
+
+def discovery_run() -> list[dict]:
     """
-    Run every 4 hours: scan for new weather markets and add to watchlist.
+    Run every 4 hours: fetch active weather markets from Polymarket.
+    Returns the market list so trading_run can reuse it without a second API call.
     """
     logger.info("=== DISCOVERY RUN START ===")
-    from bot.polymarket import search_weather_markets
-    markets = search_weather_markets()
+    from polymarket import search_weather_markets
+    from config import MIN_LIQUIDITY_USD
+    markets = search_weather_markets(min_liquidity=MIN_LIQUIDITY_USD)
     logger.info(f"Discovery: found {len(markets)} active weather markets")
     logger.info("=== DISCOVERY RUN END ===")
+    return markets
 
-def trading_run():
+
+def trading_run(contracts: list[dict] | None = None):
     """
     Run every 30 minutes: analyze all markets, execute signals that pass risk checks.
-    This is the main loop of the bot.
+    Accepts a pre-fetched contracts list to avoid a redundant Gamma API call.
     """
     logger.info("=== TRADING RUN START ===")
 
     bankroll = get_bankroll()
     logger.info(f"Current bankroll: ${bankroll:.2f} | Paper trade: {PAPER_TRADE}")
 
-    # Step 1: Generate signals
-    signals = run_edge_scan(bankroll=bankroll)
+    # Step 1: Generate signals (reuse pre-fetched contracts if available)
+    signals = run_edge_scan(bankroll=bankroll, contracts=contracts)
     logger.info(f"Generated {len(signals)} signals")
 
     # Step 2: Initialize CLOB client (None in paper mode)
@@ -77,6 +85,7 @@ def trading_run():
     logger.info(f"Trading run complete: {executed} executed, {skipped} skipped by risk rules")
     logger.info("=== TRADING RUN END ===")
 
+
 def main():
     """Start the bot and scheduling loop."""
     logger.info("Weather arbitrage bot starting up")
@@ -86,12 +95,9 @@ def main():
     # Initialize database
     init_db()
 
-    # Create logs directory
-    os.makedirs("logs", exist_ok=True)
-
-    # Run once immediately on startup
-    discovery_run()
-    trading_run()
+    # Run once immediately on startup — fetch markets once, share with trading run
+    contracts = discovery_run()
+    trading_run(contracts=contracts)
 
     # Schedule recurring runs
     scheduler = BlockingScheduler()

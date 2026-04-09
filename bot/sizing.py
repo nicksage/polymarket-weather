@@ -4,6 +4,31 @@ from config import KELLY_FRACTION, MAX_POSITION_PCT
 
 logger = logging.getLogger(__name__)
 
+'''
+#########################################
+Section 6: Kelly Criterion Position Sizing
+
+
+The Kelly Criterion is a formula for optimal bet sizing that maximizes long-term bankroll growth.
+For a binary outcome with edge e and decimal odds b:
+
+Kelly fraction = (b*p - q) / b
+               = (b*p - (1-p)) / b
+
+Where:
+q = 1 - p
+p = your probability of winning
+b = net odds (payout per dollar risked — for a $0.60 YES share, b = 0.40/0.60 = 0.667)
+
+Rule of thumb: use 1/4 Kelly as default. If your model has been running for 3+ months with a
+documented Brier score, consider moving to 1/2 Kelly.
+
+Full Kelly is aggressive. Model uncertainty means your p estimate could be wrong. Using 1/4
+Kelly (betting 25% of the theoretical optimal) dramatically reduces variance while preserving
+most of the long-term growth.
+#########################################
+'''
+
 
 def calculate_kelly_size(edge: float, odds: float, bankroll: float) -> float:
     """
@@ -68,6 +93,7 @@ def calculate_kelly_size(edge: float, odds: float, bankroll: float) -> float:
 
     # Round to nearest dollar, minimum $1
     return max(1.0, round(position_size, 2))
+
 
 def get_bankroll(db_path: str | None = None) -> float:
     """

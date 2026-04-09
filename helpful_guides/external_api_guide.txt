@@ -1,0 +1,115 @@
+
+#########################################################################################
+
+External Weather APIs — Data Flow
+
+Source	
+Data Fetched
+Weight
+How Used
+
+-----------------------------------------------------------------------------------------
+source: NWS (api.weather.gov)	
+-----------------------------------------------------------------------------------------
+data fetched: probability of precipitation (PoP) from forecast periods; daytime high temperature, 
+weight: highest weight (0.40)
+use case: authoritative because many Polymarket contracts resolve against NWS official records
+
+-----------------------------------------------------------------------------------------
+source: Open-Meteo Ensemble (ensemble-api.open-meteo.com)	
+-----------------------------------------------------------------------------------------
+data fetched: 51 ECMWF ensemble member forecasts; fraction predicting rain/snow/temp above threshold	
+weight: 0.35
+use case: direct probabilistic output, most calibrated
+
+-----------------------------------------------------------------------------------------
+source: Open-Meteo Deterministic (fallback)	
+-----------------------------------------------------------------------------------------
+data fetched: precipitation_probability_max, snowfall_sum, temperature_2m_max/min	
+weight: 0.25
+use case: used when ensemble endpoint fails
+
+-----------------------------------------------------------------------------------------
+source: NOAA CDO (ncdc.noaa.gov)	
+-----------------------------------------------------------------------------------------
+data fetched: 10 years of historical PRCP/SNOW/TMAX/TMIN for same calendar day	
+weight: 0.15
+use case: limatological base rate, sanity check
+
+-----------------------------------------------------------------------------------------
+source: Tomorrow.io (api.tomorrow.io) | https://docs.tomorrow.io/reference/welcome
+-----------------------------------------------------------------------------------------
+data fetched: precipitationProbability, snowAccumulation, temperatureMax/Min	
+weight: 0.10
+use case: only called if TOMORROWIO_API_KEY is set
+
+
+#########################################################################################
+
+How is this information used to ultimately make a decision?
+
+ensemble_p = Σ(source_probability × brier_weight) / Σ(brier_weight)
+disagreement = stdev([p1, p2, p3, p4])  # if > 0.15, skip the contract
+
+The result is a single probability (0–1) representing the ensemble's best estimate of whether the weather event occurs.
+
+
+What Are the Weather APIs Actually Returning?
+This is the most important thing to understand, because the current code gets this wrong.
+
+The APIs return raw forecast values (temperatures in °C, precipitation in mm). They do not return the probability of reaching a specific threshold. Your bot must compute that probability itself.
+
+Here is what each source actually provides and how it becomes a probability:
+
+Open-Meteo Ensemble — 39 independent model runs ("members")
+
+Each member is a separate simulation of the atmosphere with slightly different starting conditions. The ensemble API returns 39 separate temperature or precipitation forecasts:
+
+
+temperature_2m_max_member01: [19.8°C]
+temperature_2m_max_member02: [22.4°C]
+temperature_2m_max_member03: [20.1°C]
+... 39 members total
+The contract asks: "Will Shanghai reach 29°C or higher?"
+
+Your bot computes: P(temp ≥ 29°C) = members_above_29 / 39
+
+If 7 of 39 members forecast ≥ 29°C: prob = 7/39 = 0.18
+
+This is the single most important fix — the current code uses a median split which by definition always gives ~0.5 regardless of what the members actually say.
+
+NWS — the one exception: it does return a probability directly
+
+NWS returns probabilityOfPrecipitation as a value 0–100. This is already a calibrated probability — P(any measurable precip). Your bot just divides by 100. No threshold comparison needed for rain/snow markets. For temperature markets NWS returns a point estimate (e.g., "High: 72°F"), which must be converted to a soft probability using the uncertainty model from Change 6.
+
+NOAA CDO — historical base rates, not a forecast
+
+NOAA doesn't predict anything. It returns 10 years of past observations for the same calendar day at the nearest station. Your bot computes the historical frequency:
+
+
+"How often has Shanghai hit 29°C+ on April 9 in the last 10 years?"
+→ 6 out of 10 years → historical_prob = 0.60
+This is a climatological prior — it tells you what's normal, not what tomorrow's weather will be. It carries the lowest weight (0.15) for this reason.
+
+Tomorrow.io — returns probability directly for precipitation, point estimate for temperature
+
+precipitationProbability is already a 0–100 value (same as NWS). For temperature it returns temperatureMax which requires the same threshold comparison as Open-Meteo.
+
+The Full Picture
+
+Contract: "Will Shanghai reach 29°C or higher on April 9?"
+threshold = 29.0°C
+
+Open-Meteo ensemble  → 39 member forecasts → P(any member ≥ 29°C) = 0.18  weight 0.35
+NOAA historical      → 10yr base rate      → P(historical ≥ 29°C) = 0.60  weight 0.15
+NWS                  → US only, skip       →                                weight 0.00
+Tomorrow.io          → tempMax = 24.2°C   → soft prob via delta formula    weight 0.10
+
+ensemble_p = (0.18×0.35 + 0.60×0.15 + soft×0.10) / (0.35 + 0.15 + 0.10)
+           = weighted average = ~0.31
+
+market_p = 0.43  (Polymarket YES price)
+edge     = 0.31 - 0.43 = -0.12  → bet NO
+
+
+#########################################################################################

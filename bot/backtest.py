@@ -1,18 +1,19 @@
 
-'''
+"""
+#########################################
 
 Use the Polymarket Gamma API's historical endpoint to pull resolved weather contracts, then
-test whether your model would have found edge
+test whether your model would have found edge.
 
-'''
+#########################################
+"""
 
-# backtest.py
 import httpx
 import json
 import logging
 from datetime import date, timedelta
 from weather import get_ensemble_probability
-from bot.polymarket import _normalize_market, parse_contract_metadata
+from polymarket import _normalize_market, parse_contract_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +73,6 @@ def backtest_contract(contract: dict) -> dict | None:
 
     p_model = ensemble["probability"]
 
-
     # Market price at time of analysis (use opening price as proxy)
     p_market = contract.get("yes_price", 0.5)
 
@@ -116,6 +116,7 @@ def backtest_contract(contract: dict) -> dict | None:
         "pnl": round(pnl, 4),
         "had_signal": abs(edge) > 0.07,
     }
+
 
 def run_backtest(days_back: int = 90) -> dict:
     """
