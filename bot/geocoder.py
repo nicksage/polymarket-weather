@@ -42,7 +42,10 @@ def get_coordinates(city_name: str) -> tuple[float, float] | None:
 
         r = results[0]
         coords = (float(r["latitude"]), float(r["longitude"]))
-        logger.debug(f"Geocoding: '{city_name}' → {coords} ({r.get('country', '')})")
+        logger.info(
+            f"Geocoding API call for '{city_name}' was successful — "
+            f"resolved to ({coords[0]:.4f}, {coords[1]:.4f}), {r.get('country', '')}"
+        )
         _cache[key] = coords
         return coords
 

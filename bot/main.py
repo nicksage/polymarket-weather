@@ -14,7 +14,6 @@ from sizing import get_bankroll
 # Ensure logs directory exists before FileHandler is created
 os.makedirs("logs", exist_ok=True)
 
-# Configure structured logging
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s",
@@ -25,48 +24,67 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
+# Silence httpx's raw "HTTP Request: GET ..." lines — we log descriptive
+# plain-English messages at each call site instead.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 
 def discovery_run() -> list[dict]:
     """
-    Run every 4 hours: fetch active weather markets from Polymarket.
-    Returns the market list so trading_run can reuse it without a second API call.
+    Run every 4 hours: discover all active highest-temperature events.
+    Returns the event list so trading_run can reuse it without a second API call.
     """
     logger.info("=== DISCOVERY RUN START ===")
-    from polymarket import search_weather_markets
+    from polymarket import search_temp_high_events
     from config import MIN_LIQUIDITY_USD
-    markets = search_weather_markets(min_liquidity=MIN_LIQUIDITY_USD)
-    logger.info(f"Discovery: found {len(markets)} active weather markets")
+    events = search_temp_high_events(min_liquidity=MIN_LIQUIDITY_USD)
+    logger.info(f"Discovery: found {len(events)} highest-temperature events")
     logger.info("=== DISCOVERY RUN END ===")
-    return markets
+    return events
 
 
-def trading_run(contracts: list[dict] | None = None):
+def trading_run(events: list[dict] | None = None):
     """
-    Run every 30 minutes: analyze all markets, execute signals that pass risk checks.
-    Accepts a pre-fetched contracts list to avoid a redundant Gamma API call.
+    Run every 30 minutes: analyze all events, execute signals that pass risk checks.
+
+    Accepts a pre-fetched events list to avoid a redundant Gamma API call.
+    Both the full event analysis and the filtered signals list are returned
+    from run_edge_scan(); signals are passed through risk.py → execution.py.
     """
     logger.info("=== TRADING RUN START ===")
 
-    bankroll = get_bankroll()
-    logger.info(f"Current bankroll: ${bankroll:.2f} | Paper trade: {PAPER_TRADE}")
+    # Record bias data for any resolved contracts whose ERA5 actuals are now
+    # available (target_date <= today - 5 days).  Runs cheaply — most calls
+    # return 0 new records after the first week of operation.
+    try:
+        from bias import record_resolved_contracts, log_bias_summary
+        new_records = record_resolved_contracts()
+        if new_records > 0:
+            log_bias_summary()
+    except Exception as e:
+        logger.warning(f"Bias recorder failed (non-fatal): {e}")
 
-    # Step 1: Generate signals (reuse pre-fetched contracts if available)
-    signals = run_edge_scan(bankroll=bankroll, contracts=contracts)
-    logger.info(f"Generated {len(signals)} signals")
+    bankroll = get_bankroll()
+    logger.info(f"Bankroll: ${bankroll:.2f} | Paper trade: {PAPER_TRADE}")
+
+    # Step 1: Analyze all events, generate signals
+    all_events, signals = run_edge_scan(bankroll=bankroll, events=events)
+    logger.info(f"Analyzed {len(all_events)} events → {len(signals)} raw signals")
 
     # Step 2: Initialize CLOB client (None in paper mode)
     client = get_clob_client()
 
-    # Step 3: Filter by risk rules and execute
+    # Step 3: Risk filter and execute
     executed = 0
-    skipped = 0
+    skipped  = 0
 
     for signal in signals:
         passed, failures = run_all_checks(signal, bankroll)
 
         if not passed:
             logger.info(
-                f"Signal {signal['contract_id'][:12]} skipped: {'; '.join(failures)}"
+                f"Signal skipped [{signal.get('city')} {signal.get('date')} "
+                f"{signal.get('question', '')[:30]}]: {'; '.join(failures)}"
             )
             skipped += 1
             continue
@@ -77,49 +95,55 @@ def trading_run(contracts: list[dict] | None = None):
             executed += 1
             logger.info(
                 f"Executed: {signal['recommended_side']} ${signal['kelly_size']:.2f} "
-                f"on {signal['contract_id'][:12]} | status={result['status']}"
+                f"on {signal['contract_id'][:12]} "
+                f"[{signal.get('city')} {signal.get('question', '')[:20]}] "
+                f"| status={result['status']}"
             )
         else:
-            logger.error(f"Execution failed for {signal['contract_id'][:12]}: {result}")
+            logger.error(
+                f"Execution failed for {signal.get('contract_id', '')[:12]}: {result}"
+            )
 
-    logger.info(f"Trading run complete: {executed} executed, {skipped} skipped by risk rules")
+    logger.info(
+        f"Trading run complete: {executed} executed, {skipped} skipped by risk rules"
+    )
     logger.info("=== TRADING RUN END ===")
 
 
 def main():
-    """Start the bot and scheduling loop."""
-    logger.info("Weather arbitrage bot starting up")
+    logger.info("Highest-temperature arbitrage bot starting up")
     logger.info(f"Paper trade mode: {PAPER_TRADE}")
     logger.info(f"Database: {DB_PATH}")
 
-    # Initialize database
     init_db()
 
-    # Run once immediately on startup — fetch markets once, share with trading run
-    contracts = discovery_run()
-    trading_run(contracts=contracts)
+    # Run once immediately on startup
+    events = discovery_run()
+    trading_run(events=events)
 
-    # Schedule recurring runs
     scheduler = BlockingScheduler()
 
-    # Market analysis every 30 minutes
+    # Market analysis every 30 minutes (reuses cached discovery results)
     scheduler.add_job(
         trading_run,
         trigger=IntervalTrigger(minutes=30),
         id="trading_run",
         name="Trading scan",
-        misfire_grace_time=300,  # Allow up to 5 min late start
+        misfire_grace_time=300,
     )
 
-   # Market discovery every 4 hours
+    # Fresh market discovery every 4 hours (new events may appear)
+    def _discovery_then_trade():
+        fresh_events = discovery_run()
+        trading_run(events=fresh_events)
+
     scheduler.add_job(
-        discovery_run,
+        _discovery_then_trade,
         trigger=IntervalTrigger(hours=4),
         id="discovery_run",
-        name="Market discovery",
-        misfire_grace_time=600,  # Allow up to 10 min late start
+        name="Market discovery + trade",
+        misfire_grace_time=600,
     )
-
 
     try:
         scheduler.start()
@@ -128,6 +152,7 @@ def main():
     except Exception as e:
         logger.exception(f"Bot crashed: {e}")
         raise
+
 
 if __name__ == "__main__":
     main()

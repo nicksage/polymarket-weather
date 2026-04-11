@@ -22,3 +22,13 @@ pytest-mock>=3.14.0
 streamlit>=1.35.0
 plotly>=5.22.0
 pandas>=2.2.0
+
+# Probability / statistics (temperature distribution modeling)
+scipy>=1.13.0
+numpy>=1.26.0
+
+# NOAA NBM quantile forecasts (US cities only)
+# Requires system-level eccodes: brew install eccodes (macOS) or apt install libeccodes-dev (Linux)
+# Install with: pip install herbie-data
+# If not installed, NOAA NBM source is skipped gracefully — Open-Meteo ensemble is used instead.
+herbie-data>=2024.3.0

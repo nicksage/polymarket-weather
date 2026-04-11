@@ -1,251 +1,400 @@
+"""
+edge.py — Signal generation for highest-temperature Polymarket contracts.
+
+Operates at the EVENT level: each Polymarket "Highest temperature in X on Y"
+event contains multiple mutually-exclusive outcome ranges.  For each event we:
+    1. Fetch the temperature distribution N(μ, σ) from weather.py
+    2. Compute model_prob[i] = P(T_max in range_i) for every outcome bin
+    3. Normalize so model probs sum to 1.0
+    4. Compare each model_prob[i] to the market's yes_price[i]
+    5. Flag outcomes where |edge| > EDGE_THRESHOLD as signals
+
+run_edge_scan() returns BOTH:
+    - all_events:  full analysis for every discovered event (dashboard Tab 1)
+    - signals:     only outcome-level dicts with is_signal=True (execution + Tab 2)
+
+Signal dict schema (one per outcome):
+    contract_id, question, range_low, range_high, unit,
+    market_price, model_prob, raw_model_prob, ev, edge,
+    recommended_side, kelly_size, is_signal,
+    yes_token_id, no_token_id, liquidity_usd, volume_usd,
+    city, date, lat, lon, event_id, event_title, scan_timestamp
+"""
+
 import logging
-from datetime import datetime, date, timedelta
-from config import EDGE_THRESHOLD, MIN_LIQUIDITY_USD, MAX_FORECAST_DAYS
-from weather import get_ensemble_probability, clear_forecast_cache, reset_tomorrowio_limit
-from polymarket import search_weather_markets, parse_contract_metadata
-from db import insert_signal
+from datetime import datetime, date
+from config import EDGE_THRESHOLD, MIN_LIQUIDITY_USD, MAX_FORECAST_DAYS, NORM_WARNING_LOW, NORM_WARNING_HIGH
+from weather import (
+    get_temp_distribution_for_event,
+    get_temp_range_probability,
+    clear_forecast_cache,
+    reset_tomorrowio_limit,
+)
+from polymarket import search_temp_high_events
+from db import (
+    insert_temp_event, insert_temp_outcome,
+    insert_signal,
+)
 from sizing import calculate_kelly_size
-
-'''
-
-model_p, market_p, and ev — Plain English
-market_p — What the crowd thinks
-This is the current YES price on Polymarket, expressed as a probability.
-
-If market_p = 0.43, that means the market collectively believes there is a 43% chance the event happens (e.g., "29°C or higher in Shanghai today").
-
-It's directly readable as a probability because Polymarket is a binary market — a YES share costs $0.43 and pays $1.00 if it resolves YES. The price is the implied probability.
-
-model_p — What the weather models think
-This is your ensemble forecast — the weighted blend of NWS, Open-Meteo, NOAA, and Tomorrow.io — expressed as a probability of the same event.
-
-If model_p = 0.72, your weather models collectively say there is a 72% chance the event happens.
-
-ev — Expected profit per dollar wagered
-EV (Expected Value) is how much you expect to make per $1 bet, given the gap between your model and the market.
-
-model says 72%, market prices it at 43% → bet YES
-EV = 0.72 × (1 - 0.43) - 0.28 × 0.43
-   = 0.72 × 0.57  -  0.28 × 0.43
-   = 0.410        -  0.120
-   = +0.29
-An EV of +0.29 means: for every $1 wagered, you expect to profit $0.29 on average over many trades.
-
-Reading a signal as "what are the chances of X happening?"
-Yes — this framing is exactly right, and these numbers map directly to it:
-
-Contract:    "Will Shanghai reach 29°C or higher on April 9?"
-
-market_p  =  0.43  →  "The crowd says 43% chance YES"
-model_p   =  0.72  →  "Your weather models say 72% chance YES"
-edge      =  0.29  →  "You think the market is underpricing this by 29pp"
-ev        =  0.29  →  "You expect +$0.29 profit per $1 bet on YES"
-signal    =  BUY YES
-
-The entire bet is: "I think X is more likely to happen than the market believes."
-
-When model_p > market_p → bet YES (market underestimates the chance it happens)
-When model_p < market_p → bet NO (market overestimates the chance it happens)
-
-The edge threshold (EDGE_THRESHOLD=0.07) means you only act when the disagreement is ≥ 7 percentage points — small gaps aren't worth the transaction cost and model noise.
-
-'''
 
 logger = logging.getLogger(__name__)
 
-def calculate_ev(p_model: float, p_market: float, side: str) -> float:
-    """
-    Calculate expected value per dollar wagered.
-    For YES: EV = p_model * (1 - p_market) - (1 - p_model) * p_market
-    For NO:  EV = (1 - p_model) * p_model - p_model * (1 - p_market)
 
-    A positive EV means the bet is favorable at current market prices.
-    EV of 0.10 means you expect to profit $0.10 for every $1.00 wagered.
+# ---------------------------------------------------------------------------
+# EV calculation
+# ---------------------------------------------------------------------------
+
+def _calculate_ev(model_prob: float, market_price: float, side: str) -> float:
+    """
+    Expected value per dollar wagered on the given side.
+
+    YES: EV = model_prob * (1 - market_price) - (1 - model_prob) * market_price
+    NO:  EV = (1 - model_prob) * market_price - model_prob * (1 - market_price)
     """
     if side == "YES":
-        return p_model * (1 - p_market) - (1 - p_model) * p_market
-    elif side == "NO":
-        # If we think p_model is LOW, we want to buy NO at no_price = 1 - p_market
-        p_no_model = 1 - p_model
-        p_no_market = 1 - p_market
+        return model_prob * (1 - market_price) - (1 - model_prob) * market_price
+    else:
+        p_no_model  = 1 - model_prob
+        p_no_market = 1 - market_price
         return p_no_model * (1 - p_no_market) - (1 - p_no_model) * p_no_market
-    else:
-        raise ValueError(f"Invalid side: {side}")
 
 
-def determine_side(p_model: float, p_market: float) -> tuple[str, float]:
+# ---------------------------------------------------------------------------
+# Event-level analysis
+# ---------------------------------------------------------------------------
+
+def analyze_temp_event(event: dict, bankroll: float) -> dict | None:
     """
-    Determine which side to trade and the edge magnitude.
-    Returns (side, edge) where edge = |p_model - p_market|
+    Full analysis pipeline for a single highest-temperature event.
+
+    Returns an event-level analysis dict containing a list of outcome dicts,
+    or None if the forecast distribution could not be obtained.
+
+    The returned dict has the same top-level keys as event, plus:
+        forecast_mu_c, forecast_sigma_c, clim_mu_c, clim_sigma_c,
+        days_ahead, model_probs_sum, normalization_warning,
+        market_overround, n_sources, forecast_mu_display, display_unit
+    Each outcome in event["outcomes"] gets additional fields:
+        model_prob, raw_model_prob, ev, edge, recommended_side,
+        kelly_size, is_signal, market_price (alias for yes_price)
     """
-    edge = p_model - p_market
-    if edge > 0:
-        return "YES", abs(edge)
-    else:
-        return "NO", abs(edge)
+    city       = event.get("city", "")
+    date_str   = event.get("date")
+    lat        = event.get("lat")
+    lon        = event.get("lon")
+    display_unit = event.get("display_unit", "celsius")
 
-
-def analyze_contract(contract: dict, bankroll: float = 1000.0) -> dict | None:
-    """
-    Full analysis pipeline for a single Polymarket weather contract.
-
-    1. Parse meteorological parameters from contract question
-    2. Fetch ensemble weather probability
-    3. Compare to market implied probability
-    4. Calculate EV and Kelly size
-    5. Return signal dict if edge exceeds threshold, else None
-
-    Returns a signal dict or None if no edge or parsing failed.
-    """
-    
-    contract_id = contract.get("contract_id")
-    question = contract.get("question", "")
-
-    # Step 1: Parse what the contract is asking
-    metadata = parse_contract_metadata(contract)
-    if not metadata:
-        logger.debug(f"Could not parse metadata for: {question[:80]}")
+    if not date_str or lat is None or lon is None:
         return None
 
-    # Check contract is not expiring too soon (< 6 hours) or too far out (> MAX_FORECAST_DAYS)
+    # Guard: skip events outside the reliable forecast window
     try:
-        resolution_date = date.fromisoformat(metadata["date"])
-        now = datetime.now()
-        hours_to_expiry = (
-            datetime.combine(resolution_date, datetime.max.time()) - now
-        ).total_seconds() / 3600
-        days_to_expiry = hours_to_expiry / 24
+        days_ahead = (date.fromisoformat(date_str) - date.today()).days
+    except ValueError:
+        return None
 
-        if hours_to_expiry < 6:
-            logger.info(f"Skipping {contract_id} '{question[:50]}': expires in {hours_to_expiry:.1f}h")
-            return None
+    if days_ahead < 0:
+        logger.debug(f"Skipping past event: {city} {date_str}")
+        return None
 
-        if days_to_expiry > MAX_FORECAST_DAYS:
-            logger.info(
-                f"Skipping {contract_id} '{question[:50]}': "
-                f"{days_to_expiry:.1f} days out > MAX_FORECAST_DAYS={MAX_FORECAST_DAYS}"
+    if days_ahead > MAX_FORECAST_DAYS:
+        logger.info(f"Skipping {city} {date_str}: {days_ahead}d > MAX_FORECAST_DAYS={MAX_FORECAST_DAYS}")
+        return None
+
+    # Fetch temperature distribution
+    dist = get_temp_distribution_for_event(lat, lon, date_str)
+    if dist is None:
+        logger.warning(f"No distribution for {city} {date_str}")
+        return None
+
+    mu_c     = dist["mu_c"]
+    sigma_c  = dist["sigma_c"]
+    clim_kde = dist.get("clim_kde")   # KDE object or None
+
+    # Display-unit mu for dashboard
+    if display_unit == "fahrenheit":
+        mu_display = mu_c * 9 / 5 + 32
+    else:
+        mu_display = mu_c
+
+    outcomes   = event.get("outcomes", [])
+    n_outcomes = len(outcomes)
+
+    # Step 1: compute raw model probabilities for each bin.
+    # Outcomes where range_low and range_high are both None (unparseable range)
+    # get raw_prob=None and are excluded from normalization but still included
+    # in the output so the dashboard can display all discovered contracts.
+    raw_probs: list[float | None] = []
+    for o in outcomes:
+        lo = o.get("range_low")
+        hi = o.get("range_high")
+        if lo is None and hi is None:
+            raw_probs.append(None)  # unparseable — no model probability
+        else:
+            p = get_temp_range_probability(
+                mu_c, sigma_c, lo, hi, o.get("unit", "celsius"),
+                kde=clim_kde,
             )
-            return None
-    except (ValueError, TypeError) as e:
-        logger.info(f"Could not check expiry for {contract_id}: {e} | date={metadata.get('date')}")
+            raw_probs.append(p)
 
-    # Step 2: Get ensemble weather probability
-    ensemble = get_ensemble_probability(
-        lat=metadata["lat"],
-        lon=metadata["lon"],
-        date_str=metadata["date"],
-        variable=metadata.get("variable", "rain"),
-        threshold=metadata.get("threshold"),
-        unit=metadata.get("unit"),
+    parseable_probs = [p for p in raw_probs if p is not None]
+    raw_sum = sum(parseable_probs)
+
+    # Step 2: normalize parseable probs so they sum to 1.0 (among themselves).
+    norm_warning = bool(parseable_probs) and (
+        raw_sum < NORM_WARNING_LOW or raw_sum > NORM_WARNING_HIGH
     )
+    if norm_warning:
+        logger.warning(
+            f"Normalization warning for {city} {date_str}: raw_sum={raw_sum:.3f}"
+        )
 
-    if not ensemble or ensemble.get("probability") is None:
-        logger.warning(f"No ensemble probability for {contract_id}")
-        return None
+    if raw_sum > 0:
+        # Normalize only the parseable probs; keep None for unparseable
+        model_probs: list[float | None] = [
+            (p / raw_sum) if p is not None else None for p in raw_probs
+        ]
+    elif parseable_probs:
+        # raw_sum is 0 despite having parseable probs — uniform fallback
+        n_parseable = len(parseable_probs)
+        model_probs = [
+            (1.0 / n_parseable) if p is not None else None for p in raw_probs
+        ]
+    else:
+        # No parseable ranges at all — all outcomes get None
+        model_probs = [None] * n_outcomes
 
-    p_model = ensemble["probability"]
-    disagreement = ensemble.get("disagreement", 0.0)
+    # Step 3: market overround
+    market_prices  = [o.get("yes_price", 0.5) for o in outcomes]
+    market_sum = sum(market_prices)
 
-    # Skip if sources disagree heavily (model uncertainty too high)
-    if disagreement > 0.15:
-        logger.info(f"Skipping {contract_id}: source disagreement {disagreement:.2f} > 0.15")
-        return None
+    # Step 4: build enriched outcome list
+    enriched_outcomes = []
+    for i, o in enumerate(outcomes):
+        market_price = market_prices[i]
+        model_prob   = model_probs[i]   # may be None for unparseable ranges
+        raw_prob     = raw_probs[i]     # may be None
 
-    # Step 3: Market implied probability
-    p_market_yes = contract.get("yes_price", 0.5)
+        # Outcomes without a parseable range: show market data only, no signal
+        if model_prob is None:
+            enriched_outcomes.append({
+                "contract_id":      o.get("contract_id"),
+                "question":         o.get("question", ""),
+                "range_low":        o.get("range_low"),
+                "range_high":       o.get("range_high"),
+                "unit":             o.get("unit", "celsius"),
+                "market_price":     round(market_price, 4),
+                "yes_price":        round(market_price, 4),
+                "no_price":         round(o.get("no_price", 1 - market_price), 4),
+                "yes_token_id":     o.get("yes_token_id"),
+                "no_token_id":      o.get("no_token_id"),
+                "liquidity_usd":    o.get("liquidity_usd", 0),
+                "volume_usd":       o.get("volume_usd", 0),
+                "model_prob":       None,
+                "raw_model_prob":   None,
+                "ev":               None,
+                "edge":             None,
+                "recommended_side": None,
+                "kelly_size":       0.0,
+                "is_signal":        False,
+            })
+            continue
 
-    # Step 4: Determine side and edge
-    side, edge = determine_side(p_model, p_market_yes)
+        model_prob_r = round(model_prob, 6)
+        edge         = model_prob_r - market_price
+        abs_edge     = abs(edge)
 
-    if edge < EDGE_THRESHOLD:
-        logger.debug(f"No edge on {contract_id}: model={p_model:.3f} market={p_market_yes:.3f}edge={edge:.3f}")
-        return None
+        if edge > 0:
+            side = "YES"
+        elif edge < 0:
+            side = "NO"
+        else:
+            side = None
 
-    # Step 5: Calculate EV
-    ev = calculate_ev(p_model, p_market_yes, side)
+        ev = _calculate_ev(model_prob, market_price, side) if side else 0.0
 
-    # Step 6: Kelly sizing
-    kelly_size = calculate_kelly_size(
-        edge=edge,
-        odds=1.0 / (p_market_yes if side == "YES" else (1 - p_market_yes)),
-        bankroll=bankroll,
-    )
+        # A market_price of exactly 0 or 1 means the market considers this bin
+        # resolved/impossible — no valid odds exist and the bin is not tradeable.
+        market_at_extreme = market_price <= 0.0 or market_price >= 1.0
+        is_signal = abs_edge >= EDGE_THRESHOLD and side is not None and not market_at_extreme
 
-    signal = {
-        "contract_id": contract_id,
-        "question": question,
-        "market_p": round(p_market_yes, 4),
-        "model_p": round(p_model, 4),
-        "ev": round(ev, 4),
-        "recommended_side": side,
-        "edge": round(edge, 4),
-        "disagreement": round(disagreement, 4),
-        "kelly_size": round(kelly_size, 2),
-        "n_sources": ensemble.get("n_sources", 0),
-        "sources": ensemble.get("sources", []),
-        "timestamp": datetime.utcnow().isoformat(),
-        "metadata": metadata,
+        # Kelly sizing — halved when normalization warning is active
+        if is_signal:
+            # Odds are safe to compute here because market_at_extreme is False
+            if side == "YES":
+                odds = (1.0 - market_price) / market_price
+            else:
+                odds = market_price / (1.0 - market_price)
+            kelly_raw = calculate_kelly_size(
+                edge     = abs_edge,
+                odds     = odds,
+                bankroll = bankroll,
+            )
+            kelly_size = round(kelly_raw * (0.5 if norm_warning else 1.0), 2)
+        else:
+            kelly_size = 0.0
+
+        enriched_outcomes.append({
+            # Identity
+            "contract_id":      o.get("contract_id"),
+            "question":         o.get("question", ""),
+            "range_low":        o.get("range_low"),
+            "range_high":       o.get("range_high"),
+            "unit":             o.get("unit", "celsius"),
+            # Prices
+            "market_price":     round(market_price, 4),
+            "yes_price":        round(market_price, 4),
+            "no_price":         round(o.get("no_price", 1 - market_price), 4),
+            "yes_token_id":     o.get("yes_token_id"),
+            "no_token_id":      o.get("no_token_id"),
+            "liquidity_usd":    o.get("liquidity_usd", 0),
+            "volume_usd":       o.get("volume_usd", 0),
+            # Model
+            "model_prob":       model_prob,
+            "raw_model_prob":   raw_prob,
+            # Signal
+            "ev":               round(ev, 4),
+            "edge":             round(edge, 4),
+            "recommended_side": side,
+            "kelly_size":       kelly_size,
+            "is_signal":        is_signal,
+        })
+
+    # Build event-level analysis dict
+    result = {
+        **event,
+        "forecast_mu_c":       mu_c,
+        "forecast_sigma_c":    sigma_c,
+        "clim_mu_c":           dist.get("clim_mu_c", mu_c),
+        "clim_sigma_c":        dist.get("clim_sigma_c", sigma_c),
+        "forecast_mu_display": round(mu_display, 1),
+        "display_unit":        display_unit,
+        "days_ahead":          days_ahead,
+        "model_probs_sum":     round(raw_sum, 4),
+        "normalization_warning": norm_warning,
+        "market_overround":    round(market_sum, 4),
+        "n_outcomes":          n_outcomes,
+        "n_sources":           len(dist.get("sources", [])),
+        "sources":             dist.get("sources", []),
+        "outcomes":            enriched_outcomes,
     }
 
+    n_signals = sum(1 for o in enriched_outcomes if o["is_signal"])
     logger.info(
-        f"SIGNAL: {contract_id[:12]} | side={side} | model={p_model:.3f} "
-        f"market={p_market_yes:.3f} | edge={edge:.3f} | EV={ev:.3f} | kelly=${kelly_size:.2f}"
+        f"Event: {city} {date_str} | μ={mu_c:.1f}°C σ={sigma_c:.1f}°C | "
+        f"{n_outcomes} outcomes | {n_signals} signals | "
+        f"overround={market_sum:.3f}"
     )
 
-    return signal
+    return result
 
 
-def run_edge_scan(bankroll: float = 1000.0, contracts: list[dict] | None = None) -> list[dict]:
+# ---------------------------------------------------------------------------
+# Main scan loop
+# ---------------------------------------------------------------------------
+
+def run_edge_scan(
+    bankroll: float = 1000.0,
+    events: list[dict] | None = None,
+) -> tuple[list[dict], list[dict]]:
     """
-    Main scan loop: find all weather markets, analyze each, save signals.
+    Discover and analyze all highest-temperature Polymarket events.
 
     Args:
-        contracts: Pre-fetched market list. If None, fetches from Polymarket API.
-    Returns list of signals generated this run.
+        bankroll: Current available USDC (used for Kelly sizing).
+        events:   Pre-fetched event list from search_temp_high_events().
+                  If None, fetches fresh from Polymarket API.
+
+    Returns:
+        (all_events_analyzed, signals)
+        all_events_analyzed — one dict per event, containing enriched outcomes
+                              (used by dashboard Tab 1 and DB write)
+        signals             — flat list of individual outcome-level signal dicts
+                              (used by risk.py + execution.py)
     """
     logger.info("Starting edge scan...")
-    clear_forecast_cache()       # Avoid stale cached forecasts across runs
-    reset_tomorrowio_limit()     # Allow Tomorrow.io to be retried each scan
+    clear_forecast_cache()
+    reset_tomorrowio_limit()
 
-    if contracts is None:
-        contracts = search_weather_markets(min_liquidity=MIN_LIQUIDITY_USD)
-    logger.info(f"Analyzing {len(contracts)} weather contracts")
+    if events is None:
+        events = search_temp_high_events(min_liquidity=MIN_LIQUIDITY_USD)
+    logger.info(f"Analyzing {len(events)} highest-temperature events")
 
-    signals = []
-    drop_no_metadata = 0
-    drop_no_edge = 0
+    from datetime import timezone
+    scan_ts = datetime.now(timezone.utc).isoformat()
 
-    for contract in contracts:
-        question = contract.get("question", "")
-        group = contract.get("group_title", "")
-        metadata = parse_contract_metadata(contract)
-        if not metadata:
-            drop_no_metadata += 1
-            logger.debug(f"No metadata | q='{question[:60]}' group='{group[:60]}'")
+    all_events_analyzed: list[dict] = []
+    signals:             list[dict] = []
+
+    skipped_no_dist = 0
+
+    for event in events:
+        analysis = analyze_temp_event(event, bankroll=bankroll)
+
+        if analysis is None:
+            skipped_no_dist += 1
             continue
 
-        signal = analyze_contract(contract, bankroll=bankroll)
-        if signal is None:
-            # analyze_contract logs the specific reason at INFO level now
-            drop_no_edge += 1
-            continue
+        # Persist to DB
+        try:
+            event_row_id = insert_temp_event(analysis, scan_ts)
+            for outcome in analysis["outcomes"]:
+                insert_temp_outcome(outcome, event_row_id, scan_ts)
+        except Exception as e:
+            logger.error(f"DB write failed for {analysis.get('city')} {analysis.get('date')}: {e}")
 
-        insert_signal(
-            timestamp=signal["timestamp"],
-            contract_id=signal["contract_id"],
-            question=signal.get("question"),
-            market_p=signal.get("market_p"),
-            model_p=signal.get("model_p"),
-            ev=signal.get("ev"),
-            recommended_side=signal.get("recommended_side"),
-            kelly_size=signal.get("kelly_size"),
-        )
-        signals.append(signal)
+        all_events_analyzed.append(analysis)
+
+        # Flatten signals with event-level context
+        for outcome in analysis["outcomes"]:
+            if not outcome.get("is_signal"):
+                continue
+
+            signal = {
+                # Outcome fields (execution needs these)
+                **outcome,
+                # Event context
+                "city":        analysis.get("city"),
+                "date":        analysis.get("date"),
+                "lat":         analysis.get("lat"),
+                "lon":         analysis.get("lon"),
+                "event_id":    analysis.get("event_id"),
+                "event_title": analysis.get("event_title"),
+                "scan_timestamp": scan_ts,
+                # Aliased fields expected by risk.py / execution.py
+                "contract_id":      outcome.get("contract_id"),
+                "recommended_side": outcome.get("recommended_side"),
+                "kelly_size":       outcome.get("kelly_size"),
+                "market_p":         outcome.get("market_price"),
+                "model_p":          outcome.get("model_prob"),
+                "metadata": {
+                    "date":     analysis.get("date"),
+                    "lat":      analysis.get("lat"),
+                    "lon":      analysis.get("lon"),
+                    "variable": "temp_high",
+                },
+            }
+            signals.append(signal)
+
+            # Also log to legacy signals table for backward compatibility
+            try:
+                insert_signal(
+                    timestamp        = scan_ts,
+                    contract_id      = outcome["contract_id"],
+                    question         = outcome.get("question"),
+                    market_p         = outcome.get("market_price"),
+                    model_p          = outcome.get("model_prob"),
+                    ev               = outcome.get("ev"),
+                    recommended_side = outcome.get("recommended_side"),
+                    kelly_size       = outcome.get("kelly_size"),
+                )
+            except Exception as e:
+                logger.debug(f"Legacy signal insert failed: {e}")
 
     logger.info(
-        f"Edge scan complete: {len(signals)} signals | "
-        f"dropped: {drop_no_metadata} no-metadata, "
-        f"{drop_no_edge} no-edge/expiry/ensemble "
-        f"(out of {len(contracts)} contracts)"
+        f"Edge scan complete: {len(all_events_analyzed)} events analyzed | "
+        f"{len(signals)} signals | "
+        f"{skipped_no_dist} skipped (no distribution)"
     )
-    return signals
+
+    return all_events_analyzed, signals

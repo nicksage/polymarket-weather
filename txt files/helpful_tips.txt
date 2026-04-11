@@ -35,3 +35,8 @@ persistent context so you don't have to re-explain the project each time. See Se
 complete filled-out example.
 
 #########################################
+
+    Label	                                   Plain English	                                                          Source
+Forecast Avg	    The model's predicted mean maximum temperature for that day	                    Blended ECMWF (51 members) + GFS (31 members) ensemble
+Uncertainty (σ)	    How wide the ensemble spread is — larger = less confident forecast	            Standard deviation across ensemble members
+Historical Avg	    The 10-year average temperature for this same calendar date and location	    ERA5 reanalysis data, used as a Bayesian anchor at longer forecast horizons (>7 days)

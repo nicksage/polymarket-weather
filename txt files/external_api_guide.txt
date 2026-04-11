@@ -113,3 +113,29 @@ edge     = 0.31 - 0.43 = -0.12  → bet NO
 
 
 #########################################################################################
+
+ERA5 — "ECMWF Reanalysis v5." It's a global historical weather dataset produced by the European Centre for Medium-Range Weather Forecasts (the same organization that runs the main ensemble model). 
+    It works by taking all available historical observations (weather stations, radiosondes, satellites) and running a climate model backward over them to produce a physically consistent, gap-free reconstruction of atmospheric conditions back to 1940.
+    When you ask "what was the actual high temperature in London on April 10, 2019?" — ERA5 is the authoritative answer. It's essentially the gold standard for historical weather data.
+
+KDE — "Kernel Density Estimation." It's a statistical technique for estimating a probability distribution directly from data, without assuming any particular shape. A normal distribution forces your data into a bell curve defined by just two numbers (mean and standard deviation). 
+    KDE instead places a small "kernel" (a smooth bump) at each data point, then sums all the bumps together to form the overall distribution. The result can capture shapes a normal distribution can't — like a slight left skew, a fat tail, or a subtle bimodal pattern. For temperature, 
+    most city/date combinations are approximately normal so the difference is small, but for cities with more complex seasonal patterns it can meaningfully improve accuracy.
+
+
+On your USE_KDE_CLIM interpretation — this needs a correction
+
+The flag controls the shape of the distribution fit to historical data, not bias correction. These are two separate things:
+
+USE_KDE_CLIM — switches the climatological prior from a normal distribution (parametric, described by μ and σ) to a KDE (nonparametric, described by the data itself). This affects the shape of the distribution used to compute bin probabilities
+Bias correction (bias.py) — a completely separate adjustment applied to the ensemble forecast mean (μ). It answers the question: "historically, when ECMWF says London will be 12°C on an April day, is it actually 12°C, or is it systematically off by +1°C or −0.5°C?" It corrects the forecast center before computing any probabilities
+The relationship between them:
+
+
+Raw ECMWF ensemble  →  bias correction applied  →  corrected μ
+                                                          ↓
+Historical ERA5 data  →  KDE or normal fit  →  climatological prior
+                                                          ↓
+                      Bayesian blend of corrected forecast + prior
+                                                          ↓
+                           P(temp in bin_i) for each outcome range

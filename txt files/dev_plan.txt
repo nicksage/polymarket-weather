@@ -19,7 +19,13 @@ update_position_outcome() in db.py — ready to close a position given exit_pric
 get_open_orders() in execution.py — fetches live orders from CLOB API
 What's missing: a resolver.py or scheduled job that polls open positions, checks Polymarket for resolution status, and calls update_position_outcome(). This is the next critical feature to build.
 
+2. Additional statistical analysis with stored data:
+-----------------------------------------------------------------------------------------
+> Three are genuinely valuable for this use case:
 
+> Warming trend correction — London's April 10 max temperature has risen ~0.3°C/decade due to climate change. Without detrending, the climatological prior is biased cold. A simple linear regression over stored historical values detects and removes this bias before computing μ and σ
+> ECMWF bias correction — After each Polymarket contract resolves, store (forecast_mu, actual_tmax). Over time, you'll detect systematic biases (e.g., ECMWF runs 1.2°C warm in Bangkok in April). Apply city+month-specific corrections to future forecasts. This is proven operationally at NCEP/ECMWF
+> KDE for non-normal distributions — Some cities have bimodal April temperature distributions (e.g., continental cities where either a warm front or cold front dominates). KDE fits these better than a normal distribution and gives more accurate bin probabilities
 
 #########################################################################################
 KNOWN ISSUES:
