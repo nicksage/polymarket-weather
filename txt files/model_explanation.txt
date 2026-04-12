@@ -1,0 +1,130 @@
+Q: How is "Fcst Avg" calculated?
+
+    A: It's the final blended forecast mean (forecast_mu_display in the DB), built in stages in weather.py:724:
+
+    1. ECMWF ensemble (51 members) → μ₁, σ₁ and GFS ensemble → μ₂, σ₂ are blended 65%/35% into a mixture-of-Gaussians forecast mean
+    2. ERA5 climatological prior (10-year historical average) is Bayesian-blended with the forecast, with the forecast weighted more heavily when close (days_ahead → α approaches 1.0) and climatology weighted more heavily for distant dates
+    3. For US locations: further blended with NOAA NBM at 30% weight (or NWS hourly at 20% if NBM unavailable)
+    4. Bias correction: a historical ECMWF systematic error term (from stored forecast_errors in the DB) is added to adjust for known model drift
+    5. The result is converted to °F or °C depending on the market's display unit
+
+Q: Please explain numbers 1-4 to me in more detail. Which functions are used in each step? Which external data API/sources are used?
+
+    A: How Forecast Avg is Calculated
+    The entry point is get_temp_distribution_for_event in weather.py. Here's each step:
+
+    Step 1 — ECMWF + GFS Ensemble Blend
+    Functions: _get_ecmwf_ensemble_distribution, _get_gfs_ensemble_distribution, _blend_gaussians, _fit_normal
+
+    API: Both hit Open-Meteo's Ensemble API (ensemble-api.open-meteo.com/v1/ensemble) with different models= params:
+
+    ECMWF: models=ecmwf_ifs04 → 51 ensemble members
+    GFS: models=gfs025 → 31 ensemble members
+    Each call returns a temperature_2m_max_memberNN key per ensemble member for the target date. _fit_normal computes the mean and standard deviation across all members to get μ and σ. The two models are then combined via _blend_gaussians at a 65% ECMWF / 35% GFS weight. The blend formula accounts for both within-component variance and the spread between the two model means.
+
+    Step 2 — ERA5 Climatological Prior (Bayesian Blend)
+    Functions: _get_era5_clim_distribution, _build_era5_date_list, _fetch_era5_from_api, _apply_trend_correction, _forecast_alpha
+
+    API: Open-Meteo Archive API (archive-api.open-meteo.com/v1/archive), which serves ERA5 reanalysis data.
+
+    It pulls 10 years × ±7 days around the target calendar date (so ~140 historical data points). These are:
+
+    Cached in the local SQLite DB — only missing dates are fetched from the API
+    Run through _apply_trend_correction which fits a linear warming trend via np.polyfit, detrends the historical values, then projects forward to the current year
+    Fit to a normal distribution (or optionally a KDE if USE_KDE_CLIM=True and ≥10 samples)
+    The forecast and climatology are then Bayesian-blended via _blend_gaussians using a weight α from _forecast_alpha:
+
+    Days 0–7: α = 1.0 → pure forecast, climatology ignored
+    Days 8–15: α decreases linearly from 1.0 → 0.40 (more weight to climatology the further out)
+    Days >15: event is skipped entirely (guarded in edge.py)
+    Step 3 — NOAA / NWS Supplemental (US only)
+    Functions: _get_noaa_nbm_distribution, _get_nws_hourly_distribution, _get_nws_observation_station
+
+    Only runs when the coordinates fall within the US bounding box. Two APIs are tried in order:
+
+    Primary — NOAA NBM (weather.gov/mdl/nbm_text): Fetches the MDL NBM text product for the nearest ASOS/AWOS station (station looked up via api.weather.gov/points/{lat},{lon}). The text product contains Q10/Q25/Q50/Q75/Q90 temperature quantiles in °F. μ is taken as Q50; σ is derived from the IQR: σ ≈ (Q75 − Q25) / 1.349. Blended in at 30% weight.
+
+    Fallback — NWS Hourly Gridpoint (api.weather.gov): If NBM is unavailable, fetches the hourly forecast for the target day, takes max(hourly temps) as μ, and estimates σ as diurnal_spread / 4. Blended in at 20% weight.
+
+    Step 4 — Bias Correction
+    Function: get_bias_correction in db.py (called from get_temp_distribution_for_event at weather.py:827)
+
+    No external API — uses data from the local SQLite DB (forecast_errors table).
+
+    The bias.py module runs periodically: it compares past ECMWF forecast_mu_c values stored in temp_events against actual ERA5 temperatures for the same dates (fetched after the fact). Those residuals are stored in forecast_errors. get_bias_correction looks up the mean error for the same lat/lon/calendar-month-day, and if there are enough observations (controlled by MIN_BIAS_OBSERVATIONS), a correction bias_c is added directly to μ. This adjusts for systematic warm or cold bias in the ECMWF model for a given location and time of year.
+
+Q: What are ensemble members?
+
+    A: Weather models are run multiple times with slightly different starting conditions (small perturbations to the initial atmospheric state — temperature, pressure, humidity, wind). Each individual run is one "ensemble member." The spread between members represents forecast uncertainty: if all 51 ECMWF members agree on 85°F, confidence is high; if they range from 72–98°F, confidence is low. Running many members is computationally expensive, which is why the free ECMWF run has 51 and GFS has 31.
+
+Q: What does "2m_max_member" mean?
+
+    A: It's the Open-Meteo API field name. Breaking it down:
+
+    temperature_2m — air temperature measured at 2 meters above ground (standard meteorological height, avoids surface heating artifacts)
+    _max — the daily maximum (highest temperature over the full 24-hour period)
+    _memberNN — which ensemble member (e.g. _member00, _member01, ... _member50 for ECMWF)
+    So temperature_2m_max_member23 is "the daily high temperature predicted by ensemble member #23."
+
+Q: Does each "ensemble member" provide their temp forecast?
+
+    A: Yes. Each member independently runs the full atmospheric simulation with its own slightly perturbed starting conditions. The bot collects all member values for the target date, then _fit_normal computes the mean and standard deviation across all members. The mean (μ) is the consensus forecast; the standard deviation (σ) is the model's self-reported uncertainty — a wider spread of member predictions means the model itself is less confident.
+
+Q: Please explain "bayesian blend" in more detail
+
+    A: It's a principled way to combine two uncertain estimates, where you weight each source by how trustworthy it is given the situation.
+
+    Here's the intuition: a 10-day forecast is less reliable than a 2-day forecast, but you know roughly what temperatures are normal for a given city on a given calendar date. Bayesian blending lets the model say: "For near-term dates, trust the forecast almost entirely. For distant dates, pull the estimate toward what history says is normal."
+
+    The weight is controlled by α from _forecast_alpha:
+
+    Days Out	α (forecast weight)	1-α (climatology weight)
+    0–7 days	1.0	0.0 — climatology ignored
+    8 days	0.92	0.08
+    12 days	0.60	0.40
+    15 days	0.40	0.60
+    _blend_gaussians then combines the two distributions, computing a mixture mean and a conservative σ that accounts for both the uncertainty within each distribution and the disagreement between them (if the forecast says 90°F and climatology says 75°F, the resulting σ is wider than either alone).
+
+Q: In step 3 - Is the supplemental data "live" data/forecasts, or is it historical data? What context/information do these data sources add?
+
+    A: It is live forecast data, not historical. Both sources are forward-looking:
+
+    NOAA NBM — The National Blend of Models is NOAA's operational gridded forecast product, updated several times daily. It already blends NWS models internally and provides quantile forecasts (Q10–Q90), which is why the bot trusts it enough to blend in at 30% weight.
+    NWS Hourly Gridpoint — The standard NWS 7-day hourly forecast you'd see on weather.gov, also live and updated continuously.
+    What they add: both are US government operational forecasts with dense local station calibration. ECMWF and GFS are global models at ~4–25km resolution; NWS products are calibrated to specific ASOS weather stations and incorporate local terrain effects. They serve as a local reality check on the global model blend — particularly useful for cities with complex geography (coastal cities, mountain valleys, etc.) where global models can miss local patterns.
+
+Q: Does get_bias_correction operate based on data that is capture as the bot is periodically run, or is it based on a lager, historical data set?
+
+
+    A: It is entirely based on data the bot accumulates as it runs — there is no pre-loaded historical dataset.
+
+    Here's the lifecycle:
+
+    Each scan, the bot stores its ECMWF forecast mean (forecast_mu_c) in the temp_events table
+    The bias.py module runs periodically after forecast dates have passed — it fetches the actual ERA5 observed temperature for those dates and computes the error: error = actual − forecast
+    Those errors are written to the forecast_errors table in SQLite, keyed by lat/lon and calendar date (MM-DD)
+    get_bias_correction reads that table and returns the mean error for the same location and time of year — but only if MIN_BIAS_OBSERVATIONS is met (a minimum sample threshold to avoid correcting on noise)
+    Practical implication: the bias correction starts doing nothing (no observations), gradually improves as the bot resolves more markets, and becomes meaningfully accurate only after many weeks or months of operation for each city. It's a self-improving feedback loop — the longer the bot runs, the better its ECMWF correction becomes.
+
+Q: What is the Kelly Fraction (variable in .env)
+
+    A: The Kelly Criterion is a mathematically optimal formula for sizing bets to maximize long-term bankroll growth. The full Kelly formula from sizing.py:71 is:
+
+    full_kelly = (b × p - (1-p)) / b
+    Where:
+
+    p = your model's probability of winning
+    b = the net payout per dollar risked (e.g. buying YES at $0.60 → b = 0.40/0.60 = 0.667)
+    Example: Model says 70% chance YES, market prices it at 60% (YES costs $0.60):
+
+    Full Kelly says bet ~16.7% of bankroll on this trade
+    At KELLY_FRACTION=0.25 → actually bet 4.2% of bankroll
+    Then MAX_POSITION_PCT=0.10 caps it at 10% anyway
+    KELLY_FRACTION is the throttle on the Kelly formula's output. Full Kelly (1.0) is mathematically optimal only if your probability estimates are perfectly accurate — which they never are. Because your model could be miscalibrated, using full Kelly risks catastrophic drawdown when the model is wrong. The common practice:
+
+    Value	Name	        Use when
+    0.25	Quarter Kelly	Default/early stage — model unproven
+    0.50	Half Kelly	    Model has 3+ months of calibrated history
+    1.00	Full Kelly	    Almost never — requires near-perfect calibration
+    
+    The code's own comment says it directly: "If your model has been running for 3+ months with a documented Brier score, consider moving to 1/2 Kelly."

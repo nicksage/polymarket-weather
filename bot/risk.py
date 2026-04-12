@@ -7,6 +7,9 @@ from config import (
     MIN_HOURS_TO_EXPIRY,
     MAX_DAILY_DRAWDOWN_PCT,
     MAX_FORECAST_SIGMA_C,
+    TRADE_US_ONLY,
+    US_LAT,
+    US_LON,
 )
 from db import get_open_positions, get_daily_pnl
 
@@ -106,6 +109,17 @@ def check_normalization_warning(signal: dict) -> RiskCheck:
     return RiskCheck(True)
 
 
+def check_us_only(lat: float | None, lon: float | None) -> RiskCheck:
+    """Block non-US trades when TRADE_US_ONLY is enabled."""
+    if not TRADE_US_ONLY:
+        return RiskCheck(True)
+    if lat is None or lon is None:
+        return RiskCheck(False, "TRADE_US_ONLY is set but lat/lon unavailable for this signal")
+    if not (US_LAT[0] <= lat <= US_LAT[1] and US_LON[0] <= lon <= US_LON[1]):
+        return RiskCheck(False, f"TRADE_US_ONLY: ({lat:.2f},{lon:.2f}) is outside US bounds")
+    return RiskCheck(True)
+
+
 def check_daily_drawdown(bankroll: float) -> RiskCheck:
     """
     Halt trading if today's realized P&L loss exceeds MAX_DAILY_DRAWDOWN_PCT
@@ -136,6 +150,7 @@ def run_all_checks(signal: dict, bankroll: float) -> tuple[bool, list[str]]:
         check_liquidity(signal.get("liquidity_usd", 0)),
         check_daily_drawdown(bankroll),
         check_normalization_warning(signal),
+        check_us_only(signal.get("lat"), signal.get("lon")),
     ]
 
     # Forecast quality check — sigma is carried in the signal via event context

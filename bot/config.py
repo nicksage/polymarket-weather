@@ -92,3 +92,17 @@ USE_KDE_CLIM: bool = _bool("USE_KDE_CLIM", False)
 # before bias correction is applied.  Below this threshold the correction is
 # 0.0 (no adjustment) — avoids noisy corrections from sparse data.
 MIN_BIAS_OBSERVATIONS: int = int(os.getenv("MIN_BIAS_OBSERVATIONS", "10"))
+
+# ---------------------------------------------------------------------------
+# Geography filter
+# ---------------------------------------------------------------------------
+
+# US bounding box used by both risk.py (trade guard) and dashboard.py (filter).
+# Covers contiguous US + Alaska + Hawaii with generous margins.
+US_LAT: tuple[float, float] = (15.0, 72.0)
+US_LON: tuple[float, float] = (-180.0, -60.0)
+
+# When True, the risk layer blocks execution on any signal whose lat/lon falls
+# outside the US bounding box.  Dashboard filter is independent and always
+# available regardless of this setting.
+TRADE_US_ONLY: bool = _bool("TRADE_US_ONLY", False)
