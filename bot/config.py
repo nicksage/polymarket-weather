@@ -106,3 +106,35 @@ US_LON: tuple[float, float] = (-180.0, -60.0)
 # outside the US bounding box.  Dashboard filter is independent and always
 # available regardless of this setting.
 TRADE_US_ONLY: bool = _bool("TRADE_US_ONLY", False)
+
+# ---------------------------------------------------------------------------
+# Position controls
+# ---------------------------------------------------------------------------
+
+# MAX_BIN_BUYS: maximum number of temperature-range bins the bot may hold
+# simultaneously for the same city+date event.  Default 1 means the bot
+# takes at most one position per event.  Set to 0 to disable the check.
+MAX_BIN_BUYS: int = int(os.getenv("MAX_BIN_BUYS", "1"))
+
+# MAX_TRADE_DAYS: how many calendar days ahead the bot may enter trades.
+# 0 = only contracts resolving today (local time).
+# 1 = today + tomorrow.
+# N = any contract resolving within the next N days (inclusive).
+# Default 7 — avoids very near-term contracts where the edge check plus
+# MIN_HOURS_TO_EXPIRY already blocks same-day trades anyway.
+MAX_TRADE_DAYS: int = int(os.getenv("MAX_TRADE_DAYS", "7"))
+
+# ALLOWED_SIDES: restricts which contract sides the bot may trade.
+# "yes"  → only BUY YES contracts
+# "no"   → only BUY NO contracts
+# "both" → no restriction (default)
+ALLOWED_SIDES: str = os.getenv("ALLOWED_SIDES", "both").lower().strip()
+
+# ---------------------------------------------------------------------------
+# Wallet / Data API
+# ---------------------------------------------------------------------------
+
+# Polymarket proxy wallet address — used to query on-chain position data from
+# data-api.polymarket.com.  Required for live trading enrichment; ignored in
+# paper mode.
+WALLET_ADDRESS: str = os.getenv("WALLET_ADDRESS", "")

@@ -119,6 +119,32 @@ def init_db():
         for col_def in [
             "ALTER TABLE temp_outcomes ADD COLUMN yes_price REAL",
             "ALTER TABLE temp_outcomes ADD COLUMN no_price  REAL",
+            # positions table — expanded for full trade lifecycle tracking
+            "ALTER TABLE positions ADD COLUMN order_id        TEXT",
+            "ALTER TABLE positions ADD COLUMN is_paper        INTEGER DEFAULT 1",
+            "ALTER TABLE positions ADD COLUMN question        TEXT",
+            "ALTER TABLE positions ADD COLUMN city            TEXT",
+            "ALTER TABLE positions ADD COLUMN date            TEXT",
+            "ALTER TABLE positions ADD COLUMN event_id        TEXT",
+            "ALTER TABLE positions ADD COLUMN model_prob      REAL",
+            "ALTER TABLE positions ADD COLUMN market_prob     REAL",
+            "ALTER TABLE positions ADD COLUMN ev              REAL",
+            "ALTER TABLE positions ADD COLUMN edge            REAL",
+            "ALTER TABLE positions ADD COLUMN fill_status     TEXT DEFAULT 'filled'",
+            "ALTER TABLE positions ADD COLUMN shares          REAL",
+            "ALTER TABLE positions ADD COLUMN unrealized_pnl  REAL DEFAULT 0",
+            "ALTER TABLE positions ADD COLUMN current_price   REAL",
+            "ALTER TABLE positions ADD COLUMN scan_timestamp   TEXT",
+            "ALTER TABLE positions ADD COLUMN cancelled_reason TEXT",
+            "ALTER TABLE positions ADD COLUMN gamma_market_id  TEXT",
+            "ALTER TABLE positions ADD COLUMN range_low        REAL",
+            "ALTER TABLE positions ADD COLUMN range_high       REAL",
+            "ALTER TABLE positions ADD COLUMN unit             TEXT",
+            "ALTER TABLE positions ADD COLUMN local_time       TEXT",
+            "ALTER TABLE positions ADD COLUMN yes_token_id     TEXT",
+            "ALTER TABLE positions ADD COLUMN no_token_id      TEXT",
+            "ALTER TABLE positions ADD COLUMN lat              REAL",
+            "ALTER TABLE positions ADD COLUMN lon              REAL",
         ]:
             try:
                 conn.execute(col_def)
@@ -201,21 +227,90 @@ def insert_position(
     size_usdc: float,
     entry_price: float,
     entry_time: str,
+    order_id: str = None,
+    is_paper: int = 1,
+    question: str = None,
+    city: str = None,
+    date: str = None,
+    event_id: str = None,
+    model_prob: float = None,
+    market_prob: float = None,
+    ev: float = None,
+    edge: float = None,
+    fill_status: str = "filled",
+    shares: float = None,
+    scan_timestamp: str = None,
+    gamma_market_id: str = None,
+    range_low: float = None,
+    range_high: float = None,
+    unit: str = None,
+    yes_token_id: str = None,
+    no_token_id: str = None,
+    lat: float = None,
+    lon: float = None,
 ) -> int:
     sql = """
-        INSERT INTO positions
-            (contract_id, side, size_usdc, entry_price, entry_time)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO positions (
+            contract_id, side, size_usdc, entry_price, entry_time,
+            order_id, is_paper, question, city, date, event_id,
+            model_prob, market_prob, ev, edge,
+            fill_status, shares, scan_timestamp,
+            unrealized_pnl, current_price, gamma_market_id,
+            range_low, range_high, unit,
+            yes_token_id, no_token_id, lat, lon
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     with _get_conn() as conn:
-        cur = conn.execute(sql, (contract_id, side, size_usdc, entry_price, entry_time))
+        cur = conn.execute(sql, (
+            contract_id, side, size_usdc, entry_price, entry_time,
+            order_id, is_paper, question, city, date, event_id,
+            model_prob, market_prob, ev, edge,
+            fill_status, shares, scan_timestamp,
+            entry_price,  # current_price initialised to entry_price
+            gamma_market_id,
+            range_low, range_high, unit,
+            yes_token_id, no_token_id, lat, lon,
+        ))
         return cur.lastrowid
 
 
-def get_open_positions() -> list[sqlite3.Row]:
+def get_open_positions() -> list[dict]:
     sql = "SELECT * FROM positions WHERE status = 'open' ORDER BY entry_time ASC"
     with _get_conn() as conn:
-        return conn.execute(sql).fetchall()
+        return [dict(r) for r in conn.execute(sql).fetchall()]
+
+
+def get_pending_positions() -> list[dict]:
+    """Return live orders placed but not yet confirmed as filled."""
+    sql = """
+        SELECT * FROM positions
+        WHERE status = 'open' AND fill_status = 'pending'
+        ORDER BY entry_time ASC
+    """
+    with _get_conn() as conn:
+        return [dict(r) for r in conn.execute(sql).fetchall()]
+
+
+def get_open_positions_for_event(city: str, date: str) -> list[dict]:
+    """Return all open (non-cancelled) positions for a given city+date event."""
+    sql = """
+        SELECT * FROM positions
+        WHERE city = ? AND date = ? AND status = 'open'
+        ORDER BY entry_time ASC
+    """
+    with _get_conn() as conn:
+        return [dict(r) for r in conn.execute(sql, (city, date)).fetchall()]
+
+
+def count_open_bins_for_event(city: str, date: str) -> int:
+    """Count distinct open positions for a city+date event (for MAX_BIN_BUYS check)."""
+    sql = """
+        SELECT COUNT(*) FROM positions
+        WHERE city = ? AND date = ? AND status = 'open'
+    """
+    with _get_conn() as conn:
+        row = conn.execute(sql, (city, date)).fetchone()
+        return row[0] if row else 0
 
 
 def update_position_outcome(
@@ -227,25 +322,149 @@ def update_position_outcome(
 ) -> None:
     sql = """
         UPDATE positions
-        SET exit_price = ?, exit_time = ?, pnl = ?, status = ?
+        SET exit_price = ?, exit_time = ?, pnl = ?, status = ?,
+            unrealized_pnl = 0
         WHERE id = ?
     """
     with _get_conn() as conn:
         conn.execute(sql, (exit_price, exit_time, pnl, status, position_id))
 
 
-def get_daily_pnl(for_date: str = None) -> float:
-    if for_date is None:
-        for_date = date.today().isoformat()
+def update_position_fill(
+    position_id: int,
+    fill_status: str,
+    shares: float,
+    entry_price: float,
+) -> None:
+    """Update a pending position once fill is confirmed via CLOB API."""
     sql = """
-        SELECT COALESCE(SUM(pnl), 0.0)
-        FROM positions
-        WHERE status = 'closed'
-          AND DATE(exit_time) = ?
+        UPDATE positions
+        SET fill_status = ?, shares = ?, entry_price = ?, current_price = ?
+        WHERE id = ?
     """
     with _get_conn() as conn:
-        row = conn.execute(sql, (for_date,)).fetchone()
-        return row[0]
+        conn.execute(sql, (fill_status, shares, entry_price, entry_price, position_id))
+
+
+def cancel_position(
+    position_id: int,
+    cancelled_reason: str,
+    exit_time: str,
+) -> None:
+    """Mark a position as cancelled (unfilled order, expired, etc.)."""
+    sql = """
+        UPDATE positions
+        SET status = 'closed', fill_status = 'cancelled',
+            cancelled_reason = ?, exit_time = ?, pnl = 0
+        WHERE id = ?
+    """
+    with _get_conn() as conn:
+        conn.execute(sql, (cancelled_reason, exit_time, position_id))
+
+
+def update_position_market_price(
+    position_id: int,
+    current_price: float,
+    unrealized_pnl: float,
+    local_time: str = None,
+) -> None:
+    """Refresh current market price, unrealized P&L, and local time for an open position."""
+    sql = """
+        UPDATE positions
+        SET current_price = ?, unrealized_pnl = ?, local_time = COALESCE(?, local_time)
+        WHERE id = ?
+    """
+    with _get_conn() as conn:
+        conn.execute(sql, (current_price, unrealized_pnl, local_time, position_id))
+
+
+def backfill_gamma_market_ids(outcomes: list[dict]) -> int:
+    """
+    For any open position with NULL gamma_market_id, attempt to fill it by
+    matching contract_id against a list of outcome dicts (from the discovery
+    pipeline).  Each outcome dict must have 'contract_id' and 'gamma_market_id'.
+    Returns the number of rows updated.
+    """
+    if not outcomes:
+        return 0
+    # Build a lookup: conditionId → numeric gamma_market_id
+    lookup = {
+        o["contract_id"]: o["gamma_market_id"]
+        for o in outcomes
+        if o.get("contract_id") and o.get("gamma_market_id")
+    }
+    if not lookup:
+        return 0
+    with _get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, contract_id FROM positions WHERE gamma_market_id IS NULL AND status = 'open'"
+        ).fetchall()
+        updated = 0
+        for row in rows:
+            gid = lookup.get(row[1])
+            if gid:
+                conn.execute(
+                    "UPDATE positions SET gamma_market_id = ? WHERE id = ?",
+                    (str(gid), row[0]),
+                )
+                updated += 1
+    return updated
+
+
+def backfill_position_coords() -> int:
+    """
+    For any position with NULL lat/lon, attempt to fill from the CITY_COORDS
+    lookup table in polymarket.py.  Returns the number of rows updated.
+
+    This is a one-time migration helper; it is safe to call repeatedly.
+    """
+    try:
+        from polymarket import CITY_COORDS
+    except ImportError:
+        return 0
+
+    with _get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, city FROM positions WHERE lat IS NULL OR lon IS NULL"
+        ).fetchall()
+        updated = 0
+        for row in rows:
+            pos_id = row[0]
+            city   = (row[1] or "").lower().strip()
+            coords = CITY_COORDS.get(city)
+            if coords:
+                conn.execute(
+                    "UPDATE positions SET lat = ?, lon = ? WHERE id = ?",
+                    (coords[0], coords[1], pos_id),
+                )
+                updated += 1
+    return updated
+
+
+def get_daily_pnl(for_date: str = None) -> float:
+    """
+    Return today's P&L: realized (closed positions) + unrealized (open filled positions).
+    Used by check_daily_drawdown so that a deeply underwater open position
+    still counts against the drawdown limit, not just closed trades.
+    """
+    if for_date is None:
+        for_date = date.today().isoformat()
+    with _get_conn() as conn:
+        realized = conn.execute(
+            """
+            SELECT COALESCE(SUM(pnl), 0.0) FROM positions
+            WHERE status = 'closed' AND fill_status != 'cancelled'
+              AND DATE(exit_time) = ?
+            """,
+            (for_date,),
+        ).fetchone()[0]
+        unrealized = conn.execute(
+            """
+            SELECT COALESCE(SUM(unrealized_pnl), 0.0) FROM positions
+            WHERE status = 'open' AND fill_status = 'filled'
+            """,
+        ).fetchone()[0]
+    return realized + unrealized
 
 
 # ---------------------------------------------------------------------------

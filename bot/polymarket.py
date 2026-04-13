@@ -241,18 +241,19 @@ def _normalize_sub_market(raw: dict, event_title: str) -> dict | None:
         # will still display the market price and contract metadata.
 
         return {
-            "contract_id":  raw.get("conditionId") or raw.get("id"),
-            "question":     question,
-            "range_low":    low,
-            "range_high":   high,
-            "unit":         unit,
-            "yes_price":    yes_price,
-            "no_price":     no_price,
-            "yes_token_id": yes_token_id,
-            "no_token_id":  no_token_id,
-            "liquidity_usd": liquidity,
-            "volume_usd":   volume,
-            "resolution_date": raw.get("endDate") or raw.get("resolutionDate", ""),
+            "contract_id":      raw.get("conditionId") or raw.get("id"),
+            "gamma_market_id":  str(raw.get("id", "")),   # numeric Gamma ID for /markets/{id} lookups
+            "question":         question,
+            "range_low":        low,
+            "range_high":       high,
+            "unit":             unit,
+            "yes_price":        yes_price,
+            "no_price":         no_price,
+            "yes_token_id":     yes_token_id,
+            "no_token_id":      no_token_id,
+            "liquidity_usd":    liquidity,
+            "volume_usd":       volume,
+            "resolution_date":  raw.get("endDate") or raw.get("resolutionDate", ""),
         }
     except (KeyError, ValueError, TypeError, _json.JSONDecodeError) as e:
         logger.debug(f"Failed to normalize sub-market: {e}")
@@ -595,8 +596,119 @@ def search_temp_high_events(min_liquidity: float = 500.0) -> list[dict]:
 def get_contract_price(contract_id: str) -> dict | None:
     """Fetch the latest YES/NO prices for a specific sub-market contract."""
     try:
-        data = _gamma_get(f"/markets/{contract_id}", {})
+        result = _gamma_get("/markets", {"conditionId": contract_id})
+        data = result[0] if isinstance(result, list) and result else result
+        if not data:
+            return None
         return _normalize_sub_market(data, "")
     except Exception as e:
         logger.error(f"Failed to get price for {contract_id}: {e}")
         return None
+
+
+def get_market_status(contract_id: str, gamma_market_id: str = None) -> dict | None:
+    """
+    Fetch resolution status and current prices for a single sub-market.
+
+    Uses the numeric Gamma market ID (e.g. "1886470") for a direct path
+    lookup: GET /markets/{gamma_market_id}.  Falls back to scanning the
+    parent event if gamma_market_id is not provided.
+
+    Returns a dict with:
+        closed       bool   — True when market has resolved
+        yes_price    float  — current YES token price (1.0 or 0.0 if resolved)
+        no_price     float  — current NO token price
+        winner       str|None — "YES", "NO", or None if still open
+    Returns None on API error.
+    """
+    import json as _json
+    try:
+        if gamma_market_id:
+            data = _gamma_get(f"/markets/{gamma_market_id}", {})
+        else:
+            # Fallback: scan first page for a matching conditionId
+            result = _gamma_get("/markets", {"limit": 100})
+            markets = result if isinstance(result, list) else []
+            data = next((m for m in markets if m.get("conditionId") == contract_id), None)
+
+        if not data:
+            return None
+
+        closed = bool(data.get("closed", False))
+        active = bool(data.get("active", True))
+
+        def _parse(field):
+            val = data.get(field, "[]")
+            if isinstance(val, str):
+                return _json.loads(val)
+            return val or []
+
+        outcomes = _parse("outcomes")
+        prices   = _parse("outcomePrices")
+
+        yes_idx = next((i for i, o in enumerate(outcomes) if str(o).upper() == "YES"), None)
+        no_idx  = next((i for i, o in enumerate(outcomes) if str(o).upper() == "NO"),  None)
+
+        yes_price = float(prices[yes_idx]) if yes_idx is not None and yes_idx < len(prices) else None
+        no_price  = float(prices[no_idx])  if no_idx  is not None and no_idx  < len(prices) else None
+
+        # Determine winner: after resolution, the winning token trades at 1.0
+        winner = None
+        if closed:
+            if yes_price is not None and yes_price >= 0.99:
+                winner = "YES"
+            elif no_price is not None and no_price >= 0.99:
+                winner = "NO"
+
+        return {
+            "closed":    closed,
+            "active":    active,
+            "yes_price": yes_price,
+            "no_price":  no_price,
+            "winner":    winner,
+        }
+    except Exception as e:
+        logger.error(f"Failed to get market status for {contract_id}: {e}")
+        return None
+
+
+def get_data_api_positions(wallet_address: str) -> list[dict]:
+    """
+    Fetch all on-chain positions for a wallet from the Polymarket Data API.
+    This is the blockchain source of truth for live (non-paper) positions.
+
+    Returns a list of position dicts with keys:
+        token_id, title, outcome, size, avg_price,
+        initial_value, current_value, cash_pnl, percent_pnl
+    """
+    if not wallet_address:
+        return []
+    try:
+        resp = httpx.get(
+            "https://data-api.polymarket.com/positions",
+            params={"address": wallet_address, "sizeThreshold": "0"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        raw = resp.json()
+        if not isinstance(raw, list):
+            return []
+        result = []
+        for p in raw:
+            asset = p.get("asset", {})
+            result.append({
+                "token_id":      asset.get("token_id") or p.get("asset_id", ""),
+                "title":         p.get("title", ""),
+                "outcome":       asset.get("outcome", ""),
+                "size":          float(p.get("size", 0)),
+                "avg_price":     float(p.get("avgPrice", 0)),
+                "initial_value": float(p.get("initialValue", 0)),
+                "current_value": float(p.get("currentValue", 0)),
+                "cash_pnl":      float(p.get("cashPnl", 0)),
+                "percent_pnl":   float(p.get("percentPnl", 0)),
+            })
+        logger.info(f"Data API: fetched {len(result)} on-chain positions for {wallet_address[:10]}...")
+        return result
+    except Exception as e:
+        logger.error(f"Data API positions fetch failed: {e}")
+        return []

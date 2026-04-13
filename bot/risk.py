@@ -1,5 +1,13 @@
 import logging
-from datetime import datetime
+from datetime import datetime, date as _date, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+try:
+    from timezonefinder import TimezoneFinder as _TZF
+    _tf = _TZF()
+except Exception:
+    _tf = None
+
 from config import (
     MAX_POSITION_PCT,
     MAX_TOTAL_EXPOSURE_PCT,
@@ -10,8 +18,11 @@ from config import (
     TRADE_US_ONLY,
     US_LAT,
     US_LON,
+    MAX_BIN_BUYS,
+    ALLOWED_SIDES,
+    MAX_TRADE_DAYS,
 )
-from db import get_open_positions, get_daily_pnl
+from db import get_open_positions, get_daily_pnl, count_open_bins_for_event
 
 logger = logging.getLogger(__name__)
 
@@ -52,24 +63,53 @@ def check_total_exposure(new_position_size: float, bankroll: float) -> RiskCheck
     return RiskCheck(True)
 
 
-def check_time_to_expiry(resolution_date_str: str) -> RiskCheck:
+def check_time_to_expiry(
+    resolution_date_str: str,
+    lat: float | None = None,
+    lon: float | None = None,
+) -> RiskCheck:
     """
-    Do not trade within MIN_HOURS_TO_EXPIRY hours of resolution (default 6h).
-    Liquidity dries up and spreads widen dramatically near expiry.
+    Do not trade within MIN_HOURS_TO_EXPIRY hours of local end-of-day resolution.
+
+    Polymarket temperature contracts resolve at end of the calendar day **in the
+    city's local timezone** (e.g. Moscow April 12 resolves at 20:59 UTC, not
+    23:59 UTC).  Using UTC midnight would allow trades within the window when
+    the market has effectively already closed locally.
+
+    Resolution time = 23:59:59 local time on the event date.
+    Falls back to UTC midnight if lat/lon are unavailable or timezonefinder
+    cannot determine a timezone for the location.
     """
     try:
-        resolution_dt = datetime.fromisoformat(resolution_date_str.replace("Z", "+00:00"))
-        hours_remaining = (
-            resolution_dt - datetime.now(tz=resolution_dt.tzinfo)
-        ).total_seconds() / 3600
+        date_str = resolution_date_str[:10]   # keep only YYYY-MM-DD
+        year, month, day = int(date_str[:4]), int(date_str[5:7]), int(date_str[8:10])
+
+        # Resolve the local timezone from coordinates when possible
+        tz = None
+        if lat is not None and lon is not None and _tf is not None:
+            try:
+                tz_name = _tf.timezone_at(lat=lat, lng=lon)
+                if tz_name:
+                    tz = ZoneInfo(tz_name)
+            except (ZoneInfoNotFoundError, Exception):
+                pass
+
+        if tz is None:
+            tz = ZoneInfo("UTC")
+
+        # End-of-day in local timezone
+        resolution_dt = datetime(year, month, day, 23, 59, 59, tzinfo=tz)
+        now_utc       = datetime.now(tz=ZoneInfo("UTC"))
+        hours_remaining = (resolution_dt.astimezone(ZoneInfo("UTC")) - now_utc).total_seconds() / 3600
 
         if hours_remaining < MIN_HOURS_TO_EXPIRY:
             return RiskCheck(
                 False,
-                f"Only {hours_remaining:.1f}h to expiry (min {MIN_HOURS_TO_EXPIRY}h)"
+                f"Only {hours_remaining:.1f}h to local expiry (min {MIN_HOURS_TO_EXPIRY}h)"
             )
         return RiskCheck(True)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as e:
+        logger.warning(f"check_time_to_expiry could not parse '{resolution_date_str}': {e}")
         return RiskCheck(False, "Could not parse resolution date")
 
 
@@ -109,6 +149,39 @@ def check_normalization_warning(signal: dict) -> RiskCheck:
     return RiskCheck(True)
 
 
+def check_allowed_side(side: str) -> RiskCheck:
+    """
+    Block trades on sides not permitted by ALLOWED_SIDES config.
+    "yes"  → only YES trades allowed
+    "no"   → only NO trades allowed
+    "both" → no restriction
+    """
+    if ALLOWED_SIDES == "both":
+        return RiskCheck(True)
+    if ALLOWED_SIDES == "yes" and side != "YES":
+        return RiskCheck(False, f"ALLOWED_SIDES=yes — blocking {side} trade")
+    if ALLOWED_SIDES == "no" and side != "NO":
+        return RiskCheck(False, f"ALLOWED_SIDES=no — blocking {side} trade")
+    return RiskCheck(True)
+
+
+def check_bin_limit(city: str, date: str) -> RiskCheck:
+    """
+    Block trade if the bot already holds MAX_BIN_BUYS open positions
+    for the same city+date event.  MAX_BIN_BUYS=0 disables the check.
+    """
+    if MAX_BIN_BUYS <= 0:
+        return RiskCheck(True)
+    current = count_open_bins_for_event(city, date)
+    if current >= MAX_BIN_BUYS:
+        return RiskCheck(
+            False,
+            f"MAX_BIN_BUYS={MAX_BIN_BUYS} reached for {city} {date} "
+            f"({current} open position(s))",
+        )
+    return RiskCheck(True)
+
+
 def check_us_only(lat: float | None, lon: float | None) -> RiskCheck:
     """Block non-US trades when TRADE_US_ONLY is enabled."""
     if not TRADE_US_ONLY:
@@ -118,6 +191,31 @@ def check_us_only(lat: float | None, lon: float | None) -> RiskCheck:
     if not (US_LAT[0] <= lat <= US_LAT[1] and US_LON[0] <= lon <= US_LON[1]):
         return RiskCheck(False, f"TRADE_US_ONLY: ({lat:.2f},{lon:.2f}) is outside US bounds")
     return RiskCheck(True)
+
+
+def check_trade_days(resolution_date_str: str) -> RiskCheck:
+    """
+    Block trades on contracts that resolve more than MAX_TRADE_DAYS calendar
+    days from today (UTC).  Prevents entering far-future contracts where model
+    uncertainty is too high and edge estimates are unreliable.
+
+    MAX_TRADE_DAYS=0 → only today's contracts.
+    MAX_TRADE_DAYS=1 → today + tomorrow.
+    """
+    try:
+        event_date = _date.fromisoformat(resolution_date_str[:10])
+        today      = _date.today()
+        days_away  = (event_date - today).days
+        if days_away < 0:
+            return RiskCheck(False, f"Contract date {event_date} is in the past")
+        if days_away > MAX_TRADE_DAYS:
+            return RiskCheck(
+                False,
+                f"Contract resolves in {days_away}d (MAX_TRADE_DAYS={MAX_TRADE_DAYS})",
+            )
+        return RiskCheck(True)
+    except (ValueError, TypeError):
+        return RiskCheck(False, "Could not parse resolution date for trade-day check")
 
 
 def check_daily_drawdown(bankroll: float) -> RiskCheck:
@@ -145,6 +243,8 @@ def run_all_checks(signal: dict, bankroll: float) -> tuple[bool, list[str]]:
     failures: list[str] = []
 
     checks = [
+        check_allowed_side(signal.get("recommended_side", "")),
+        check_bin_limit(signal.get("city", ""), signal.get("date", "")),
         check_position_size(signal.get("kelly_size", 0), bankroll),
         check_total_exposure(signal.get("kelly_size", 0), bankroll),
         check_liquidity(signal.get("liquidity_usd", 0)),
@@ -159,11 +259,15 @@ def run_all_checks(signal: dict, bankroll: float) -> tuple[bool, list[str]]:
     if sigma_c is not None:
         checks.append(check_forecast_sigma(sigma_c))
 
-    # Time-to-expiry check uses the event date (resolution at end of that day)
+    # Time-to-expiry check — resolution is end-of-day in the city's local timezone
     resolution_date = signal.get("metadata", {}).get("date") or signal.get("date", "")
     if resolution_date:
-        # Treat resolution as end-of-day UTC for the event date
-        checks.append(check_time_to_expiry(f"{resolution_date}T23:59:59Z"))
+        checks.append(check_trade_days(resolution_date))
+        checks.append(check_time_to_expiry(
+            resolution_date,
+            lat=signal.get("lat"),
+            lon=signal.get("lon"),
+        ))
 
     for check in checks:
         if not check:

@@ -1,0 +1,51 @@
+# systemd service unit for the Polymarket Weather Arbitrage Bot
+#
+# Installation (Linux):
+#   1. Edit WorkingDirectory and ExecStart to match your actual paths
+#   2. sudo cp deploy/weather_bot.service /etc/systemd/system/
+#   3. sudo systemctl daemon-reload
+#   4. sudo systemctl enable weather_bot   # start on boot
+#   5. sudo systemctl start weather_bot    # start now
+#
+# Useful commands:
+#   sudo systemctl status weather_bot      # check status
+#   sudo journalctl -u weather_bot -f      # tail logs
+#   sudo systemctl restart weather_bot     # manual restart
+
+[Unit]
+Description=Polymarket Weather Arbitrage Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# --- Edit these two lines to match your setup ---
+WorkingDirectory=/home/YOUR_USER/polymarket-weather/bot
+ExecStart=/home/YOUR_USER/polymarket-weather/venv/bin/python main.py
+
+# Run as a non-root user for security
+User=YOUR_USER
+Group=YOUR_USER
+
+# Load environment variables from .env file
+EnvironmentFile=/home/YOUR_USER/polymarket-weather/.env
+
+# Restart policy: restart on any non-zero exit (crash), but not on
+# clean shutdown (e.g. systemctl stop).
+Restart=on-failure
+RestartSec=30s
+
+# Give the bot 60 seconds to shut down cleanly before force-killing
+TimeoutStopSec=60
+
+# Log stdout/stderr to the systemd journal (readable via journalctl)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=weather_bot
+
+# Resource limits — prevent runaway memory use
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

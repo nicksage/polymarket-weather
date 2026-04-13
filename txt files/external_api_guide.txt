@@ -40,7 +40,8 @@ source: NOAA CDO (ncdc.noaa.gov)
 -----------------------------------------------------------------------------------------
 This is the National Blend of Models text product. Not a REST JSON API — the bot scrapes a plain-text formatted bulletin from NOAA's MDL (Meteorological Development Laboratory) server.
 
-The bulletin contains Q10/Q25/Q50/Q75/Q90 temperature quantiles for a given ASOS station, updated several times daily (the bot tries forecast cycles 12z, 06z, 00z, 18z in order). From those 5 quantiles the bot derives μ (= Q50) and σ (= IQR / 1.349).
+The bulletin contains Q10/Q25/Q50/Q75/Q90 temperature quantiles for a given ASOS station, updated several times daily (the bot tries forecast cycles 12z, 06z, 00z, 18z in order).
+From those 5 quantiles the bot derives μ (= Q50) and σ (= IQR / 1.349).
 
 This is the primary US supplemental source. Blended at 30% weight when available. Preferred over NWS hourly because it gives explicit uncertainty quantiles rather than a single point forecast.
 
@@ -60,6 +61,7 @@ Q: How is this information used to ultimately make a decision?
 
     The result is a single probability (0–1) representing the ensemble's best estimate of whether the weather event occurs.
 
+#########################################################################################
 
 Q: What Are the Weather APIs Actually Returning?
 
@@ -101,7 +103,6 @@ Q: What Are the Weather APIs Actually Returning?
     market_p = 0.43  (Polymarket YES price)
     edge     = 0.31 - 0.43 = -0.12  → bet NO`
 
-
 #########################################################################################
 
 Q: What is ERA5?
@@ -111,6 +112,8 @@ Q: What is ERA5?
     (weather stations, radiosondes, satellites) and running a climate model backward over them to produce a physically consistent, gap-free 
     reconstruction of atmospheric conditions back to 1940.  When you ask "what was the actual high temperature in London on April 10, 2019?" 
     — ERA5 is the authoritative answer. It's essentially the gold standard for historical weather data.
+
+#########################################################################################
 
 Q: What is KDE?
     
@@ -135,3 +138,54 @@ Q: What is KDE?
                         Bayesian blend of corrected forecast + prior
                                                             ↓
                             P(temp in bin_i) for each outcome range
+
+#########################################################################################
+
+Q: What occurs in the "DISCOVERY RUN" loop?
+
+    FREQUENCY: Runs every 4 hours at the top of the hour. 12am, 4am, 8am, etc.
+
+    A: Single responsibility: find what markets exist. Occurs every 4 hours.
+
+    1. Calls Polymarket Gamma API (/events?tag_slug=temperature) — paginated, ~2 pages × 100 events = ~200 API calls with the 1 req/s rate limiter
+    2. For each event, normalizes the sub-markets (parses temperature ranges, extracts city/date/lat/lon)
+    3. Returns the event list — nothing is written to the DB here
+    
+    External API calls made: Polymarket Gamma API only. ~2-5 calls for the happy path (tag slug works), up to ~60 calls on the fallback full scan.
+
+#########################################################################################
+
+Q: What occurs in the "TRADING RUN" loop?
+
+    FREQUENCY: Runs hourly at 10 minutes past the hour. 12:10am, 1:10am, 2:10am, etc.
+
+    A: For each discovered event (say there are 20 active markets). Occurs every 30-60 minutes.
+
+        Step	            What happens	                    APIs called
+    Weather fetch	    ECMWF ensemble	                    Open-Meteo Ensemble API (1 call/event)
+                        GFS ensemble	                    Open-Meteo Ensemble API (1 call/event)
+                        ERA5 climatology	                Open-Meteo Archive API (cache miss only)
+                        NOAA NBM (US)	                    NWS Points + MDL NBM text product (2 calls/US event)
+                        Tomorrow.io	                        Tomorrow.io API (1 call/event, skipped if rate-limited)
+                        Bias correction	                    SQLite only — no API
+    Edge calculation	Kelly sizing, signal generation	    No API
+    DB write	        Persist events + outcomes	        SQLite only
+    Execution	        Place orders (if signals pass risk)	Polymarket CLOB API
+
+    For 20 events: ~40-60 weather API calls per trading run. The ERA5 calls are heavily cached after the first run so most of those go to SQLite. Tomorrow.io rate-limits itself after the first few calls per cycle.
+
+#########################################################################################
+
+Q: What occurs in the "MONITOR RUN" loop?
+
+    FREQUENCY: Runs hourly at 30 minutes past the hour. 12:30am, 1:30am, 2:30am, etc.
+
+    A: The settlement loop is deliberately lighter than the trading loop — it doesn't call weather APIs at all. Its main cost is a handful of 
+    Gamma API calls (one per open position to check resolution status). With 5-10 open positions at a time, that's 5-10 API calls per settlement 
+    run, well within any rate limit. Occurs every 1-2 hours. 
+
+    1. Cancel pending orders — any live order not filled before this run is cancelled via CLOB API, logged with cancelled_reason="unfilled_before_monitor_run"
+    2. Settle resolved markets — checks Gamma API for each open position; if closed=True, determines winner from outcomePrices, computes P&L, marks position closed. For live trades, prefers cashPnl from the Polymarket Data API (on-chain source of truth) over our own math
+    3. Update unrealized P&L — refreshes current_price and unrealized_pnl for all open positions (Data API for live, Gamma API for paper)
+
+#########################################################################################
