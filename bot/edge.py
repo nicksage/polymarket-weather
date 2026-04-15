@@ -281,7 +281,7 @@ def analyze_temp_event(event: dict, bankroll: float) -> dict | None:
 
     n_signals = sum(1 for o in enriched_outcomes if o["is_signal"])
     logger.info(
-        f"Event: {city} {date_str} | μ={mu_c:.1f}°C σ={sigma_c:.1f}°C | "
+        f"Event: {city} {date_str} | mu={mu_c:.1f}°C sd={sigma_c:.1f}°C | "
         f"{n_outcomes} outcomes | {n_signals} signals | "
         f"overround={market_sum:.3f}"
     )

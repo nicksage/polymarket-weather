@@ -1,9 +1,10 @@
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime
 
-DB_PATH = os.getenv("DB_PATH", "data/signals.db")
+# Single source of truth — always resolves to bot/data/signals.db (absolute).
+from config import DB_PATH
 
 
 @contextmanager
@@ -145,6 +146,11 @@ def init_db():
             "ALTER TABLE positions ADD COLUMN no_token_id      TEXT",
             "ALTER TABLE positions ADD COLUMN lat              REAL",
             "ALTER TABLE positions ADD COLUMN lon              REAL",
+            "ALTER TABLE positions ADD COLUMN forecast_sigma_c REAL",
+            # forecast_errors table — model column added for per-(city, month, model) bias.
+            # Existing rows default to 'ecmwf' since that's the only model previously tracked.
+            "ALTER TABLE forecast_errors ADD COLUMN model TEXT DEFAULT 'ecmwf'",
+            "ALTER TABLE forecast_errors ADD COLUMN lead_days_bucket INTEGER",
         ]:
             try:
                 conn.execute(col_def)
@@ -189,6 +195,42 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_bias_loc_cmd
                 ON forecast_errors(lat_key, lon_key, calendar_month_day);
+
+            -- Cache of Visual Crossing daily-max observations, keyed by
+            -- coordinate + date.  Populated by the bias backfill script and
+            -- the monitor loop.  Source is always station-observed ("obs").
+            CREATE TABLE IF NOT EXISTS historical_observed_daily (
+                lat_key     REAL NOT NULL,        -- round(lat, 2)
+                lon_key     REAL NOT NULL,        -- round(lon, 2)
+                city        TEXT,
+                date        TEXT NOT NULL,        -- YYYY-MM-DD local
+                tempmax_c   REAL,
+                tempmin_c   REAL,
+                temp_c      REAL,
+                stations    TEXT,                  -- JSON list of station IDs
+                fetched_at  TEXT NOT NULL,
+                PRIMARY KEY (lat_key, lon_key, date)
+            );
+            CREATE INDEX IF NOT EXISTS idx_hod_city_date
+                ON historical_observed_daily(city, date);
+
+            -- Cache of Open-Meteo Previous Runs historical forecasts.
+            -- One row per (location, date, model, lead_days) — lets us store
+            -- multiple lead times and multiple models for the same day.
+            CREATE TABLE IF NOT EXISTS historical_forecasts_previous_runs (
+                lat_key             REAL NOT NULL,
+                lon_key             REAL NOT NULL,
+                city                TEXT,
+                date                TEXT NOT NULL,
+                model               TEXT NOT NULL,
+                lead_days           INTEGER NOT NULL,
+                forecast_tempmax_c  REAL,
+                n_hours             INTEGER,
+                fetched_at          TEXT NOT NULL,
+                PRIMARY KEY (lat_key, lon_key, date, model, lead_days)
+            );
+            CREATE INDEX IF NOT EXISTS idx_hfpr_city_model_date
+                ON historical_forecasts_previous_runs(city, model, date);
         """)
 
 
@@ -248,6 +290,7 @@ def insert_position(
     no_token_id: str = None,
     lat: float = None,
     lon: float = None,
+    forecast_sigma_c: float = None,
 ) -> int:
     sql = """
         INSERT INTO positions (
@@ -257,8 +300,9 @@ def insert_position(
             fill_status, shares, scan_timestamp,
             unrealized_pnl, current_price, gamma_market_id,
             range_low, range_high, unit,
-            yes_token_id, no_token_id, lat, lon
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            yes_token_id, no_token_id, lat, lon,
+            forecast_sigma_c
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     with _get_conn() as conn:
         cur = conn.execute(sql, (
@@ -270,6 +314,7 @@ def insert_position(
             gamma_market_id,
             range_low, range_high, unit,
             yes_token_id, no_token_id, lat, lon,
+            forecast_sigma_c,
         ))
         return cur.lastrowid
 
@@ -438,6 +483,70 @@ def backfill_position_coords() -> int:
                     (coords[0], coords[1], pos_id),
                 )
                 updated += 1
+    return updated
+
+
+def backfill_position_sigma() -> int:
+    """
+    For any position with NULL forecast_sigma_c, attempt to fill it by joining
+    positions.contract_id + positions.scan_timestamp against temp_outcomes and
+    temp_events (which store forecast_sigma_c per scan).
+
+    Falls back to matching on contract_id alone (any scan) when the
+    scan_timestamp is missing or the exact scan row has been purged.
+
+    Returns the number of rows updated.  Safe to call repeatedly.
+    """
+    with _get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, contract_id, scan_timestamp FROM positions "
+            "WHERE forecast_sigma_c IS NULL"
+        ).fetchall()
+        if not rows:
+            return 0
+
+        updated = 0
+        for pos_id, contract_id, scan_ts in rows:
+            sigma = None
+
+            # Preferred: exact scan_timestamp match
+            if scan_ts:
+                row = conn.execute(
+                    """
+                    SELECT e.forecast_sigma_c
+                    FROM temp_outcomes o
+                    JOIN temp_events e ON o.event_row_id = e.id
+                    WHERE o.contract_id = ? AND o.scan_timestamp = ?
+                    LIMIT 1
+                    """,
+                    (contract_id, scan_ts),
+                ).fetchone()
+                if row:
+                    sigma = row[0]
+
+            # Fallback: any scan for this contract
+            if sigma is None:
+                row = conn.execute(
+                    """
+                    SELECT e.forecast_sigma_c
+                    FROM temp_outcomes o
+                    JOIN temp_events e ON o.event_row_id = e.id
+                    WHERE o.contract_id = ?
+                    ORDER BY o.scan_timestamp DESC
+                    LIMIT 1
+                    """,
+                    (contract_id,),
+                ).fetchone()
+                if row:
+                    sigma = row[0]
+
+            if sigma is not None:
+                conn.execute(
+                    "UPDATE positions SET forecast_sigma_c = ? WHERE id = ?",
+                    (sigma, pos_id),
+                )
+                updated += 1
+
     return updated
 
 
@@ -715,10 +824,15 @@ def insert_forecast_error(
     lat: float, lon: float, city: str,
     target_date: str, days_ahead: int,
     forecast_mu_c: float, actual_tmax_c: float,
+    model: str = "ecmwf_ifs025",
 ) -> None:
     """
-    Record one ECMWF forecast vs ERA5 actuals comparison.
+    Record one forecast-vs-actual comparison.
     Called by bias.py after a contract resolves and ERA5 data is available.
+
+    `model` defaults to 'ecmwf_ifs025' to match the backfilled rows produced
+    by scripts/backfill_bias_data.py.  Pass a different model id (e.g.
+    'gfs_global') if recording GFS errors separately.
     """
     lat_key, lon_key = _loc_keys(lat, lon)
     from datetime import datetime, timezone
@@ -728,13 +842,15 @@ def insert_forecast_error(
     sql = """
         INSERT INTO forecast_errors
             (lat_key, lon_key, city, calendar_month_day, target_date,
-             days_ahead, forecast_mu_c, actual_tmax_c, error_c, recorded_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             days_ahead, forecast_mu_c, actual_tmax_c, error_c, recorded_at,
+             model)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     with _get_conn() as conn:
         conn.execute(sql, (
             lat_key, lon_key, city, month_day, target_date,
             days_ahead, forecast_mu_c, actual_tmax_c, error_c, now,
+            model,
         ))
 
 
@@ -743,24 +859,27 @@ def get_bias_correction(
     calendar_month_day: str,
     window_days: int = 30,
     min_observations: int = 10,
+    model: str = "ecmwf",
 ) -> tuple[float, int]:
     """
-    Compute the mean ECMWF forecast error for a location over a rolling
+    Compute the mean forecast error for a location + model over a rolling
     calendar window centred on `calendar_month_day` (MM-DD format).
 
     We use a ±window_days calendar window (ignoring year) to capture
     seasonal bias rather than one calendar date in isolation.
 
     Returns (bias_correction_c, n_observations).
-        bias_correction_c > 0 means ECMWF historically runs too cold → add to forecast
-        bias_correction_c < 0 means ECMWF historically runs too warm → subtract
+        bias_correction_c > 0 means the model historically runs too cold → add to forecast
+        bias_correction_c < 0 means the model historically runs too warm → subtract
     Returns (0.0, 0) if fewer than min_observations are available.
+
+    `model` filters forecast_errors by the model column.  Legacy rows inserted
+    before the column existed default to 'ecmwf'.
     """
     lat_key, lon_key = _loc_keys(lat, lon)
 
     # Build a list of MM-DD strings within ±window_days of the target
     from datetime import date as _date, timedelta
-    import calendar as _cal
     try:
         month = int(calendar_month_day[:2])
         day   = int(calendar_month_day[3:])
@@ -777,13 +896,14 @@ def get_bias_correction(
     sql = f"""
         SELECT error_c FROM forecast_errors
         WHERE lat_key = ? AND lon_key = ?
+          AND COALESCE(model, 'ecmwf') = ?
           AND calendar_month_day IN ({placeholders})
         ORDER BY recorded_at DESC
-        LIMIT 60
+        LIMIT 2000
     """
     with _get_conn() as conn:
         rows = conn.execute(
-            sql, [lat_key, lon_key] + list(window_dates)
+            sql, [lat_key, lon_key, model] + list(window_dates)
         ).fetchall()
 
     errors = [r[0] for r in rows if r[0] is not None]
@@ -793,4 +913,145 @@ def get_bias_correction(
     return (sum(errors) / n, n)
 
 
-import calendar  # needed by get_bias_correction
+# ---------------------------------------------------------------------------
+# Upsert helpers for the VC + OM backfill caches
+# ---------------------------------------------------------------------------
+
+def upsert_historical_observed_daily(
+    lat: float, lon: float, city: str | None, rows: list[dict]
+) -> int:
+    """
+    Insert/replace Visual Crossing daily observation rows.
+
+    `rows` items must have: date, tempmax_c, tempmin_c, temp_c, stations (list).
+    Returns number of rows written.
+    """
+    if not rows:
+        return 0
+    import json
+    lat_key, lon_key = _loc_keys(lat, lon)
+    now = datetime.utcnow().isoformat() + "Z"
+    sql = """
+        INSERT INTO historical_observed_daily
+            (lat_key, lon_key, city, date, tempmax_c, tempmin_c, temp_c,
+             stations, fetched_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(lat_key, lon_key, date) DO UPDATE SET
+            city       = excluded.city,
+            tempmax_c  = excluded.tempmax_c,
+            tempmin_c  = excluded.tempmin_c,
+            temp_c     = excluded.temp_c,
+            stations   = excluded.stations,
+            fetched_at = excluded.fetched_at
+    """
+    with _get_conn() as conn:
+        for r in rows:
+            conn.execute(sql, (
+                lat_key, lon_key, city, r["date"],
+                r.get("tempmax_c"), r.get("tempmin_c"), r.get("temp_c"),
+                json.dumps(r.get("stations") or []),
+                now,
+            ))
+    return len(rows)
+
+
+def upsert_historical_forecasts_previous_runs(
+    lat: float, lon: float, city: str | None, rows: list[dict]
+) -> int:
+    """
+    Insert/replace Open-Meteo Previous Runs forecast rows.
+
+    `rows` items must have: date, model, lead_days, forecast_tempmax_c, n_hours.
+    Returns number of rows written.
+    """
+    if not rows:
+        return 0
+    lat_key, lon_key = _loc_keys(lat, lon)
+    now = datetime.utcnow().isoformat() + "Z"
+    sql = """
+        INSERT INTO historical_forecasts_previous_runs
+            (lat_key, lon_key, city, date, model, lead_days,
+             forecast_tempmax_c, n_hours, fetched_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(lat_key, lon_key, date, model, lead_days) DO UPDATE SET
+            city               = excluded.city,
+            forecast_tempmax_c = excluded.forecast_tempmax_c,
+            n_hours            = excluded.n_hours,
+            fetched_at         = excluded.fetched_at
+    """
+    with _get_conn() as conn:
+        for r in rows:
+            conn.execute(sql, (
+                lat_key, lon_key, city, r["date"], r["model"], r["lead_days"],
+                r.get("forecast_tempmax_c"), r.get("n_hours"),
+                now,
+            ))
+    return len(rows)
+
+
+def rebuild_forecast_errors_from_cache(
+    lat: float, lon: float,
+    city: str | None = None,
+    lead_days: int = 3,
+) -> int:
+    """
+    Join historical_observed_daily + historical_forecasts_previous_runs for
+    one location, compute error = actual - forecast, and write rows into
+    forecast_errors (one per (date, model) pair).
+
+    Idempotent: deletes any existing backfilled forecast_errors rows for the
+    location before re-inserting, so re-running this after an updated cache
+    won't create duplicates.
+
+    A "backfilled" row is distinguished from a live-recorded row by having
+    lead_days_bucket matching the lead_days argument AND being written by
+    this function.  We key the delete on (lat_key, lon_key, lead_days_bucket).
+
+    Returns the number of forecast_errors rows written.
+    """
+    lat_key, lon_key = _loc_keys(lat, lon)
+    now = datetime.utcnow().isoformat() + "Z"
+    with _get_conn() as conn:
+        # Remove any previously-backfilled rows for this (location, lead) so
+        # we can re-insert cleanly from the updated cache.
+        conn.execute(
+            "DELETE FROM forecast_errors "
+            "WHERE lat_key = ? AND lon_key = ? AND lead_days_bucket = ?",
+            (lat_key, lon_key, lead_days),
+        )
+
+        # Join the two caches and insert a forecast_errors row per match.
+        cursor = conn.execute("""
+            SELECT f.date, f.model, f.lead_days, f.forecast_tempmax_c,
+                   o.tempmax_c
+            FROM historical_forecasts_previous_runs f
+            JOIN historical_observed_daily o
+              ON f.lat_key = o.lat_key
+             AND f.lon_key = o.lon_key
+             AND f.date    = o.date
+            WHERE f.lat_key = ? AND f.lon_key = ?
+              AND f.lead_days = ?
+              AND f.forecast_tempmax_c IS NOT NULL
+              AND o.tempmax_c IS NOT NULL
+        """, (lat_key, lon_key, lead_days))
+
+        inserted = 0
+        for date_str, model, lead, fcst, actual in cursor.fetchall():
+            error_c = actual - fcst
+            cmd     = date_str[5:]   # MM-DD
+            conn.execute("""
+                INSERT INTO forecast_errors
+                    (lat_key, lon_key, city, calendar_month_day, target_date,
+                     days_ahead, forecast_mu_c, actual_tmax_c, error_c,
+                     recorded_at, model, lead_days_bucket)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                lat_key, lon_key, city, cmd, date_str,
+                lead, fcst, actual, error_c, now, model, lead,
+            ))
+            inserted += 1
+
+    return inserted
+
+
+import calendar  # kept for any downstream code that imports it from here

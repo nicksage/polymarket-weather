@@ -40,6 +40,7 @@ from db import (
     cancel_position,
     backfill_gamma_market_ids,
     backfill_position_coords,
+    backfill_position_sigma,
 )
 from polymarket import get_market_status, get_data_api_positions, search_temp_high_events
 from execution import cancel_order, get_clob_client
@@ -307,6 +308,11 @@ def run_monitor_loop() -> dict:
     coords_filled = backfill_position_coords()
     if coords_filled:
         logger.info(f"[MONITOR] Backfilled lat/lon for {coords_filled} position(s)")
+
+    # Step 0b-σ — Backfill forecast_sigma_c for positions that predate the column.
+    sigma_filled = backfill_position_sigma()
+    if sigma_filled:
+        logger.info(f"[MONITOR] Backfilled forecast_sigma_c for {sigma_filled} position(s)")
 
     # Step 0b — Backfill gamma_market_id for any open positions missing it.
     # Runs a fresh discovery scan so we get the current numeric Gamma IDs;

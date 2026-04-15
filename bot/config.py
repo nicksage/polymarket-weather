@@ -35,7 +35,12 @@ MIN_HOURS_TO_EXPIRY: float = _float("MIN_HOURS_TO_EXPIRY", 6.0)
 MAX_DAILY_DRAWDOWN_PCT: float = _float("MAX_DAILY_DRAWDOWN_PCT", 0.10)
 
 # System
-DB_PATH: str = os.getenv("DB_PATH", "data/signals.db")
+# Always resolve DB_PATH to bot/data/signals.db regardless of where Python
+# is launched from (repo root, bot/, or elsewhere).  This prevents stale
+# duplicate DBs from appearing at ./data/signals.db when the bot is run
+# from the project root and the dashboard is run from bot/.
+_BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH: str = os.path.join(_BOT_DIR, "data", "signals.db")
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
 # ---------------------------------------------------------------------------

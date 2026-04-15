@@ -15,6 +15,7 @@ Live order status values returned by Polymarket CLOB:
 
 import logging
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType
@@ -65,7 +66,10 @@ def execute_signal(signal: dict, client: ClobClient | None = None) -> dict:
     contract_id = signal["contract_id"]
     side        = signal["recommended_side"]
     size_usdc   = signal["kelly_size"]
-    entry_time  = datetime.now(timezone.utc).isoformat()
+    # Store entry_time in local US Central (CST/CDT auto-handled by ZoneInfo).
+    # The ISO string carries an explicit offset (e.g. -05:00) so the instant
+    # remains unambiguous.
+    entry_time  = datetime.now(ZoneInfo("America/Chicago")).isoformat()
 
     # Determine token ID and price based on side
     if side == "YES":
@@ -105,8 +109,9 @@ def execute_signal(signal: dict, client: ClobClient | None = None) -> dict:
         unit            = signal.get("unit"),
         yes_token_id    = signal.get("yes_token_id"),
         no_token_id     = signal.get("no_token_id"),
-        lat             = signal.get("lat"),
-        lon             = signal.get("lon"),
+        lat              = signal.get("lat"),
+        lon              = signal.get("lon"),
+        forecast_sigma_c = signal.get("forecast_sigma_c"),
     )
 
     # -------------------------------------------------------------------------

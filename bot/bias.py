@@ -193,10 +193,10 @@ def log_bias_summary() -> None:
         logger.info("Bias summary: no locations with 3+ observations yet")
         return
 
-    logger.info("=== ECMWF Bias Summary (actual − forecast) ===")
+    logger.info("=== ECMWF Bias Summary (actual - forecast) ===")
     for r in rows:
         logger.info(
             f"  {r['city'] or '?':20s} n={r['n']:3d} | "
             f"mean_error={r['mean_error']:+.2f}°C | "
-            f"{r['earliest']} → {r['latest']}"
+            f"{r['earliest']} to {r['latest']}"
         )

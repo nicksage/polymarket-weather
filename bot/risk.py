@@ -21,6 +21,7 @@ from config import (
     MAX_BIN_BUYS,
     ALLOWED_SIDES,
     MAX_TRADE_DAYS,
+    PAPER_TRADE,
 )
 from db import get_open_positions, get_daily_pnl, count_open_bins_for_event
 
@@ -49,16 +50,30 @@ def check_position_size(size_usdc: float, bankroll: float) -> RiskCheck:
 
 
 def check_total_exposure(new_position_size: float, bankroll: float) -> RiskCheck:
-    """Total open exposure must not exceed MAX_TOTAL_EXPOSURE_PCT of bankroll (default 20%)."""
-    open_positions   = get_open_positions()
-    current_exposure = sum(p.get("size_usdc", 0) for p in open_positions)
+    """
+    Total open exposure must not exceed MAX_TOTAL_EXPOSURE_PCT of bankroll.
+    Paper and live positions are tracked separately — in paper mode only
+    paper positions count; in live mode only live positions count.  This
+    matches the dashboard's per-mode Capital Deployed metrics.
+    """
+    open_positions = get_open_positions()
+    is_paper_int   = 1 if PAPER_TRADE else 0
+    relevant = [
+        p for p in open_positions
+        if p.get("is_paper", 1) == is_paper_int
+        and p.get("fill_status") != "cancelled"
+    ]
+    current_exposure = sum(p.get("size_usdc", 0) for p in relevant)
     new_total        = current_exposure + new_position_size
+    cap              = MAX_TOTAL_EXPOSURE_PCT * bankroll
 
-    if new_total > MAX_TOTAL_EXPOSURE_PCT * bankroll:
+    if new_total > cap:
+        mode = "paper" if PAPER_TRADE else "live"
         return RiskCheck(
             False,
-            f"Total exposure ${new_total:.2f} would exceed "
-            f"{MAX_TOTAL_EXPOSURE_PCT*100:.0f}% of bankroll"
+            f"Total {mode} exposure ${new_total:,.2f} would exceed "
+            f"{MAX_TOTAL_EXPOSURE_PCT*100:.0f}% cap (${cap:,.2f}); "
+            f"current={current_exposure:,.2f} over {len(relevant)} position(s)"
         )
     return RiskCheck(True)
 
@@ -132,7 +147,7 @@ def check_forecast_sigma(sigma_c: float) -> RiskCheck:
     if sigma_c > MAX_FORECAST_SIGMA_C:
         return RiskCheck(
             False,
-            f"Forecast σ={sigma_c:.2f}°C > maximum ({MAX_FORECAST_SIGMA_C}°C) — "
+            f"Forecast sd={sigma_c:.2f}°C > maximum ({MAX_FORECAST_SIGMA_C}°C) - "
             "ensemble too uncertain"
         )
     return RiskCheck(True)

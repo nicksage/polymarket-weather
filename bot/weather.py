@@ -186,7 +186,7 @@ def _get_ecmwf_ensemble_distribution(
     if fit is None:
         return None
     mu, sigma = fit
-    logger.debug(f"ECMWF ensemble: n={len(values)} μ={mu:.2f}°C σ={sigma:.2f}°C")
+    logger.debug(f"ECMWF ensemble: n={len(values)} mu={mu:.2f}°C sd={sigma:.2f}°C")
     return {"mu_c": mu, "sigma_c": sigma, "source": "ecmwf", "n": len(values)}
 
 
@@ -236,7 +236,7 @@ def _get_gfs_ensemble_distribution(
     if fit is None:
         return None
     mu, sigma = fit
-    logger.debug(f"GFS ensemble: n={len(values)} μ={mu:.2f}°C σ={sigma:.2f}°C")
+    logger.debug(f"GFS ensemble: n={len(values)} mu={mu:.2f}°C sd={sigma:.2f}°C")
     return {"mu_c": mu, "sigma_c": sigma, "source": "gfs", "n": len(values)}
 
 
@@ -430,7 +430,7 @@ def _get_era5_clim_distribution(
         sigma_c = float(statistics.stdev(detrended))
         sigma_c = max(sigma_c, MIN_FORECAST_SIGMA_C)
         logger.debug(
-            f"ERA5 clim (KDE): n={len(detrended)} μ={mu_c:.2f}°C σ={sigma_c:.2f}°C "
+            f"ERA5 clim (KDE): n={len(detrended)} mu={mu_c:.2f}°C sd={sigma_c:.2f}°C "
             f"trend_adj={trend_adj:+.2f}°C new_fetched={fetched_new}"
         )
         return {
@@ -444,7 +444,7 @@ def _get_era5_clim_distribution(
         sigma_c = max(sigma_c, MIN_FORECAST_SIGMA_C)
         mu_c    = float(trend_adj_mean)
         logger.debug(
-            f"ERA5 clim (normal): n={len(detrended)} μ={mu_c:.2f}°C σ={sigma_c:.2f}°C "
+            f"ERA5 clim (normal): n={len(detrended)} mu={mu_c:.2f}°C sd={sigma_c:.2f}°C "
             f"trend_adj={trend_adj:+.2f}°C new_fetched={fetched_new}"
         )
         return {
@@ -583,7 +583,7 @@ def _get_noaa_nbm_distribution(lat: float, lon: float, date_str: str) -> dict | 
 
     logger.debug(
         f"NOAA NBM [{icao}]: Q10={q10} Q25={q25} Q50={q50} Q75={q75} Q90={q90}°F "
-        f"→ μ={mu_c:.2f}°C σ={sigma_c:.2f}°C"
+        f"-> mu={mu_c:.2f}°C sd={sigma_c:.2f}°C"
     )
     return {
         "mu_c":       round(mu_c, 2),
@@ -656,7 +656,7 @@ def _get_nws_hourly_distribution(
 
     logger.debug(
         f"NWS hourly: {len(day_temps_f)} hourly temps, "
-        f"max={mu_f:.1f}°F → μ={mu_c:.2f}°C σ={sigma_c:.2f}°C"
+        f"max={mu_f:.1f}°F -> mu={mu_c:.2f}°C sd={sigma_c:.2f}°C"
     )
     return {"mu_c": mu_c, "sigma_c": sigma_c, "source": "nws_hourly"}
 
@@ -769,6 +769,37 @@ def get_temp_distribution_for_event(
         _dist_cache[cache_key] = None
         return None
 
+    # ---- Per-model bias correction (applied BEFORE blending) --------------
+    # Each model's systematic error is its own — correct ECMWF with the
+    # ECMWF-specific bias history, and GFS with GFS-specific history.  These
+    # biases come from the forecast_errors table, populated by
+    # scripts/backfill_bias_data.py (historical) and bias.py (ongoing).
+    from db import get_bias_correction
+    calendar_month_day = date_str[5:]   # MM-DD
+    ecmwf_bias_c = 0.0; ecmwf_bias_n = 0
+    gfs_bias_c   = 0.0; gfs_bias_n   = 0
+    if ecmwf is not None:
+        ecmwf_bias_c, ecmwf_bias_n = get_bias_correction(
+            lat, lon, calendar_month_day,
+            min_observations=MIN_BIAS_OBSERVATIONS,
+            model="ecmwf_ifs025",
+        )
+        if ecmwf_bias_c != 0.0:
+            ecmwf = {**ecmwf, "mu_c": ecmwf["mu_c"] + ecmwf_bias_c}
+    if gfs is not None:
+        gfs_bias_c, gfs_bias_n = get_bias_correction(
+            lat, lon, calendar_month_day,
+            min_observations=MIN_BIAS_OBSERVATIONS,
+            model="gfs_global",
+        )
+        if gfs_bias_c != 0.0:
+            gfs = {**gfs, "mu_c": gfs["mu_c"] + gfs_bias_c}
+    if ecmwf_bias_c != 0.0 or gfs_bias_c != 0.0:
+        logger.debug(
+            f"Per-model bias: ECMWF {ecmwf_bias_c:+.2f}C (n={ecmwf_bias_n}) "
+            f"GFS {gfs_bias_c:+.2f}C (n={gfs_bias_n})"
+        )
+
     # Blend ECMWF + GFS
     if ecmwf and gfs:
         mu_fcst, sigma_fcst = _blend_gaussians(
@@ -785,6 +816,10 @@ def get_temp_distribution_for_event(
         mu_fcst, sigma_fcst = gfs["mu_c"], gfs["sigma_c"]  # type: ignore[union-attr]
         n_members = gfs["n"]  # type: ignore[union-attr]
         sources   = ["gfs"]
+
+    # Tag the source list so downstream can see bias was applied
+    if ecmwf_bias_c != 0.0 or gfs_bias_c != 0.0:
+        sources.append("bias_corrected")
 
     # Climatological prior
     clim = _get_era5_clim_distribution(lat, lon, date_str)
@@ -823,20 +858,7 @@ def get_temp_distribution_for_event(
                 )
                 sources.append("nws_hourly")
 
-    # Bias correction — apply ECMWF systematic error adjustment
-    from db import get_bias_correction
-    calendar_month_day = date_str[5:]   # MM-DD
-    bias_c, n_bias_obs = get_bias_correction(
-        lat, lon, calendar_month_day,
-        min_observations=MIN_BIAS_OBSERVATIONS,
-    )
-    if bias_c != 0.0:
-        mu_c += bias_c
-        sources.append("bias_corrected")
-        logger.debug(
-            f"Bias correction: {bias_c:+.2f}°C applied "
-            f"({n_bias_obs} obs) → adjusted μ={mu_c:.2f}°C"
-        )
+    # (Bias correction happens per-model BEFORE blending — see above.)
 
     # Tomorrow.io outlier sanity check
     tio_temp = _get_tomorrowio_point_estimate(lat, lon, date_str)
@@ -844,8 +866,8 @@ def get_temp_distribution_for_event(
         deviation = abs(tio_temp - mu_c)
         if deviation > 5.0:
             logger.warning(
-                f"Tomorrow.io sanity check: forecast μ={mu_c:.1f}°C but "
-                f"Tomorrow.io={tio_temp:.1f}°C (Δ={deviation:.1f}°C)"
+                f"Tomorrow.io sanity check: forecast mu={mu_c:.1f}°C but "
+                f"Tomorrow.io={tio_temp:.1f}°C (delta={deviation:.1f}°C)"
             )
 
     # Final sanity gate
@@ -867,14 +889,26 @@ def get_temp_distribution_for_event(
         "sources":     sources,
         "n_members":   n_members,
         "alpha":       round(alpha, 3),
-        "bias_c":      round(bias_c, 3),
-        "n_bias_obs":  n_bias_obs,
+        # Per-model bias corrections applied to the raw model means before blending.
+        # `bias_c` is the ECMWF-weighted contribution to the blended mu shift,
+        # retained under its original key for backwards compatibility with
+        # downstream consumers (dashboard, bias logger).
+        "bias_c":       round(
+            (ecmwf_bias_c if ecmwf else 0.0) * (ECMWF_WEIGHT if ecmwf and gfs else 1.0)
+            + (gfs_bias_c if gfs else 0.0) * (GFS_WEIGHT   if ecmwf and gfs else (1.0 if gfs else 0.0)),
+            3,
+        ),
+        "n_bias_obs":   max(ecmwf_bias_n, gfs_bias_n),
+        "ecmwf_bias_c": round(ecmwf_bias_c, 3),
+        "ecmwf_bias_n": ecmwf_bias_n,
+        "gfs_bias_c":   round(gfs_bias_c, 3),
+        "gfs_bias_n":   gfs_bias_n,
         "clim_kde":    clim_kde,    # KDE object (not serialisable — stays in memory only)
     }
 
     logger.info(
         f"Distribution ({lat:.2f},{lon:.2f}) {date_str} "
-        f"μ={mu_c:.2f}°C σ={sigma_c:.2f}°C α={alpha:.2f} "
+        f"mu={mu_c:.2f}°C sd={sigma_c:.2f}°C alpha={alpha:.2f} "
         f"sources={sources}"
     )
 

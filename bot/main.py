@@ -19,6 +19,8 @@ Three scheduled loops:
 
 import logging
 import os
+import sys
+
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 from datetime import datetime
@@ -105,7 +107,7 @@ def trading_run():
 
     # Analyze events and generate signals
     all_events, signals = run_edge_scan(bankroll=bankroll, events=events)
-    logger.info(f"Analyzed {len(all_events)} events → {len(signals)} raw signals")
+    logger.info(f"Analyzed {len(all_events)} events -> {len(signals)} raw signals")
 
     # Sort by EV descending so that when MAX_BIN_BUYS blocks subsequent signals
     # for the same event, the highest-EV signal is always the one that executes.

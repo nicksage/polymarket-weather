@@ -166,11 +166,19 @@ def _signal_badge(side) -> str:
     return "—"
 
 def _fmt_entered(ts) -> str:
-    """Format an ISO timestamp as 'HH:MM:SS AM/PM MM-DD-YYYY'."""
+    """
+    Format an ISO timestamp as 'HH:MM:SS AM/PM MM-DD-YYYY' in US Central time.
+    Handles both UTC-stored legacy entries and Chicago-stored new entries:
+    any tz-aware ISO string is converted to America/Chicago before formatting.
+    Naive strings are assumed to already be local and displayed as-is.
+    """
     if not ts:
         return "—"
     try:
+        from zoneinfo import ZoneInfo
         dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(ZoneInfo("America/Chicago"))
         return dt.strftime("%I:%M:%S %p %m-%d-%Y")
     except Exception:
         return str(ts)[:19]
@@ -380,27 +388,137 @@ positions_df = load_positions()
 n_events   = len(events_df)   if not events_df.empty   else 0
 n_outcomes = len(outcomes_df) if not outcomes_df.empty else 0
 n_signals  = len(signals_df)  if not signals_df.empty  else 0
-total_pnl  = positions_df["pnl"].sum() if not positions_df.empty and "pnl" in positions_df else 0
-open_count = len(positions_df[positions_df["status"] == "open"]) if not positions_df.empty else 0
-
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Events Tracked",  n_events)
-m2.metric("Outcome Ranges",  n_outcomes)
-m3.metric("Trade Signals",   n_signals)
-m4.metric("Open Positions",  open_count)
-m5.metric("Cumulative P&L",  f"${total_pnl:.2f}")
+n_cities   = outcomes_df["city"].nunique() if not outcomes_df.empty else 0
 
 st.divider()
+
+# Partition positions into paper vs live (needed by all tabs)
+if not positions_df.empty:
+    _base_open = positions_df[positions_df["status"] == "open"].copy()
+    if "fill_status" in positions_df.columns:
+        _base_open = _base_open[_base_open["fill_status"] != "cancelled"]
+    _base_closed = positions_df[positions_df["status"] == "closed"].copy()
+    if "fill_status" in positions_df.columns:
+        _base_closed = _base_closed[_base_closed["fill_status"] != "cancelled"]
+
+    _paper_open   = _base_open[_base_open["is_paper"] == 1]   if "is_paper" in _base_open.columns   else _base_open
+    _live_open    = _base_open[_base_open["is_paper"] == 0]   if "is_paper" in _base_open.columns   else pd.DataFrame()
+    _paper_closed = _base_closed[_base_closed["is_paper"] == 1] if "is_paper" in _base_closed.columns else _base_closed
+    _live_closed  = _base_closed[_base_closed["is_paper"] == 0] if "is_paper" in _base_closed.columns else pd.DataFrame()
+else:
+    _paper_open = _live_open = _paper_closed = _live_closed = pd.DataFrame()
+
+# ---------------------------------------------------------------------------
+# Refresh helpers — defined before tabs so any tab can trigger a refresh
+# ---------------------------------------------------------------------------
+def _do_refresh(spinner_key: str):
+    msgs: list[tuple[str, str]] = []  # (level, text) — survives st.rerun() via session_state
+
+    with st.spinner("Refreshing data…"):
+        import sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.dirname(__file__))
+
+        # Step 1 — ensure DB schema is current (adds forecast_sigma_c column if missing)
+        try:
+            from db import init_db
+            init_db()
+            msgs.append(("info", "DB schema verified"))
+        except Exception as _e:
+            msgs.append(("error", f"DB init failed: {_e}"))
+
+        # Step 2 — backfill coords and sigma independently so one failure doesn't
+        #           block the other
+        try:
+            from db import backfill_position_coords
+            n_coords = backfill_position_coords()
+            if n_coords:
+                msgs.append(("info", f"Backfilled lat/lon for {n_coords} position(s)"))
+        except Exception as _e:
+            msgs.append(("error", f"Coord backfill failed: {_e}"))
+
+        try:
+            from db import backfill_position_sigma
+            n_sigma = backfill_position_sigma()
+            if n_sigma:
+                msgs.append(("info", f"Backfilled uncertainty for {n_sigma} position(s)"))
+        except Exception as _e:
+            msgs.append(("error", f"Sigma backfill failed: {_e}"))
+
+        # Step 3 — run the full monitor loop
+        try:
+            from monitor import run_monitor_loop
+            summary = run_monitor_loop()
+            msgs.append((
+                "success",
+                f"Monitor complete — cancelled={summary.get('cancelled', 0)} "
+                f"resolved={summary.get('closed', 0)} "
+                f"pnl_updated={summary.get('updated', 0)}"
+            ))
+        except Exception as _e:
+            msgs.append(("error", f"Monitor loop failed: {_e}"))
+
+    # Persist messages across st.rerun() via session_state
+    st.session_state["_refresh_msgs"] = msgs
+
+    st.cache_data.clear()
+    for _k in ("f_dates", "f_side", "f_side_disabled", "f_view", "f_contracts", "f_geo"):
+        st.session_state.pop(_k, None)
+    st.rerun()
+
+
+def _show_refresh_messages():
+    """Display any messages left by the last _do_refresh call, then clear them."""
+    msgs = st.session_state.pop("_refresh_msgs", [])
+    for level, text in msgs:
+        if level == "success":
+            st.success(text)
+        elif level == "error":
+            st.error(text)
+        else:
+            st.info(text)
+
+
+def _do_light_refresh():
+    """
+    Lightweight refresh — clears cached DB queries and reruns so the
+    on-screen metrics reflect the latest positions table.  Does NOT
+    run init_db, backfills, or the monitor loop.
+    """
+    st.cache_data.clear()
+    st.rerun()
+
 
 # ===========================================================================
 # Main tabs
 # ===========================================================================
-_tab_contract, _tab_position = st.tabs(["Contract Data", "Position Data"])
+_tab_contract, _tab_paper, _tab_live = st.tabs(["Contract Data", "Paper Trade Data", "Live Trade Data"])
 
 # ===========================================================================
 # TAB 1 — Contract Data
 # ===========================================================================
 with _tab_contract:
+
+    _show_refresh_messages()
+
+    m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
+    m1.metric("Events Tracked", n_events)
+    m2.metric("Outcome Ranges", n_outcomes)
+    m3.metric("Trade Signals",  n_signals)
+    m4.metric("Number of Cities", n_cities)
+    m5.metric("Open Paper Trades", len(_paper_open))
+    _paper_capital = _paper_open["size_usdc"].sum() if not _paper_open.empty and "size_usdc" in _paper_open.columns else 0
+    m6.metric("Paper Capital Deployed", f"${_paper_capital:,.2f}")
+    m7.metric("Open Live Trades", len(_live_open))
+    _live_capital = _live_open["size_usdc"].sum() if not _live_open.empty and "size_usdc" in _live_open.columns else 0
+    m8.metric("Capital Deployed", f"${_live_capital:,.2f}")
+
+    _, _refresh_col = st.columns([6, 1])
+    with _refresh_col:
+        if st.button("🔄 Refresh Data", key="refresh_contract",
+                     help="Refresh the deployed capital and contract metrics from the database"):
+            _do_light_refresh()
+
+    st.divider()
 
     if outcomes_df.empty:
         st.info("No data yet. Run the bot or wait for the next scan.")
@@ -708,284 +826,546 @@ with _tab_contract:
 
 
 # ===========================================================================
-# TAB 2 — Position Data
+# Position helpers (shared by Paper Trade Data and Live Trade Data tabs)
 # ===========================================================================
-with _tab_position:
 
-    # ── P&L and Model Calibration ────────────────────────────────────────────
-    with st.expander("P&L and Model Calibration", expanded=False):
-        col_pnl, col_cal = st.columns(2)
-        with col_pnl:
-            st.subheader("Cumulative P&L")
-            if not positions_df.empty and "pnl" in positions_df.columns:
-                closed = positions_df[positions_df["status"] == "closed"].copy()
-                if not closed.empty:
-                    closed = closed.sort_values("exit_time")
-                    closed["cumulative_pnl"] = closed["pnl"].cumsum()
-                    fig_pnl = px.line(
-                        closed, x="exit_time", y="cumulative_pnl",
-                        labels={"exit_time": "Date", "cumulative_pnl": "Cumulative P&L ($)"},
-                    )
-                    fig_pnl.update_traces(line_color="#00CC96")
-                    st.plotly_chart(fig_pnl, width="stretch")
-                else:
-                    st.info("No closed positions yet")
-            else:
-                st.info("No position data available")
+def _build_open_rows(df):
+    rows = []
+    for _, p in df.iterrows():
+        entry  = p.get("entry_price")
+        curr   = p.get("current_price")
+        unreal = p.get("unrealized_pnl")
+        shares = p.get("shares")
+        _unit  = p.get("unit", "celsius")
+        _range = _range_label(p.get("range_low"), p.get("range_high"), _unit) if (
+            not _is_missing(p.get("range_low")) or not _is_missing(p.get("range_high"))
+        ) else (p.get("question") or "")[:30]
+        rows.append({
+            "City":           p.get("city", ""),
+            "Date":           p.get("date", ""),
+            "Local Time":     p.get("local_time") or "—",
+            "Question":       p.get("question") or "",
+            "Side":           p.get("side", ""),
+            "Fill":           p.get("fill_status", "filled"),
+            "Range":          _range,
+            "Size ($)":       f"${p.get('size_usdc', 0):.2f}",
+            "Shares":         f"{shares:.2f}" if shares else "—",
+            "Entered":        _fmt_entered(p.get("entry_time")),
+            "Entry Price":    f"{entry:.4f}" if entry else "—",
+            "Current Price":  f"{curr:.4f}" if curr else "—",
+            "Unrealized P&L": f"${unreal:+.4f}" if unreal is not None else "—",
+            "Model Prob":     _fmt_pct(p.get("model_prob")),
+            "Market Prob":    _fmt_pct(p.get("market_prob")),
+            "EV":             _fmt_ev(p.get("ev")),
+            "Uncertainty":    f"{p['forecast_sigma_c']:.2f}°C" if not _is_missing(p.get("forecast_sigma_c")) else "—",
+        })
+    return rows
 
-        with col_cal:
-            st.subheader("Model Calibration")
-            st.caption("Average actual outcome vs. model probability bucket.")
-            try:
-                conn   = sqlite3.connect(DB_PATH)
-                sig_df = pd.read_sql(
-                    "SELECT * FROM signals WHERE executed = 1 AND outcome IS NOT NULL", conn
-                )
-                conn.close()
-                if not sig_df.empty and "model_p" in sig_df.columns:
-                    sig_df["p_bucket"] = pd.cut(sig_df["model_p"], bins=10, labels=False)
-                    cal = sig_df.groupby("p_bucket").agg(
-                        avg_model_p=("model_p", "mean"),
-                        avg_outcome=("outcome", "mean"),
-                    ).reset_index()
-                    fig_cal = go.Figure()
-                    fig_cal.add_trace(go.Bar(
-                        x=cal["avg_model_p"], y=cal["avg_outcome"],
-                        name="Actual Frequency", marker_color="steelblue",
-                    ))
-                    fig_cal.add_trace(go.Scatter(
-                        x=[0, 1], y=[0, 1], name="Perfect Calibration",
-                        line=dict(color="red", dash="dash"),
-                    ))
-                    fig_cal.update_layout(
-                        xaxis_title="Model Probability", yaxis_title="Actual Outcome Rate",
-                    )
-                    st.plotly_chart(fig_cal, width="stretch")
-                else:
-                    st.info("Not enough resolved trades for calibration chart")
-            except Exception:
-                st.info("Not enough resolved trades for calibration chart")
 
-    # ── Helper: build open-position rows ────────────────────────────────────
-    def _build_open_rows(df):
-        rows = []
-        for _, p in df.iterrows():
-            entry  = p.get("entry_price")
-            curr   = p.get("current_price")
-            unreal = p.get("unrealized_pnl")
-            shares = p.get("shares")
-            _unit  = p.get("unit", "celsius")
-            _range = _range_label(p.get("range_low"), p.get("range_high"), _unit) if (
-                not _is_missing(p.get("range_low")) or not _is_missing(p.get("range_high"))
-            ) else (p.get("question") or "")[:30]
-            rows.append({
-                "City":           p.get("city", ""),
-                "Date":           p.get("date", ""),
-                "Local Time":     p.get("local_time") or "—",
-                "Question":       p.get("question") or "",
-                "Side":           p.get("side", ""),
-                "Fill":           p.get("fill_status", "filled"),
-                "Range":          _range,
-                "Size ($)":       f"${p.get('size_usdc', 0):.2f}",
-                "Shares":         f"{shares:.2f}" if shares else "—",
-                "Entered":        _fmt_entered(p.get("entry_time")),
-                "Entry Price":    f"{entry:.4f}" if entry else "—",
-                "Current Price":  f"{curr:.4f}" if curr else "—",
-                "Unrealized P&L": f"${unreal:+.4f}" if unreal is not None else "—",
-                "Model Prob":     _fmt_pct(p.get("model_prob")),
-                "Market Prob":    _fmt_pct(p.get("market_prob")),
-                "EV":             _fmt_ev(p.get("ev")),
-            })
-        return rows
+def _build_closed_rows(df):
+    rows = []
+    for _, p in df.iterrows():
+        _unit  = p.get("unit", "celsius")
+        _range = _range_label(p.get("range_low"), p.get("range_high"), _unit) if (
+            not _is_missing(p.get("range_low")) or not _is_missing(p.get("range_high"))
+        ) else (p.get("question") or "")[:30]
+        rows.append({
+            "City":         p.get("city", ""),
+            "Date":         p.get("date", ""),
+            "Question":     (p.get("question") or "")[:40],
+            "Side":         p.get("side", ""),
+            "Range":        _range,
+            "Size ($)":     f"${p.get('size_usdc', 0):.2f}",
+            "Entry":        f"{p.get('entry_price', 0):.4f}",
+            "Exit":         f"{p.get('exit_price', 0):.4f}" if p.get("exit_price") is not None else "—",
+            "Realized P&L": f"${p.get('pnl', 0):+.4f}" if p.get("pnl") is not None else "—",
+            "Entered":      _fmt_entered(p.get("entry_time")),
+            "Closed":       _fmt_entered(p.get("exit_time")),
+            "Uncertainty":  f"{p['forecast_sigma_c']:.2f}°C" if not _is_missing(p.get("forecast_sigma_c")) else "—",
+        })
+    return rows
 
-    def _build_closed_rows(df):
-        rows = []
-        for _, p in df.iterrows():
-            _unit  = p.get("unit", "celsius")
-            _range = _range_label(p.get("range_low"), p.get("range_high"), _unit) if (
-                not _is_missing(p.get("range_low")) or not _is_missing(p.get("range_high"))
-            ) else (p.get("question") or "")[:30]
-            rows.append({
-                "City":         p.get("city", ""),
-                "Date":         p.get("date", ""),
-                "Question":     (p.get("question") or "")[:40],
-                "Side":         p.get("side", ""),
-                "Range":        _range,
-                "Size ($)":     f"${p.get('size_usdc', 0):.2f}",
-                "Entry":        f"{p.get('entry_price', 0):.4f}",
-                "Exit":         f"{p.get('exit_price', 0):.4f}" if p.get("exit_price") is not None else "—",
-                "Realized P&L": f"${p.get('pnl', 0):+.4f}" if p.get("pnl") is not None else "—",
-                "Entered":      _fmt_entered(p.get("entry_time")),
-                "Closed":       _fmt_entered(p.get("exit_time")),
-            })
-        return rows
 
-    def _color_pnl(val):
-        if isinstance(val, str) and val.startswith("$"):
-            try:
-                v = float(val.replace("$", "").replace("+", ""))
-                return "color: #2ca02c" if v > 0 else ("color: #d62728" if v < 0 else "")
-            except ValueError:
-                pass
-        return ""
+def _color_pnl(val):
+    if isinstance(val, str) and val.startswith("$"):
+        try:
+            v = float(val.replace("$", "").replace("+", ""))
+            return "color: #2ca02c" if v > 0 else ("color: #d62728" if v < 0 else "")
+        except ValueError:
+            pass
+    return ""
 
-    # Partition positions into paper vs live
-    _all_open = pd.DataFrame()
-    _all_closed = pd.DataFrame()
-    if not positions_df.empty:
-        _base_open = positions_df[positions_df["status"] == "open"].copy()
-        if "fill_status" in positions_df.columns:
-            _base_open = _base_open[_base_open["fill_status"] != "cancelled"]
-        _base_closed = positions_df[positions_df["status"] == "closed"].copy()
-        if "fill_status" in positions_df.columns:
-            _base_closed = _base_closed[_base_closed["fill_status"] != "cancelled"]
 
-        _paper_open  = _base_open[_base_open["is_paper"] == 1]  if "is_paper" in _base_open.columns  else _base_open
-        _live_open   = _base_open[_base_open["is_paper"] == 0]  if "is_paper" in _base_open.columns  else pd.DataFrame()
-        _paper_closed = _base_closed[_base_closed["is_paper"] == 1] if "is_paper" in _base_closed.columns else _base_closed
-        _live_closed  = _base_closed[_base_closed["is_paper"] == 0] if "is_paper" in _base_closed.columns else pd.DataFrame()
+def _compute_trade_stats(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build the summary stats table with columns:
+    Metric | Open Yes | Open No | Closed Yes | Closed No | Total Open | Total Closed | Grand Total
+
+    Open columns use unrealized_pnl; closed columns use realized pnl.
+    Win/loss breakdown rows show '—' for open columns (unresolved trades).
+    """
+    _METRICS = [
+        "Trade Count",
+        "Win Count",
+        "Loss Count",
+        "Win Rate %",
+        "Avg P&L $",
+        "Avg Return %",
+        "Avg Win $",
+        "Avg Win %",
+        "Avg Loss $",
+        "Avg Loss %",
+        "Win Total $",
+        "Loss Total $",
+        "Total P&L $",
+    ]
+    _COL_NAMES = [
+        "Open Yes", "Open No", "Closed Yes", "Closed No",
+        "Total Open", "Total Closed", "Grand Total",
+    ]
+
+    if df.empty:
+        return pd.DataFrame(
+            [{"Metric": m, **{c: "—" for c in _COL_NAMES}} for m in _METRICS]
+        )
+
+    _open = df[df["status"] == "open"].copy()
+    if "fill_status" in _open.columns:
+        _open = _open[_open["fill_status"] != "cancelled"]
+
+    _closed = df[df["status"] == "closed"].copy()
+    if "fill_status" in _closed.columns:
+        _closed = _closed[_closed["fill_status"] != "cancelled"]
+
+    def _pnl_fmt(v):
+        if pd.isna(v):
+            return "—"
+        return f"${v:,.2f}" if v >= 0 else f"-${abs(v):,.2f}"
+
+    def _open_col(sub: pd.DataFrame) -> list:
+        """Stats for an open subset — P&L is unrealized. Win/loss based on current return."""
+        n = len(sub)
+        if n == 0:
+            return ["0"] + ["—"] * 12
+
+        unreal = sub["unrealized_pnl"].fillna(0) if "unrealized_pnl" in sub.columns else pd.Series([0.0] * n)
+        size   = sub["size_usdc"].replace(0, float("nan")) if "size_usdc" in sub.columns else pd.Series([float("nan")] * n)
+
+        avg_pnl = unreal.mean()
+        avg_ret = (unreal / size * 100).mean()
+
+        wins   = sub[unreal > 0]
+        losses = sub[unreal < 0]
+        win_unreal   = unreal[unreal > 0]
+        loss_unreal  = unreal[unreal < 0]
+        win_size     = size[unreal > 0]
+        loss_size    = size[unreal < 0]
+
+        win_rate = f"{len(wins) / n * 100:.1f}%"
+
+        avg_win_p = (win_unreal / win_size * 100).mean()
+        avg_win_p_fmt = f"+{avg_win_p:.1f}%" if not pd.isna(avg_win_p) else "—"
+
+        avg_loss_p = (loss_unreal / loss_size * 100).mean()
+        avg_loss_p_fmt = f"{avg_loss_p:.1f}%" if not pd.isna(avg_loss_p) else "—"
+
+        return [
+            str(n),                                                        # Trade Count
+            str(len(wins)),                                                # Win Count
+            str(len(losses)),                                              # Loss Count
+            win_rate,                                                      # Win Rate %
+            _pnl_fmt(avg_pnl),                                            # Avg P&L $
+            f"{avg_ret:+.1f}%" if not pd.isna(avg_ret) else "—",         # Avg Return %
+            _pnl_fmt(win_unreal.mean())  if not wins.empty   else "—",    # Avg Win $
+            avg_win_p_fmt,                                                 # Avg Win %
+            _pnl_fmt(loss_unreal.mean()) if not losses.empty else "—",    # Avg Loss $
+            avg_loss_p_fmt,                                                # Avg Loss %
+            _pnl_fmt(win_unreal.sum())   if not wins.empty   else "—",    # Win Total $
+            _pnl_fmt(loss_unreal.sum())  if not losses.empty else "—",    # Loss Total $
+            _pnl_fmt(unreal.sum()),                                        # Total P&L $
+        ]
+
+    def _closed_col(sub: pd.DataFrame) -> list:
+        """Stats for a closed subset — P&L is realized."""
+        n = len(sub)
+        if n == 0:
+            return ["0"] + ["—"] * 12
+
+        pnl  = sub["pnl"].fillna(0)
+        size = sub["size_usdc"].replace(0, float("nan")) if "size_usdc" in sub.columns else pd.Series([float("nan")] * n)
+        wins   = sub[sub["pnl"] > 0]
+        losses = sub[sub["pnl"] < 0]
+
+        win_rate = f"{len(wins) / n * 100:.1f}%"
+        avg_pnl  = pnl.mean()
+        avg_ret  = (pnl / size * 100).mean()
+
+        if not wins.empty and "size_usdc" in wins.columns:
+            avg_win_p = (wins["pnl"] / wins["size_usdc"].replace(0, float("nan")) * 100).mean()
+            avg_win_p_fmt = f"+{avg_win_p:.1f}%" if not pd.isna(avg_win_p) else "—"
+        else:
+            avg_win_p_fmt = "—"
+
+        if not losses.empty and "size_usdc" in losses.columns:
+            avg_loss_p = (losses["pnl"] / losses["size_usdc"].replace(0, float("nan")) * 100).mean()
+            avg_loss_p_fmt = f"{avg_loss_p:.1f}%" if not pd.isna(avg_loss_p) else "—"
+        else:
+            avg_loss_p_fmt = "—"
+
+        return [
+            str(n),                                                              # Trade Count
+            str(len(wins)),                                                      # Win Count
+            str(len(losses)),                                                    # Loss Count
+            win_rate,                                                            # Win Rate %
+            _pnl_fmt(avg_pnl),                                                  # Avg P&L $
+            f"{avg_ret:+.1f}%" if not pd.isna(avg_ret) else "—",               # Avg Return %
+            _pnl_fmt(wins["pnl"].mean())   if not wins.empty   else "—",        # Avg Win $
+            avg_win_p_fmt,                                                       # Avg Win %
+            _pnl_fmt(losses["pnl"].mean()) if not losses.empty else "—",        # Avg Loss $
+            avg_loss_p_fmt,                                                      # Avg Loss %
+            _pnl_fmt(wins["pnl"].sum())    if not wins.empty   else "—",        # Win Total $
+            _pnl_fmt(losses["pnl"].sum())  if not losses.empty else "—",        # Loss Total $
+            _pnl_fmt(pnl.sum()),                                                 # Total P&L $
+        ]
+
+    def _grand_total_col() -> list:
+        """Combines open (unrealized) + closed (realized) for grand totals."""
+        n = len(_open) + len(_closed)
+        if n == 0:
+            return ["0"] + ["—"] * 12
+
+        # Combined P&L series (unrealized for open, realized for closed)
+        real   = _closed["pnl"].fillna(0)
+        unreal = _open["unrealized_pnl"].fillna(0) if "unrealized_pnl" in _open.columns else pd.Series([0.0] * len(_open))
+        n_cl   = len(_closed)
+        all_pnl  = pd.concat([real, unreal], ignore_index=True)
+        all_size = pd.concat([
+            _closed["size_usdc"] if "size_usdc" in _closed.columns else pd.Series([float("nan")] * n_cl),
+            _open["size_usdc"]   if "size_usdc" in _open.columns   else pd.Series([float("nan")] * len(_open)),
+        ], ignore_index=True).replace(0, float("nan"))
+
+        avg_pnl = all_pnl.mean()
+        avg_ret = (all_pnl / all_size * 100).mean()
+
+        # Win/loss across all: closed uses pnl, open uses unrealized_pnl
+        wins_mask   = all_pnl > 0
+        losses_mask = all_pnl < 0
+        win_rate    = f"{wins_mask.sum() / n * 100:.1f}%"
+
+        win_pnl  = all_pnl[wins_mask]
+        loss_pnl = all_pnl[losses_mask]
+        win_size  = all_size[wins_mask]
+        loss_size = all_size[losses_mask]
+
+        avg_win_p = (win_pnl / win_size * 100).mean()
+        avg_win_p_fmt = f"+{avg_win_p:.1f}%" if not pd.isna(avg_win_p) else "—"
+
+        avg_loss_p = (loss_pnl / loss_size * 100).mean()
+        avg_loss_p_fmt = f"{avg_loss_p:.1f}%" if not pd.isna(avg_loss_p) else "—"
+
+        return [
+            str(n),                                                             # Trade Count
+            str(int(wins_mask.sum())),                                          # Win Count
+            str(int(losses_mask.sum())),                                        # Loss Count
+            win_rate,                                                           # Win Rate %
+            _pnl_fmt(avg_pnl),                                                 # Avg P&L $
+            f"{avg_ret:+.1f}%" if not pd.isna(avg_ret) else "—",              # Avg Return %
+            _pnl_fmt(win_pnl.mean())  if not win_pnl.empty  else "—",         # Avg Win $
+            avg_win_p_fmt,                                                      # Avg Win %
+            _pnl_fmt(loss_pnl.mean()) if not loss_pnl.empty else "—",         # Avg Loss $
+            avg_loss_p_fmt,                                                     # Avg Loss %
+            _pnl_fmt(win_pnl.sum())   if not win_pnl.empty  else "—",         # Win Total $
+            _pnl_fmt(loss_pnl.sum())  if not loss_pnl.empty else "—",         # Loss Total $
+            _pnl_fmt(all_pnl.sum()),                                           # Total P&L $
+        ]
+
+    cols_data = [
+        _open_col(_open[_open["side"] == "YES"]),
+        _open_col(_open[_open["side"] == "NO"]),
+        _closed_col(_closed[_closed["side"] == "YES"]),
+        _closed_col(_closed[_closed["side"] == "NO"]),
+        _open_col(_open),
+        _closed_col(_closed),
+        _grand_total_col(),
+    ]
+
+    rows = []
+    for i, metric in enumerate(_METRICS):
+        row = {"Metric": metric}
+        for col_name, col_vals in zip(_COL_NAMES, cols_data):
+            row[col_name] = col_vals[i]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _sigma_bucket(sigma) -> str:
+    """Assign a human-readable uncertainty tier to a forecast_sigma_c value (°C)."""
+    if _is_missing(sigma):
+        return "Unknown"
+    s = float(sigma)
+    if s < 1.5:
+        return "Low (<1.5°C)"
+    if s < 2.5:
+        return "Medium (1.5–2.5°C)"
+    if s < 4.0:
+        return "High (2.5–4.0°C)"
+    return "Very High (≥4.0°C)"
+
+
+_SIGMA_BUCKET_ORDER = [
+    "Low (<1.5°C)",
+    "Medium (1.5–2.5°C)",
+    "High (2.5–4.0°C)",
+    "Very High (≥4.0°C)",
+    "Unknown",
+]
+
+
+def _render_sigma_breakdown(df: pd.DataFrame) -> None:
+    """
+    Render a return-by-uncertainty-tier breakdown table and bar chart.
+    Uses realized P&L for closed positions and unrealized for open.
+    """
+    if df.empty:
+        st.info("No position data available for uncertainty breakdown.")
+        return
+
+    if "forecast_sigma_c" not in df.columns or df["forecast_sigma_c"].isna().all():
+        st.info("No uncertainty data recorded yet. Run the monitor loop to backfill existing positions.")
+        return
+
+    df = df.copy()
+    df["_bucket"] = df["forecast_sigma_c"].apply(_sigma_bucket)
+
+    # Derive a unified P&L column: realized for closed, unrealized for open
+    def _effective_pnl(row):
+        if row.get("status") == "closed":
+            return row.get("pnl") or 0.0
+        return row.get("unrealized_pnl") or 0.0
+
+    df["_eff_pnl"]  = df.apply(_effective_pnl, axis=1)
+    df["_eff_ret"]  = df["_eff_pnl"] / df["size_usdc"].replace(0, float("nan")) * 100
+
+    # Filter to non-cancelled
+    if "fill_status" in df.columns:
+        df = df[df["fill_status"] != "cancelled"]
+
+    rows = []
+    for bucket in _SIGMA_BUCKET_ORDER:
+        sub = df[df["_bucket"] == bucket]
+        if sub.empty:
+            continue
+        closed = sub[sub["status"] == "closed"]
+        wins   = closed[closed["pnl"] > 0]
+        n      = len(sub)
+        n_cl   = len(closed)
+        win_rate = f"{len(wins) / n_cl * 100:.1f}%" if n_cl > 0 else "—"
+        avg_ret  = sub["_eff_ret"].mean()
+        total    = sub["_eff_pnl"].sum()
+        rows.append({
+            "Uncertainty Tier": bucket,
+            "Trades":           n,
+            "Closed":           n_cl,
+            "Win Rate":         win_rate,
+            "Avg Return %":     f"{avg_ret:+.1f}%" if not pd.isna(avg_ret) else "—",
+            "Total P&L $":      f"${total:,.2f}" if total >= 0 else f"-${abs(total):,.2f}",
+        })
+
+    if not rows:
+        st.info("No data to display.")
+        return
+
+    sigma_summary = pd.DataFrame(rows)
+    st.dataframe(sigma_summary, hide_index=True, width="stretch")
+
+    # Bar chart — avg return % by tier
+    chart_rows = [r for r in rows if r["Avg Return %"] not in ("—",)]
+    if chart_rows:
+        chart_df = pd.DataFrame({
+            "Tier":       [r["Uncertainty Tier"] for r in chart_rows],
+            "Avg Return": [float(r["Avg Return %"].replace("%", "").replace("+", "")) for r in chart_rows],
+        })
+        fig = px.bar(
+            chart_df, x="Tier", y="Avg Return",
+            color="Avg Return",
+            color_continuous_scale=["#d62728", "#aec7e8", "#2ca02c"],
+            color_continuous_midpoint=0,
+            labels={"Tier": "Uncertainty Tier", "Avg Return": "Avg Return (%)"},
+            title="Avg Return % by Forecast Uncertainty Tier",
+        )
+        fig.update_layout(
+            yaxis_ticksuffix="%",
+            coloraxis_showscale=False,
+            height=320,
+            margin=dict(t=40, b=40),
+        )
+        fig.add_hline(y=0, line_dash="dash", line_color="gray")
+        st.plotly_chart(fig, width="stretch")
+
+
+# (moved above tab blocks so it can be called from any tab)
+
+
+# ===========================================================================
+# TAB 2 — Paper Trade Data
+# ===========================================================================
+with _tab_paper:
+
+    _show_refresh_messages()
+
+    _paper_all = (
+        positions_df[positions_df["is_paper"] == 1].copy()
+        if not positions_df.empty and "is_paper" in positions_df.columns
+        else pd.DataFrame()
+    )
+    st.dataframe(
+        _compute_trade_stats(_paper_all),
+        hide_index=True, width="stretch", height=540,
+    )
+    st.divider()
+
+    st.subheader("Return by Forecast Uncertainty")
+    _render_sigma_breakdown(_paper_all)
+    st.divider()
+
+    # ── Open Positions ────────────────────────────────────────────────────────
+    st.subheader("Open Positions")
+    if not _paper_open.empty:
+        _df = pd.DataFrame(_build_open_rows(_paper_open))
+        st.dataframe(
+            _df.style.map(_highlight_side, subset=["Side"]).map(_color_pnl, subset=["Unrealized P&L"]),
+            width="stretch", height=min(80 + len(_df) * 36, 500),
+            column_config={"Question": st.column_config.TextColumn("Question", width="large")},
+        )
+        _, _del_col = st.columns([6, 1])
+        with _del_col:
+            if st.button("🗑 Delete All", key="del_paper_open",
+                         help="Delete all open paper trade records from the database"):
+                import sqlite3 as _sl
+                _c = _sl.connect(DB_PATH)
+                _c.execute("DELETE FROM positions WHERE is_paper = 1 AND status = 'open'")
+                _c.commit()
+                _c.close()
+                st.cache_data.clear()
+                st.rerun()
     else:
-        _paper_open = _live_open = _paper_closed = _live_closed = pd.DataFrame()
-
-    # ── Paper Trades ─────────────────────────────────────────────────────────
-    st.subheader("Paper Trades")
-
-    with st.expander("Open Positions — Paper", expanded=True):
-        if not _paper_open.empty:
-            _df = pd.DataFrame(_build_open_rows(_paper_open))
-            st.dataframe(
-                _df.style.map(_highlight_side, subset=["Side"]).map(_color_pnl, subset=["Unrealized P&L"]),
-                width="stretch", height=min(80 + len(_df) * 36, 500),
-                column_config={"Question": st.column_config.TextColumn("Question", width="large")},
-            )
-            _tu = _paper_open["unrealized_pnl"].fillna(0).sum() if "unrealized_pnl" in _paper_open.columns else 0
-            _td = _paper_open["size_usdc"].fillna(0).sum()
-            _pc = int((_paper_open["fill_status"] == "pending").sum()) if "fill_status" in _paper_open.columns else 0
-            _pm1, _pm2, _pm3, _pm4 = st.columns([2, 2, 2, 1])
-            _pm1.metric("Total Deployed", f"${_td:.2f}")
-            _pm2.metric("Unrealized P&L", f"${_tu:+.4f}")
-            if _pc:
-                _pm3.metric("Pending Fills", _pc)
-            with _pm4:
-                if st.button("🗑 Delete All", key="del_paper_open",
-                             help="Delete all open paper trade records from the database"):
-                    import sqlite3 as _sl
-                    _c = _sl.connect(DB_PATH)
-                    _c.execute("DELETE FROM positions WHERE is_paper = 1 AND status = 'open'")
-                    _c.commit()
-                    _c.close()
-                    st.cache_data.clear()
-                    st.rerun()
-        else:
-            st.info("No open paper positions")
-
-    with st.expander("Closed Positions — Paper", expanded=False):
-        if not _paper_closed.empty:
-            _df = pd.DataFrame(_build_closed_rows(_paper_closed))
-            st.dataframe(
-                _df.style.map(_highlight_side, subset=["Side"]).map(_color_pnl, subset=["Realized P&L"]),
-                width="stretch", height=min(80 + len(_df) * 36, 400),
-                column_config={"Question": st.column_config.TextColumn("Question", width="large")},
-            )
-            _tr = _paper_closed["pnl"].fillna(0).sum()
-            _cr1, _cr2 = st.columns([3, 1])
-            with _cr1:
-                st.metric("Total Realized P&L", f"${_tr:+.4f}")
-            with _cr2:
-                if st.button("🗑 Delete All", key="del_paper_closed",
-                             help="Delete all closed paper trade records from the database"):
-                    import sqlite3 as _sl
-                    _c = _sl.connect(DB_PATH)
-                    _c.execute("DELETE FROM positions WHERE is_paper = 1 AND status = 'closed'")
-                    _c.commit()
-                    _c.close()
-                    st.cache_data.clear()
-                    st.rerun()
-        else:
-            st.info("No closed paper positions yet")
-
-        if not positions_df.empty and "fill_status" in positions_df.columns:
-            _cancelled_paper = positions_df[
-                (positions_df["fill_status"] == "cancelled") &
-                (positions_df.get("is_paper", pd.Series(dtype=int)) == 1)
-            ].copy() if "is_paper" in positions_df.columns else pd.DataFrame()
-            if not _cancelled_paper.empty:
-                st.markdown("**Cancelled Paper Orders**")
-                st.caption(f"{len(_cancelled_paper)} order(s) were cancelled before fill")
-                _can_rows = [{
-                    "City": p.get("city", ""), "Date": p.get("date", ""),
-                    "Side": p.get("side", ""), "Size ($)": f"${p.get('size_usdc', 0):.2f}",
-                    "Reason": p.get("cancelled_reason", ""),
-                    "Time": (p.get("exit_time") or "")[:16],
-                } for _, p in _cancelled_paper.iterrows()]
-                st.dataframe(pd.DataFrame(_can_rows), width="stretch", hide_index=True)
+        st.info("No open paper positions")
 
     st.divider()
 
-    # ── Live Trades ───────────────────────────────────────────────────────────
-    st.subheader("Live Trades")
+    # ── Closed Positions ──────────────────────────────────────────────────────
+    st.subheader("Closed Positions")
+    if not _paper_closed.empty:
+        _df = pd.DataFrame(_build_closed_rows(_paper_closed))
+        st.dataframe(
+            _df.style.map(_highlight_side, subset=["Side"]).map(_color_pnl, subset=["Realized P&L"]),
+            width="stretch", height=min(80 + len(_df) * 36, 400),
+            column_config={"Question": st.column_config.TextColumn("Question", width="large")},
+        )
+        _, _del_col = st.columns([6, 1])
+        with _del_col:
+            if st.button("🗑 Delete All", key="del_paper_closed",
+                         help="Delete all closed paper trade records from the database"):
+                import sqlite3 as _sl
+                _c = _sl.connect(DB_PATH)
+                _c.execute("DELETE FROM positions WHERE is_paper = 1 AND status = 'closed'")
+                _c.commit()
+                _c.close()
+                st.cache_data.clear()
+                st.rerun()
+    else:
+        st.info("No closed paper positions yet")
 
-    with st.expander("Open Positions — Live", expanded=True):
-        if not _live_open.empty:
-            _df = pd.DataFrame(_build_open_rows(_live_open))
-            st.dataframe(
-                _df.style.map(_highlight_side, subset=["Side"]).map(_color_pnl, subset=["Unrealized P&L"]),
-                width="stretch", height=min(80 + len(_df) * 36, 500),
-                column_config={"Question": st.column_config.TextColumn("Question", width="large")},
-            )
-            _tu = _live_open["unrealized_pnl"].fillna(0).sum() if "unrealized_pnl" in _live_open.columns else 0
-            _td = _live_open["size_usdc"].fillna(0).sum()
-            _pc = int((_live_open["fill_status"] == "pending").sum()) if "fill_status" in _live_open.columns else 0
-            _lm1, _lm2, _lm3 = st.columns(3)
-            _lm1.metric("Total Deployed", f"${_td:.2f}")
-            _lm2.metric("Unrealized P&L", f"${_tu:+.4f}")
-            if _pc:
-                _lm3.metric("Pending Fills", _pc)
-        else:
-            st.info("No open live positions")
+    # ── Cancelled Orders ──────────────────────────────────────────────────────
+    if not positions_df.empty and "fill_status" in positions_df.columns:
+        _cancelled_paper = positions_df[
+            (positions_df["fill_status"] == "cancelled") &
+            (positions_df.get("is_paper", pd.Series(dtype=int)) == 1)
+        ].copy() if "is_paper" in positions_df.columns else pd.DataFrame()
+        if not _cancelled_paper.empty:
+            st.divider()
+            st.subheader("Cancelled Orders")
+            st.caption(f"{len(_cancelled_paper)} order(s) were cancelled before fill")
+            _can_rows = [{
+                "City": p.get("city", ""), "Date": p.get("date", ""),
+                "Side": p.get("side", ""), "Size ($)": f"${p.get('size_usdc', 0):.2f}",
+                "Reason": p.get("cancelled_reason", ""),
+                "Time": (p.get("exit_time") or "")[:16],
+            } for _, p in _cancelled_paper.iterrows()]
+            st.dataframe(pd.DataFrame(_can_rows), width="stretch", hide_index=True)
 
-    with st.expander("Closed Positions — Live", expanded=False):
-        if not _live_closed.empty:
-            _df = pd.DataFrame(_build_closed_rows(_live_closed))
-            st.dataframe(
-                _df.style.map(_highlight_side, subset=["Side"]).map(_color_pnl, subset=["Realized P&L"]),
-                width="stretch", height=min(80 + len(_df) * 36, 400),
-                column_config={"Question": st.column_config.TextColumn("Question", width="large")},
-            )
-            _tr = _live_closed["pnl"].fillna(0).sum()
-            st.metric("Total Realized P&L", f"${_tr:+.4f}")
+    st.divider()
+    if st.button("🔄 Refresh Data", key="refresh_paper"):
+        _do_refresh("refresh_paper")
 
-            if not positions_df.empty and "fill_status" in positions_df.columns:
-                _cancelled_live = positions_df[
-                    (positions_df["fill_status"] == "cancelled") &
-                    (positions_df["is_paper"] == 0)
-                ].copy() if "is_paper" in positions_df.columns else pd.DataFrame()
-                if not _cancelled_live.empty:
-                    st.markdown("**Cancelled Live Orders**")
-                    st.caption(f"{len(_cancelled_live)} order(s) were cancelled before fill")
-                    _can_rows = [{
-                        "City": p.get("city", ""), "Date": p.get("date", ""),
-                        "Side": p.get("side", ""), "Size ($)": f"${p.get('size_usdc', 0):.2f}",
-                        "Reason": p.get("cancelled_reason", ""),
-                        "Time": (p.get("exit_time") or "")[:16],
-                    } for _, p in _cancelled_live.iterrows()]
-                    st.dataframe(pd.DataFrame(_can_rows), width="stretch", hide_index=True)
-        else:
-            st.info("No closed live positions yet")
 
-    # ── Refresh button ───────────────────────────────────────────────────────
-    if st.button("🔄 Refresh Data"):
-        with st.spinner("Running monitor loop…"):
-            try:
-                import sys as _sys, os as _os
-                _sys.path.insert(0, _os.path.dirname(__file__))
-                from db import backfill_position_coords
-                from monitor import run_monitor_loop
-                backfill_position_coords()
-                run_monitor_loop()
-            except Exception as _e:
-                st.warning(f"Monitor run failed: {_e}")
-        st.cache_data.clear()
-        for _k in ("f_dates", "f_side", "f_side_disabled", "f_view", "f_contracts", "f_geo"):
-            st.session_state.pop(_k, None)
-        st.rerun()
+# ===========================================================================
+# TAB 3 — Live Trade Data
+# ===========================================================================
+with _tab_live:
+
+    _show_refresh_messages()
+
+    _live_all = (
+        positions_df[positions_df["is_paper"] == 0].copy()
+        if not positions_df.empty and "is_paper" in positions_df.columns
+        else pd.DataFrame()
+    )
+    st.dataframe(
+        _compute_trade_stats(_live_all),
+        hide_index=True, width="stretch", height=540,
+    )
+    st.divider()
+
+    st.subheader("Return by Forecast Uncertainty")
+    _render_sigma_breakdown(_live_all)
+    st.divider()
+
+    # ── Open Positions ────────────────────────────────────────────────────────
+    st.subheader("Open Positions")
+    if not _live_open.empty:
+        _df = pd.DataFrame(_build_open_rows(_live_open))
+        st.dataframe(
+            _df.style.map(_highlight_side, subset=["Side"]).map(_color_pnl, subset=["Unrealized P&L"]),
+            width="stretch", height=min(80 + len(_df) * 36, 500),
+            column_config={"Question": st.column_config.TextColumn("Question", width="large")},
+        )
+        pass
+    else:
+        st.info("No open live positions")
+
+    st.divider()
+
+    # ── Closed Positions ──────────────────────────────────────────────────────
+    st.subheader("Closed Positions")
+    if not _live_closed.empty:
+        _df = pd.DataFrame(_build_closed_rows(_live_closed))
+        st.dataframe(
+            _df.style.map(_highlight_side, subset=["Side"]).map(_color_pnl, subset=["Realized P&L"]),
+            width="stretch", height=min(80 + len(_df) * 36, 400),
+            column_config={"Question": st.column_config.TextColumn("Question", width="large")},
+        )
+    else:
+        st.info("No closed live positions yet")
+
+    # ── Cancelled Orders ──────────────────────────────────────────────────────
+    if not positions_df.empty and "fill_status" in positions_df.columns:
+        _cancelled_live = positions_df[
+            (positions_df["fill_status"] == "cancelled") &
+            (positions_df["is_paper"] == 0)
+        ].copy() if "is_paper" in positions_df.columns else pd.DataFrame()
+        if not _cancelled_live.empty:
+            st.divider()
+            st.subheader("Cancelled Orders")
+            st.caption(f"{len(_cancelled_live)} order(s) were cancelled before fill")
+            _can_rows = [{
+                "City": p.get("city", ""), "Date": p.get("date", ""),
+                "Side": p.get("side", ""), "Size ($)": f"${p.get('size_usdc', 0):.2f}",
+                "Reason": p.get("cancelled_reason", ""),
+                "Time": (p.get("exit_time") or "")[:16],
+            } for _, p in _cancelled_live.iterrows()]
+            st.dataframe(pd.DataFrame(_can_rows), width="stretch", hide_index=True)
+
+    st.divider()
+    if st.button("🔄 Refresh Data", key="refresh_live"):
+        _do_refresh("refresh_live")
