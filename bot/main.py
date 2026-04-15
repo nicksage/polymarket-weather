@@ -32,6 +32,7 @@ from risk import run_all_checks
 from execution import get_clob_client, execute_signal
 from sizing import get_bankroll
 from monitor import run_monitor_loop
+from loops import forecast_pull_run, live_observation_run, retention_run
 
 # Ensure logs directory exists before FileHandler is created
 os.makedirs("logs", exist_ok=True)
@@ -87,14 +88,10 @@ def trading_run():
     """
     logger.info("=== TRADING RUN START ===")
 
-    # Record bias correction data for any recently resolved contracts
-    try:
-        from bias import record_resolved_contracts, log_bias_summary
-        new_records = record_resolved_contracts()
-        if new_records > 0:
-            log_bias_summary()
-    except Exception as e:
-        logger.warning(f"Bias recorder failed (non-fatal): {e}")
+    # Bias correction data is refreshed by the bias_updater daily job, not
+    # here.  (Previously this ran an ERA5-reanalysis-based recorder; that
+    # path has been dropped in favour of the VC + Open-Meteo Previous Runs
+    # pipeline.  See bias_updater.run_bias_update.)
 
     bankroll = get_bankroll()
     logger.info(f"Bankroll: ${bankroll:.2f} | Paper trade: {PAPER_TRADE}")
@@ -163,6 +160,15 @@ def main():
     # Run all loops immediately on startup so the bot is fully current before
     # the scheduler takes over.  Monitor runs last so any positions from the
     # initial trading run are immediately evaluated.
+    #
+    # Bias update runs first — it ensures forecast_errors is fresh before the
+    # trading scan reads per-model bias corrections.
+    try:
+        from bias_updater import run_bias_update
+        run_bias_update()
+    except Exception as e:
+        logger.warning(f"Startup bias update failed (non-fatal): {e}")
+
     events = discovery_run()
     _cached_events_ref = events  # seed the module-level cache
     globals()["_cached_events"] = events
@@ -201,11 +207,85 @@ def main():
         coalesce=True,
     )
 
+    # Bias update: daily at 05:00 UTC.  Fetches the last 14 days of VC
+    # observations + Open-Meteo Previous Runs ECMWF/GFS forecasts for every
+    # city and rebuilds forecast_errors.  Replaces the previous
+    # ERA5-reanalysis-based bias recorder.
+    def _scheduled_bias_update() -> None:
+        try:
+            from bias_updater import run_bias_update
+            run_bias_update()
+        except Exception as e:
+            logger.exception(f"Scheduled bias update failed (non-fatal): {e}")
+
+    scheduler.add_job(
+        _scheduled_bias_update,
+        trigger=CronTrigger(hour=5, minute=0, timezone="UTC"),
+        id="bias_update",
+        name="Bias data refresh",
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
+
+    # --- Phase 2: time-versioned forecast + observation loops ---
+
+    def _forecast_pull_job() -> None:
+        try:
+            forecast_pull_run(events=_cached_events)
+        except Exception as e:
+            logger.exception(f"Forecast pull run failed: {e}")
+
+    def _live_observation_job() -> None:
+        try:
+            live_observation_run(events=_cached_events)
+        except Exception as e:
+            logger.exception(f"Live observation run failed: {e}")
+
+    def _retention_job() -> None:
+        try:
+            retention_run(older_than_days=90)
+        except Exception as e:
+            logger.exception(f"Retention run failed: {e}")
+
+    # Forecast pull: every 2 hours at :05 (5 min after discovery at :00)
+    scheduler.add_job(
+        _forecast_pull_job,
+        trigger=CronTrigger(hour="*/2", minute=5, timezone="UTC"),
+        id="forecast_pull",
+        name="Forecast pull (ECMWF + GFS)",
+        misfire_grace_time=600,
+        coalesce=True,
+    )
+
+    # Live observations: every 20 minutes at :00 / :20 / :40
+    scheduler.add_job(
+        _live_observation_job,
+        trigger=CronTrigger(minute="0,20,40", timezone="UTC"),
+        id="live_observation",
+        name="Visual Crossing live observation",
+        misfire_grace_time=300,
+        coalesce=True,
+    )
+
+    # Retention: daily at 04:30 UTC (before bias at 05:00)
+    scheduler.add_job(
+        _retention_job,
+        trigger=CronTrigger(hour=4, minute=30, timezone="UTC"),
+        id="retention",
+        name="Hourly/obs retention purge",
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
+
     logger.info(
         "Scheduler started | "
         "Discovery: 00/04/08/12/16/20:00 UTC | "
+        "Forecast pull: */2h at :05 | "
         "Trading: :10 every hour | "
-        "Monitor: :30 every hour"
+        "Live obs: :00/:20/:40 | "
+        "Monitor: :30 every hour | "
+        "Retention: 04:30 UTC daily | "
+        "Bias update: 05:00 UTC daily"
     )
 
     try:

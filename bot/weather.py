@@ -927,6 +927,7 @@ def get_temp_range_probability(
     range_high: float | None,
     unit: str,
     kde=None,
+    obs_floor_c: float | None = None,
 ) -> float:
     """
     Compute P(range_low ≤ T_max < range_high).
@@ -965,17 +966,57 @@ def get_temp_range_probability(
     if lo_c is None and hi_c is None:
         return 1.0
 
+    # Observed-max floor: truncate the distribution below `obs_floor_c` and
+    # renormalize.  The final daily high cannot be below what's already been
+    # observed, so any probability mass below the floor is collapsed and the
+    # remaining mass is rescaled to sum to 1.  Applied in both KDE and normal
+    # paths.  When floor is above hi_c (the bin is entirely below the floor),
+    # the bin probability becomes 0.
+    apply_floor = obs_floor_c is not None
+
     # KDE path — numerical integration over the kernel density
     if kde is not None:
         _LO = lo_c if lo_c is not None else (mu_c - 10 * sigma_c)
         _HI = hi_c if hi_c is not None else (mu_c + 10 * sigma_c)
         try:
+            if apply_floor:
+                if _HI <= obs_floor_c:
+                    return 0.0
+                _LO_eff = max(_LO, obs_floor_c)
+                if _LO_eff >= _HI:
+                    return 0.0
+                denom_lo = obs_floor_c
+                denom_hi = mu_c + 10 * sigma_c
+                numer = float(kde.integrate_box_1d(_LO_eff, _HI))
+                denom = float(kde.integrate_box_1d(denom_lo, denom_hi))
+                if denom <= 0:
+                    return 0.0
+                return max(0.0, min(1.0, numer / denom))
             prob = float(kde.integrate_box_1d(_LO, _HI))
             return max(0.0, min(1.0, prob))
         except Exception:
             pass  # fall through to normal CDF on any numerical error
 
     # Normal distribution path
+    if apply_floor:
+        # Bin entirely below the floor → zero probability
+        if hi_c is not None and hi_c <= obs_floor_c:
+            return 0.0
+        lo_eff = max(lo_c, obs_floor_c) if lo_c is not None else obs_floor_c
+        if hi_c is not None and lo_eff >= hi_c:
+            return 0.0
+        denom = 1.0 - float(scipy_norm.cdf(obs_floor_c, loc=mu_c, scale=sigma_c))
+        if denom <= 0:
+            return 0.0
+        if hi_c is None:
+            numer = 1.0 - float(scipy_norm.cdf(lo_eff, loc=mu_c, scale=sigma_c))
+        else:
+            numer = float(
+                scipy_norm.cdf(hi_c, loc=mu_c, scale=sigma_c)
+                - scipy_norm.cdf(lo_eff, loc=mu_c, scale=sigma_c)
+            )
+        return max(0.0, min(1.0, numer / denom))
+
     if lo_c is None:
         return float(scipy_norm.cdf(hi_c, loc=mu_c, scale=sigma_c))
     if hi_c is None:

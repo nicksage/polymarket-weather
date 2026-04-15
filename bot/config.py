@@ -143,3 +143,38 @@ ALLOWED_SIDES: str = os.getenv("ALLOWED_SIDES", "both").lower().strip()
 # data-api.polymarket.com.  Required for live trading enrichment; ignored in
 # paper mode.
 WALLET_ADDRESS: str = os.getenv("WALLET_ADDRESS", "")
+
+# ---------------------------------------------------------------------------
+# Live adjustment layer (Phase 2b)
+# Additive adjustment on top of the ECMWF + GFS + climatology blend, driven
+# by Visual Crossing live observations.  Shadow mode by default — both
+# blended and adjusted values are computed and logged, but trading continues
+# to use the blended values until USE_LIVE_ADJUSTMENT is flipped True.
+# ---------------------------------------------------------------------------
+
+USE_LIVE_ADJUSTMENT: bool = _bool("USE_LIVE_ADJUSTMENT", False)
+
+# Global damping on the smoothed intraday residual.
+LIVE_ADJ_ALPHA: float = _float("LIVE_ADJ_ALPHA", 0.5)
+
+# Local hour where the time-of-day weight reaches 1.0.  Residuals at this
+# hour are assumed most predictive of the daily max.  Triangular taper to
+# 0 across LIVE_ADJ_TOD_RAMP_HOURS on either side.
+LIVE_ADJ_TOD_PEAK_HOUR: int = int(os.getenv("LIVE_ADJ_TOD_PEAK_HOUR", "13"))
+LIVE_ADJ_TOD_RAMP_HOURS: int = int(os.getenv("LIVE_ADJ_TOD_RAMP_HOURS", "5"))
+
+# Minimum number of observations required before trusting the residual.
+# Below this threshold, adjusted = blended (cold-start fallback).
+LIVE_ADJ_MIN_OBS: int = int(os.getenv("LIVE_ADJ_MIN_OBS", "2"))
+
+# Safety caps: actual adjustment is clipped to min(ABS_C, SIGMA * blended_sigma).
+LIVE_ADJ_MAX_ABS_C: float = _float("LIVE_ADJ_MAX_ABS_C", 3.0)
+LIVE_ADJ_MAX_SIGMA: float = _float("LIVE_ADJ_MAX_SIGMA", 2.0)
+
+# When True, the observed-max-so-far is applied as a lower-bound truncation
+# on the bin probability distribution (mass below observed_max is collapsed
+# and remaining mass is renormalized).
+LIVE_ADJ_OBS_FLOOR: bool = _bool("LIVE_ADJ_OBS_FLOOR", True)
+
+# Rolling window for residual smoothing (minutes).
+LIVE_ADJ_SMOOTH_WINDOW_MIN: int = int(os.getenv("LIVE_ADJ_SMOOTH_WINDOW_MIN", "60"))

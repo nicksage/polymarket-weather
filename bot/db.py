@@ -151,6 +151,42 @@ def init_db():
             # Existing rows default to 'ecmwf' since that's the only model previously tracked.
             "ALTER TABLE forecast_errors ADD COLUMN model TEXT DEFAULT 'ecmwf'",
             "ALTER TABLE forecast_errors ADD COLUMN lead_days_bucket INTEGER",
+            # --- temp_events: current-state cache columns (Phase 2 VC upgrade) ---
+            "ALTER TABLE temp_events ADD COLUMN timezone TEXT",
+            "ALTER TABLE temp_events ADD COLUMN latest_forecast_ts TEXT",
+            "ALTER TABLE temp_events ADD COLUMN latest_observation_ts TEXT",
+            "ALTER TABLE temp_events ADD COLUMN current_temp_c REAL",
+            "ALTER TABLE temp_events ADD COLUMN observed_max_so_far_c REAL",
+            "ALTER TABLE temp_events ADD COLUMN expected_temp_now_c REAL",
+            "ALTER TABLE temp_events ADD COLUMN actual_minus_expected_c REAL",
+            "ALTER TABLE temp_events ADD COLUMN forecast_delta_mu_c REAL",
+            "ALTER TABLE temp_events ADD COLUMN forecast_delta_sigma_c REAL",
+            "ALTER TABLE temp_events ADD COLUMN forecast_agreement_c REAL",
+            # --- temp_outcomes: decision-context columns ---
+            "ALTER TABLE temp_outcomes ADD COLUMN edge_after_fees REAL",
+            "ALTER TABLE temp_outcomes ADD COLUMN edge_after_live_adjustment REAL",
+            "ALTER TABLE temp_outcomes ADD COLUMN bin_rank_within_event INTEGER",
+            "ALTER TABLE temp_outcomes ADD COLUMN exit_priority_score REAL",
+            "ALTER TABLE temp_outcomes ADD COLUMN stale_signal INTEGER DEFAULT 0",
+            # --- positions: entry/exit attribution columns ---
+            "ALTER TABLE positions ADD COLUMN entry_snapshot_id INTEGER",
+            "ALTER TABLE positions ADD COLUMN exit_snapshot_id INTEGER",
+            "ALTER TABLE positions ADD COLUMN entry_forecast_delta_mu_c REAL",
+            "ALTER TABLE positions ADD COLUMN entry_actual_vs_expected_c REAL",
+            "ALTER TABLE positions ADD COLUMN max_favorable_excursion REAL",
+            "ALTER TABLE positions ADD COLUMN max_adverse_excursion REAL",
+            "ALTER TABLE positions ADD COLUMN exit_reason TEXT",
+            # --- Phase 2b: live adjustment layer ---
+            "ALTER TABLE temp_events ADD COLUMN adjusted_mu_c REAL",
+            "ALTER TABLE temp_events ADD COLUMN adjusted_sigma_c REAL",
+            "ALTER TABLE temp_events ADD COLUMN live_adjustment_score REAL",
+            "ALTER TABLE temp_events ADD COLUMN live_adjustment_components TEXT",
+            "ALTER TABLE temp_outcomes ADD COLUMN model_prob_blended REAL",
+            "ALTER TABLE decision_snapshots ADD COLUMN adjusted_mu_c REAL",
+            "ALTER TABLE decision_snapshots ADD COLUMN adjusted_sigma_c REAL",
+            "ALTER TABLE decision_snapshots ADD COLUMN live_adjustment_score REAL",
+            "ALTER TABLE decision_snapshots ADD COLUMN live_adjustment_components TEXT",
+            "ALTER TABLE decision_snapshots ADD COLUMN obs_floor_applied INTEGER DEFAULT 0",
         ]:
             try:
                 conn.execute(col_def)
@@ -231,7 +267,155 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_hfpr_city_model_date
                 ON historical_forecasts_previous_runs(city, model, date);
+
+            -- =============================================================
+            -- Phase 2: Time-versioned forecast + observation tables
+            -- =============================================================
+
+            -- One row per (event, source, pull).  Raw upstream pulls only —
+            -- derived/blended values live in decision_snapshots.
+            CREATE TABLE IF NOT EXISTS forecast_runs (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id          TEXT    NOT NULL,
+                city              TEXT,
+                date              TEXT    NOT NULL,       -- target contract date
+                lat               REAL,
+                lon               REAL,
+                source            TEXT    NOT NULL,       -- 'ecmwf' | 'gfs' (future: 'vc')
+                pulled_at         TEXT    NOT NULL,       -- ISO UTC
+                model_run_ts      TEXT,
+                forecast_mu_c     REAL,
+                forecast_sigma_c  REAL,
+                forecast_high_c   REAL,
+                days_ahead        INTEGER,
+                raw_json          TEXT,
+                UNIQUE(event_id, source, pulled_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_fr_event_source_time
+                ON forecast_runs(event_id, source, pulled_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_fr_city_date_source
+                ON forecast_runs(city, date, source);
+            CREATE INDEX IF NOT EXISTS idx_fr_date_time
+                ON forecast_runs(date, pulled_at DESC);
+
+            -- Hourly detail for a forecast run (72h dense + optional
+            -- is_target_day=1 daily-summary row for events >3 days out).
+            CREATE TABLE IF NOT EXISTS forecast_hourly (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id            INTEGER NOT NULL REFERENCES forecast_runs(id) ON DELETE CASCADE,
+                hour_ts_utc       TEXT    NOT NULL,
+                hour_ts_local     TEXT,
+                is_target_day     INTEGER DEFAULT 0,
+                temp_c            REAL,
+                humidity          REAL,
+                cloudcover        REAL,
+                windspeed_kph     REAL,
+                precip_mm         REAL,
+                precip_prob       REAL,
+                conditions        TEXT,
+                UNIQUE(run_id, hour_ts_utc)
+            );
+            CREATE INDEX IF NOT EXISTS idx_fh_run_time
+                ON forecast_hourly(run_id, hour_ts_utc);
+
+            -- Observations only (Visual Crossing 20-minute loop).
+            -- Derived values (forecast_remaining_max, projected_day_max) are
+            -- NOT stored here; they live in decision_snapshots.
+            CREATE TABLE IF NOT EXISTS live_observations (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id              TEXT    NOT NULL,
+                city                  TEXT,
+                date                  TEXT    NOT NULL,
+                lat                   REAL,
+                lon                   REAL,
+                pulled_at_utc         TEXT    NOT NULL,
+                observed_at_utc       TEXT,
+                observed_at_local     TEXT,
+                vc_source             TEXT,           -- 'obs'|'fcst'|'comb'|'stats'
+                current_temp_c        REAL,
+                humidity              REAL,
+                cloudcover            REAL,
+                windspeed_kph         REAL,
+                precip_mm             REAL,
+                conditions            TEXT,
+                observed_max_so_far_c REAL,
+                stations              TEXT,           -- JSON list
+                query_cost            INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_lo_event_time
+                ON live_observations(event_id, pulled_at_utc DESC);
+            CREATE INDEX IF NOT EXISTS idx_lo_city_date_time
+                ON live_observations(city, date, pulled_at_utc DESC);
+            CREATE INDEX IF NOT EXISTS idx_lo_date_time
+                ON live_observations(date, pulled_at_utc DESC);
+
+            -- One row per outcome (bin) per trading run.  Groups via
+            -- event_snapshot_group_id (UUID set once per cycle).  Logical
+            -- FKs latest_*_run_id / latest_obs_id — not enforced by SQLite.
+            CREATE TABLE IF NOT EXISTS decision_snapshots (
+                id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_snapshot_group_id   TEXT    NOT NULL,
+                event_id                  TEXT    NOT NULL,
+                contract_id               TEXT    NOT NULL,
+                city                      TEXT,
+                date                      TEXT,
+                evaluated_at_utc          TEXT    NOT NULL,
+                -- Forecast context
+                latest_ecmwf_run_id       INTEGER,
+                latest_gfs_run_id         INTEGER,
+                blended_mu_c              REAL,
+                blended_sigma_c           REAL,
+                -- Observation context
+                latest_obs_id             INTEGER,
+                current_temp_c            REAL,
+                temp_change_1h_c          REAL,
+                temp_change_3h_c          REAL,
+                observed_max_so_far_c     REAL,
+                forecast_remaining_max_c  REAL,
+                projected_day_max_c       REAL,
+                -- Comparison
+                expected_temp_now_c       REAL,
+                actual_minus_expected_c   REAL,
+                forecast_delta_mu_c       REAL,
+                forecast_delta_sigma_c    REAL,
+                forecast_agreement_c      REAL,
+                -- Market
+                market_price              REAL,
+                model_prob                REAL,
+                raw_model_prob            REAL,
+                edge                      REAL,
+                ev                        REAL,
+                recommended_side          TEXT,
+                kelly_size                REAL,
+                liquidity_usd             REAL,
+                -- Output
+                action                    TEXT,
+                reason                    TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_ds_event_time
+                ON decision_snapshots(event_id, evaluated_at_utc DESC);
+            CREATE INDEX IF NOT EXISTS idx_ds_contract_time
+                ON decision_snapshots(contract_id, evaluated_at_utc DESC);
+            CREATE INDEX IF NOT EXISTS idx_ds_group
+                ON decision_snapshots(event_snapshot_group_id);
+            CREATE INDEX IF NOT EXISTS idx_ds_date_time
+                ON decision_snapshots(date, evaluated_at_utc DESC);
+
+            -- VC cost accounting (cheap surface so we don't scan obs table).
+            CREATE TABLE IF NOT EXISTS vc_usage_daily (
+                date              TEXT PRIMARY KEY,       -- YYYY-MM-DD UTC
+                total_query_cost  INTEGER DEFAULT 0,
+                n_calls           INTEGER DEFAULT 0,
+                updated_at        TEXT
+            );
         """)
+
+        # --- Phase 2 indexes on existing table (date-windowed scans) ---
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_temp_events_date "
+                         "ON temp_events(date)")
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -588,8 +772,10 @@ def insert_temp_event(event: dict, scan_timestamp: str) -> int:
             forecast_mu_c, forecast_sigma_c, clim_mu_c, clim_sigma_c,
             forecast_mu_display, display_unit, days_ahead,
             market_overround, model_probs_sum, normalization_warning,
-            n_outcomes, n_sources
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            n_outcomes, n_sources,
+            adjusted_mu_c, adjusted_sigma_c,
+            live_adjustment_score, live_adjustment_components
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     with _get_conn() as conn:
         cur = conn.execute(sql, (
@@ -612,6 +798,10 @@ def insert_temp_event(event: dict, scan_timestamp: str) -> int:
             1 if event.get("normalization_warning") else 0,
             event.get("n_outcomes", 0),
             event.get("n_sources", 0),
+            event.get("adjusted_mu_c"),
+            event.get("adjusted_sigma_c"),
+            event.get("live_adjustment_score"),
+            event.get("live_adjustment_components"),
         ))
         return cur.lastrowid
 
@@ -625,8 +815,9 @@ def insert_temp_outcome(outcome: dict, event_row_id: int, scan_timestamp: str) -
             market_price, yes_price, no_price,
             model_prob, raw_model_prob, ev, edge,
             recommended_side, kelly_size, is_signal,
-            liquidity_usd, volume_usd, yes_token_id, no_token_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            liquidity_usd, volume_usd, yes_token_id, no_token_id,
+            model_prob_blended
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     yes_price = outcome.get("yes_price", outcome.get("market_price"))
     no_price  = outcome.get("no_price",  1.0 - float(yes_price) if yes_price is not None else None)
@@ -653,6 +844,7 @@ def insert_temp_outcome(outcome: dict, event_row_id: int, scan_timestamp: str) -
             outcome.get("volume_usd"),
             outcome.get("yes_token_id"),
             outcome.get("no_token_id"),
+            outcome.get("model_prob_blended"),
         ))
         return cur.lastrowid
 
@@ -1052,6 +1244,308 @@ def rebuild_forecast_errors_from_cache(
             inserted += 1
 
     return inserted
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — forecast_runs / forecast_hourly helpers
+# ---------------------------------------------------------------------------
+
+def insert_forecast_run(
+    event_id: str,
+    city: str | None,
+    date: str,
+    lat: float | None,
+    lon: float | None,
+    source: str,
+    pulled_at: str,
+    forecast_mu_c: float | None,
+    forecast_sigma_c: float | None,
+    forecast_high_c: float | None = None,
+    days_ahead: int | None = None,
+    model_run_ts: str | None = None,
+    raw_json: str | None = None,
+) -> int:
+    """Insert one forecast_runs row. Returns the new run_id.
+
+    UNIQUE(event_id, source, pulled_at) — re-insertions with the same timestamp
+    are ignored and the existing row id is returned.
+    """
+    sql = """
+        INSERT OR IGNORE INTO forecast_runs
+            (event_id, city, date, lat, lon, source, pulled_at,
+             model_run_ts, forecast_mu_c, forecast_sigma_c,
+             forecast_high_c, days_ahead, raw_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    with _get_conn() as conn:
+        cur = conn.execute(sql, (
+            event_id, city, date, lat, lon, source, pulled_at,
+            model_run_ts, forecast_mu_c, forecast_sigma_c,
+            forecast_high_c, days_ahead, raw_json,
+        ))
+        if cur.lastrowid:
+            return cur.lastrowid
+        # Row already existed (IGNORE hit) — look it up
+        row = conn.execute(
+            "SELECT id FROM forecast_runs "
+            "WHERE event_id = ? AND source = ? AND pulled_at = ?",
+            (event_id, source, pulled_at),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+
+def insert_forecast_hourly_bulk(run_id: int, hours: list[dict]) -> int:
+    """Bulk-insert hourly rows for a forecast_runs row.
+
+    Each `hours` dict may include: hour_ts_utc, hour_ts_local, is_target_day,
+    temp_c, humidity, cloudcover, windspeed_kph, precip_mm, precip_prob,
+    conditions.  hour_ts_utc is required.
+    """
+    if not hours:
+        return 0
+    sql = """
+        INSERT OR IGNORE INTO forecast_hourly
+            (run_id, hour_ts_utc, hour_ts_local, is_target_day,
+             temp_c, humidity, cloudcover, windspeed_kph,
+             precip_mm, precip_prob, conditions)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    rows = [(
+        run_id,
+        h.get("hour_ts_utc"),
+        h.get("hour_ts_local"),
+        1 if h.get("is_target_day") else 0,
+        h.get("temp_c"),
+        h.get("humidity"),
+        h.get("cloudcover"),
+        h.get("windspeed_kph"),
+        h.get("precip_mm"),
+        h.get("precip_prob"),
+        h.get("conditions"),
+    ) for h in hours]
+    with _get_conn() as conn:
+        conn.executemany(sql, rows)
+    return len(rows)
+
+
+def get_latest_forecast_run(event_id: str, source: str) -> dict | None:
+    sql = """
+        SELECT * FROM forecast_runs
+        WHERE event_id = ? AND source = ?
+        ORDER BY pulled_at DESC
+        LIMIT 1
+    """
+    with _get_conn() as conn:
+        row = conn.execute(sql, (event_id, source)).fetchone()
+        return dict(row) if row else None
+
+
+def get_previous_forecast_run(event_id: str, source: str) -> dict | None:
+    """Return the second-most-recent forecast_runs row (prior pull)."""
+    sql = """
+        SELECT * FROM forecast_runs
+        WHERE event_id = ? AND source = ?
+        ORDER BY pulled_at DESC
+        LIMIT 1 OFFSET 1
+    """
+    with _get_conn() as conn:
+        row = conn.execute(sql, (event_id, source)).fetchone()
+        return dict(row) if row else None
+
+
+def get_latest_forecast_hourly(run_id: int) -> list[dict]:
+    sql = """
+        SELECT * FROM forecast_hourly
+        WHERE run_id = ?
+        ORDER BY hour_ts_utc ASC
+    """
+    with _get_conn() as conn:
+        return [dict(r) for r in conn.execute(sql, (run_id,)).fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — live_observations helpers
+# ---------------------------------------------------------------------------
+
+def insert_live_observation(
+    event_id: str,
+    city: str | None,
+    date: str,
+    lat: float | None,
+    lon: float | None,
+    pulled_at_utc: str,
+    observed_at_utc: str | None,
+    observed_at_local: str | None,
+    vc_source: str | None,
+    current_temp_c: float | None,
+    humidity: float | None = None,
+    cloudcover: float | None = None,
+    windspeed_kph: float | None = None,
+    precip_mm: float | None = None,
+    conditions: str | None = None,
+    observed_max_so_far_c: float | None = None,
+    stations: str | None = None,
+    query_cost: int | None = None,
+) -> int:
+    sql = """
+        INSERT INTO live_observations
+            (event_id, city, date, lat, lon, pulled_at_utc,
+             observed_at_utc, observed_at_local, vc_source,
+             current_temp_c, humidity, cloudcover, windspeed_kph,
+             precip_mm, conditions, observed_max_so_far_c,
+             stations, query_cost)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    with _get_conn() as conn:
+        cur = conn.execute(sql, (
+            event_id, city, date, lat, lon, pulled_at_utc,
+            observed_at_utc, observed_at_local, vc_source,
+            current_temp_c, humidity, cloudcover, windspeed_kph,
+            precip_mm, conditions, observed_max_so_far_c,
+            stations, query_cost,
+        ))
+        return cur.lastrowid
+
+
+def get_recent_observations(event_id: str, since_utc: str) -> list[dict]:
+    sql = """
+        SELECT * FROM live_observations
+        WHERE event_id = ? AND pulled_at_utc >= ?
+        ORDER BY pulled_at_utc ASC
+    """
+    with _get_conn() as conn:
+        return [dict(r) for r in conn.execute(sql, (event_id, since_utc)).fetchall()]
+
+
+def get_latest_observation(event_id: str) -> dict | None:
+    sql = """
+        SELECT * FROM live_observations
+        WHERE event_id = ?
+        ORDER BY pulled_at_utc DESC
+        LIMIT 1
+    """
+    with _get_conn() as conn:
+        row = conn.execute(sql, (event_id,)).fetchone()
+        return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — decision_snapshots helpers
+# ---------------------------------------------------------------------------
+
+def insert_decision_snapshot(snapshot: dict) -> int:
+    """Insert one decision_snapshots row.  All fields are optional except
+    event_snapshot_group_id, event_id, contract_id, evaluated_at_utc."""
+    cols = [
+        "event_snapshot_group_id", "event_id", "contract_id", "city", "date",
+        "evaluated_at_utc",
+        "latest_ecmwf_run_id", "latest_gfs_run_id",
+        "blended_mu_c", "blended_sigma_c",
+        "latest_obs_id", "current_temp_c",
+        "temp_change_1h_c", "temp_change_3h_c",
+        "observed_max_so_far_c", "forecast_remaining_max_c", "projected_day_max_c",
+        "expected_temp_now_c", "actual_minus_expected_c",
+        "forecast_delta_mu_c", "forecast_delta_sigma_c", "forecast_agreement_c",
+        "market_price", "model_prob", "raw_model_prob",
+        "edge", "ev", "recommended_side", "kelly_size", "liquidity_usd",
+        "action", "reason",
+        "adjusted_mu_c", "adjusted_sigma_c",
+        "live_adjustment_score", "live_adjustment_components",
+        "obs_floor_applied",
+    ]
+    placeholders = ",".join("?" * len(cols))
+    sql = f"INSERT INTO decision_snapshots ({','.join(cols)}) VALUES ({placeholders})"
+    vals = [snapshot.get(c) for c in cols]
+    with _get_conn() as conn:
+        cur = conn.execute(sql, vals)
+        return cur.lastrowid
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — temp_events current-state updater
+# ---------------------------------------------------------------------------
+
+_EVENT_STATE_COLS = {
+    "timezone", "latest_forecast_ts", "latest_observation_ts",
+    "current_temp_c", "observed_max_so_far_c",
+    "expected_temp_now_c", "actual_minus_expected_c",
+    "forecast_delta_mu_c", "forecast_delta_sigma_c", "forecast_agreement_c",
+}
+
+
+def update_event_current_state(event_id: str, **fields) -> int:
+    """Update one or more current-state columns on the most recent temp_events
+    row for an event_id.  Silently drops unknown keys.  Returns rows affected."""
+    clean = {k: v for k, v in fields.items() if k in _EVENT_STATE_COLS}
+    if not clean:
+        return 0
+    assignments = ", ".join(f"{k} = ?" for k in clean)
+    sql = f"""
+        UPDATE temp_events
+        SET {assignments}
+        WHERE id = (
+            SELECT id FROM temp_events
+            WHERE event_id = ?
+            ORDER BY scan_timestamp DESC
+            LIMIT 1
+        )
+    """
+    with _get_conn() as conn:
+        cur = conn.execute(sql, list(clean.values()) + [event_id])
+        return cur.rowcount
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — retention helpers
+# ---------------------------------------------------------------------------
+
+def purge_forecast_hourly(older_than_days: int = 90) -> int:
+    """Delete forecast_hourly rows whose parent forecast_runs.pulled_at is
+    older than N days.  Returns rows deleted."""
+    from datetime import datetime, timedelta, timezone
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+    sql = """
+        DELETE FROM forecast_hourly
+        WHERE run_id IN (
+            SELECT id FROM forecast_runs WHERE pulled_at < ?
+        )
+    """
+    with _get_conn() as conn:
+        cur = conn.execute(sql, (cutoff,))
+        return cur.rowcount
+
+
+def purge_live_observations(older_than_days: int = 90) -> int:
+    from datetime import datetime, timedelta, timezone
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+    sql = "DELETE FROM live_observations WHERE pulled_at_utc < ?"
+    with _get_conn() as conn:
+        cur = conn.execute(sql, (cutoff,))
+        return cur.rowcount
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — VC usage cost accounting
+# ---------------------------------------------------------------------------
+
+def bump_vc_usage(query_cost: int | None) -> None:
+    """Increment the daily VC cost counter by `query_cost` (default 0) and
+    count one call.  Idempotent per (date, call) — caller is responsible for
+    calling once per VC request."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    day = now.strftime("%Y-%m-%d")
+    cost = int(query_cost or 0)
+    sql = """
+        INSERT INTO vc_usage_daily (date, total_query_cost, n_calls, updated_at)
+        VALUES (?, ?, 1, ?)
+        ON CONFLICT(date) DO UPDATE SET
+            total_query_cost = total_query_cost + excluded.total_query_cost,
+            n_calls          = n_calls + 1,
+            updated_at       = excluded.updated_at
+    """
+    with _get_conn() as conn:
+        conn.execute(sql, (day, cost, now.isoformat()))
 
 
 import calendar  # kept for any downstream code that imports it from here

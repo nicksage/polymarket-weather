@@ -23,7 +23,12 @@ Signal dict schema (one per outcome):
 
 import logging
 from datetime import datetime, date
-from config import EDGE_THRESHOLD, MIN_LIQUIDITY_USD, MAX_FORECAST_DAYS, NORM_WARNING_LOW, NORM_WARNING_HIGH
+from config import (
+    EDGE_THRESHOLD, MIN_LIQUIDITY_USD, MAX_FORECAST_DAYS,
+    NORM_WARNING_LOW, NORM_WARNING_HIGH,
+    USE_LIVE_ADJUSTMENT, LIVE_ADJ_OBS_FLOOR,
+)
+from live_adjustment import compute_live_adjustment, components_to_json
 from weather import (
     get_temp_distribution_for_event,
     get_temp_range_probability,
@@ -34,10 +39,41 @@ from polymarket import search_temp_high_events
 from db import (
     insert_temp_event, insert_temp_outcome,
     insert_signal,
+    insert_decision_snapshot,
+    get_latest_forecast_run,
+    get_previous_forecast_run,
+    get_latest_observation,
 )
 from sizing import calculate_kelly_size
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Timezone lookup (cached per-scan via db read; cheap)
+# ---------------------------------------------------------------------------
+
+def _lookup_event_timezone(event_id: str) -> str | None:
+    """Return the IANA timezone stored on the most recent temp_events row
+    for this event_id, populated by loops.live_observation_run.  None if
+    unknown (cold-start before first VC pull)."""
+    if not event_id:
+        return None
+    try:
+        import sqlite3
+        from config import DB_PATH
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            row = conn.execute(
+                "SELECT timezone FROM temp_events WHERE event_id = ? "
+                "AND timezone IS NOT NULL ORDER BY scan_timestamp DESC LIMIT 1",
+                (event_id,),
+            ).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +93,104 @@ def _calculate_ev(model_prob: float, market_price: float, side: str) -> float:
         p_no_model  = 1 - model_prob
         p_no_market = 1 - market_price
         return p_no_model * (1 - p_no_market) - (1 - p_no_model) * p_no_market
+
+
+# ---------------------------------------------------------------------------
+# Decision snapshot writer (one row per outcome per trading run)
+# ---------------------------------------------------------------------------
+
+def _write_decision_snapshots(
+    analysis: dict, group_id: str, evaluated_at_utc: str,
+) -> int:
+    """Capture the full decision context for every outcome in `analysis`.
+    Called once per event per trading run; writes N rows to decision_snapshots
+    where N = len(analysis["outcomes"]).  Returns rows written."""
+    event_id = analysis.get("event_id") or ""
+    if not event_id:
+        return 0
+
+    # Pull latest forecast + observation context (shared across all bins)
+    latest_ecmwf = get_latest_forecast_run(event_id, "ecmwf")
+    latest_gfs   = get_latest_forecast_run(event_id, "gfs")
+    prev_ecmwf   = get_previous_forecast_run(event_id, "ecmwf")
+    latest_obs   = get_latest_observation(event_id)
+
+    # Forecast delta vs prior pull (ECMWF only; GFS delta is tracked on
+    # temp_events.forecast_delta_mu_c as an average in loops.py)
+    delta_mu = delta_sigma = None
+    if latest_ecmwf and prev_ecmwf:
+        if latest_ecmwf.get("forecast_mu_c") is not None and prev_ecmwf.get("forecast_mu_c") is not None:
+            delta_mu = latest_ecmwf["forecast_mu_c"] - prev_ecmwf["forecast_mu_c"]
+        if latest_ecmwf.get("forecast_sigma_c") is not None and prev_ecmwf.get("forecast_sigma_c") is not None:
+            delta_sigma = latest_ecmwf["forecast_sigma_c"] - prev_ecmwf["forecast_sigma_c"]
+
+    agreement = None
+    if latest_ecmwf and latest_gfs:
+        mu_e = latest_ecmwf.get("forecast_mu_c")
+        mu_g = latest_gfs.get("forecast_mu_c")
+        if mu_e is not None and mu_g is not None:
+            agreement = abs(mu_e - mu_g)
+
+    current_temp        = latest_obs.get("current_temp_c")        if latest_obs else None
+    observed_max        = latest_obs.get("observed_max_so_far_c") if latest_obs else None
+
+    # Expected temp now (from latest ECMWF hourly) and derived
+    # forecast_remaining_max_c / projected_day_max_c are re-derived in
+    # loops.live_observation_run; we surface the values stored on the latest
+    # observation row if present, else NULL.
+    expected_now = None   # populated by live-obs flow in a future phase
+    actual_minus_expected = None
+    if current_temp is not None and expected_now is not None:
+        actual_minus_expected = current_temp - expected_now
+
+    written = 0
+    for rank, outcome in enumerate(analysis.get("outcomes", [])):
+        snap = {
+            "event_snapshot_group_id": group_id,
+            "event_id":                event_id,
+            "contract_id":             outcome.get("contract_id"),
+            "city":                    analysis.get("city"),
+            "date":                    analysis.get("date"),
+            "evaluated_at_utc":        evaluated_at_utc,
+            "latest_ecmwf_run_id":     latest_ecmwf["id"] if latest_ecmwf else None,
+            "latest_gfs_run_id":       latest_gfs["id"]   if latest_gfs   else None,
+            "blended_mu_c":            analysis.get("forecast_mu_c"),
+            "blended_sigma_c":         analysis.get("forecast_sigma_c"),
+            "latest_obs_id":           latest_obs["id"]   if latest_obs   else None,
+            "current_temp_c":          current_temp,
+            "temp_change_1h_c":        None,
+            "temp_change_3h_c":        None,
+            "observed_max_so_far_c":   analysis.get("observed_max_so_far_c") or observed_max,
+            "forecast_remaining_max_c": None,
+            "projected_day_max_c":     None,
+            "expected_temp_now_c":     expected_now,
+            "actual_minus_expected_c": actual_minus_expected,
+            "forecast_delta_mu_c":     delta_mu,
+            "forecast_delta_sigma_c":  delta_sigma,
+            "forecast_agreement_c":    agreement,
+            "market_price":            outcome.get("market_price"),
+            "model_prob":              outcome.get("model_prob"),
+            "raw_model_prob":          outcome.get("raw_model_prob"),
+            "edge":                    outcome.get("edge"),
+            "ev":                      outcome.get("ev"),
+            "recommended_side":        outcome.get("recommended_side"),
+            "kelly_size":              outcome.get("kelly_size"),
+            "liquidity_usd":           outcome.get("liquidity_usd"),
+            "action":                  "enter" if outcome.get("is_signal") else "skip",
+            "reason":                  None,
+            # Phase 2b live adjustment (event-level, same across all bins in this run)
+            "adjusted_mu_c":             analysis.get("adjusted_mu_c"),
+            "adjusted_sigma_c":          analysis.get("adjusted_sigma_c"),
+            "live_adjustment_score":     analysis.get("live_adjustment_score"),
+            "live_adjustment_components": analysis.get("live_adjustment_components"),
+            "obs_floor_applied":         analysis.get("obs_floor_applied", 0),
+        }
+        try:
+            insert_decision_snapshot(snap)
+            written += 1
+        except Exception as e:
+            logger.debug(f"snapshot insert failed: {e}")
+    return written
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +245,33 @@ def analyze_temp_event(event: dict, bankroll: float) -> dict | None:
     sigma_c  = dist["sigma_c"]
     clim_kde = dist.get("clim_kde")   # KDE object or None
 
-    # Display-unit mu for dashboard
+    # --- Live adjustment layer (Phase 2b) ---------------------------------
+    # Looks up live_observations + latest forecast_hourly for this event.
+    # Returns blended-pass-through in cold-start (no VC data yet).
+    event_id = event.get("event_id") or ""
+    tz_str = _lookup_event_timezone(event_id)
+    adj = compute_live_adjustment(
+        event_id        = event_id,
+        blended_mu_c    = mu_c,
+        blended_sigma_c = sigma_c,
+        target_date     = date_str,
+        timezone_str    = tz_str,
+    )
+    adjusted_mu    = adj["adjusted_mu_c"]
+    adjusted_sigma = adj["adjusted_sigma_c"]
+    obs_floor_c    = adj.get("observed_max_so_far_c") if LIVE_ADJ_OBS_FLOOR else None
+
+    # Shadow mode: both pre- and post-adjustment probs are computed.
+    # When USE_LIVE_ADJUSTMENT is False, `active_*` = blended; trading logic
+    # uses `active_*`.  When True, `active_*` = adjusted.
+    if USE_LIVE_ADJUSTMENT:
+        active_mu, active_sigma = adjusted_mu, adjusted_sigma
+        active_floor            = obs_floor_c
+    else:
+        active_mu, active_sigma = mu_c, sigma_c
+        active_floor            = None
+
+    # Display-unit mu for dashboard (use blended — base model)
     if display_unit == "fahrenheit":
         mu_display = mu_c * 9 / 5 + 32
     else:
@@ -120,22 +280,28 @@ def analyze_temp_event(event: dict, bankroll: float) -> dict | None:
     outcomes   = event.get("outcomes", [])
     n_outcomes = len(outcomes)
 
-    # Step 1: compute raw model probabilities for each bin.
-    # Outcomes where range_low and range_high are both None (unparseable range)
-    # get raw_prob=None and are excluded from normalization but still included
-    # in the output so the dashboard can display all discovered contracts.
-    raw_probs: list[float | None] = []
+    # Step 1: compute raw model probabilities for each bin — two parallel
+    # passes: blended (no floor, base model) and active (chosen by flag).
+    raw_probs:         list[float | None] = []
+    raw_probs_blended: list[float | None] = []
     for o in outcomes:
         lo = o.get("range_low")
         hi = o.get("range_high")
         if lo is None and hi is None:
-            raw_probs.append(None)  # unparseable — no model probability
-        else:
-            p = get_temp_range_probability(
-                mu_c, sigma_c, lo, hi, o.get("unit", "celsius"),
-                kde=clim_kde,
-            )
-            raw_probs.append(p)
+            raw_probs.append(None)
+            raw_probs_blended.append(None)
+            continue
+        unit = o.get("unit", "celsius")
+        p_active = get_temp_range_probability(
+            active_mu, active_sigma, lo, hi, unit,
+            kde=clim_kde, obs_floor_c=active_floor,
+        )
+        p_blended = get_temp_range_probability(
+            mu_c, sigma_c, lo, hi, unit,
+            kde=clim_kde,   # no floor on the blended baseline
+        )
+        raw_probs.append(p_active)
+        raw_probs_blended.append(p_blended)
 
     parseable_probs = [p for p in raw_probs if p is not None]
     raw_sum = sum(parseable_probs)
@@ -164,6 +330,21 @@ def analyze_temp_event(event: dict, bankroll: float) -> dict | None:
         # No parseable ranges at all — all outcomes get None
         model_probs = [None] * n_outcomes
 
+    # Parallel normalization for the blended baseline (never uses the floor).
+    parseable_blended = [p for p in raw_probs_blended if p is not None]
+    blended_sum = sum(parseable_blended)
+    if blended_sum > 0:
+        model_probs_blended: list[float | None] = [
+            (p / blended_sum) if p is not None else None for p in raw_probs_blended
+        ]
+    elif parseable_blended:
+        n_pb = len(parseable_blended)
+        model_probs_blended = [
+            (1.0 / n_pb) if p is not None else None for p in raw_probs_blended
+        ]
+    else:
+        model_probs_blended = [None] * n_outcomes
+
     # Step 3: market overround
     market_prices  = [o.get("yes_price", 0.5) for o in outcomes]
     market_sum = sum(market_prices)
@@ -174,6 +355,7 @@ def analyze_temp_event(event: dict, bankroll: float) -> dict | None:
         market_price = market_prices[i]
         model_prob   = model_probs[i]   # may be None for unparseable ranges
         raw_prob     = raw_probs[i]     # may be None
+        model_prob_blended = model_probs_blended[i]
 
         # Outcomes without a parseable range: show market data only, no signal
         if model_prob is None:
@@ -191,6 +373,7 @@ def analyze_temp_event(event: dict, bankroll: float) -> dict | None:
                 "liquidity_usd":    o.get("liquidity_usd", 0),
                 "volume_usd":       o.get("volume_usd", 0),
                 "model_prob":       None,
+                "model_prob_blended": None,
                 "raw_model_prob":   None,
                 "ev":               None,
                 "edge":             None,
@@ -251,6 +434,7 @@ def analyze_temp_event(event: dict, bankroll: float) -> dict | None:
             "volume_usd":       o.get("volume_usd", 0),
             # Model
             "model_prob":       model_prob,
+            "model_prob_blended": model_prob_blended,
             "raw_model_prob":   raw_prob,
             # Signal
             "ev":               round(ev, 4),
@@ -277,7 +461,26 @@ def analyze_temp_event(event: dict, bankroll: float) -> dict | None:
         "n_sources":           len(dist.get("sources", [])),
         "sources":             dist.get("sources", []),
         "outcomes":            enriched_outcomes,
+        # Live adjustment (Phase 2b)
+        "adjusted_mu_c":               adjusted_mu,
+        "adjusted_sigma_c":            adjusted_sigma,
+        "live_adjustment_score":       adj.get("live_adjustment_score"),
+        "live_adjustment_components":  components_to_json(adj.get("components", {})),
+        "mu_adjustment_c":             adj.get("mu_adjustment_c"),
+        "observed_max_so_far_c":       adj.get("observed_max_so_far_c"),
+        "obs_floor_applied":           1 if (USE_LIVE_ADJUSTMENT and active_floor is not None) else 0,
     }
+
+    # Log the adjustment alongside the existing event summary so shadow-mode
+    # behavior is observable without a DB query.
+    _comp = adj.get("components", {})
+    logger.info(
+        f"LiveAdj: {city} {date_str} | blended_mu={mu_c:.2f} adj_mu={adjusted_mu:.2f} "
+        f"Δ={adj.get('mu_adjustment_c'):+.2f} score={adj.get('live_adjustment_score'):.3f} "
+        f"floor={adj.get('observed_max_so_far_c')} "
+        f"reason={_comp.get('reason')} n_obs={_comp.get('n_obs_used')} "
+        f"mode={'LIVE' if USE_LIVE_ADJUSTMENT else 'SHADOW'}"
+    )
 
     n_signals = sum(1 for o in enriched_outcomes if o["is_signal"])
     logger.info(
@@ -321,7 +524,9 @@ def run_edge_scan(
     logger.info(f"Analyzing {len(events)} highest-temperature events")
 
     from datetime import timezone
+    import uuid
     scan_ts = datetime.now(timezone.utc).isoformat()
+    snapshot_group_id = str(uuid.uuid4())   # one per trading-run cycle
 
     all_events_analyzed: list[dict] = []
     signals:             list[dict] = []
@@ -342,6 +547,12 @@ def run_edge_scan(
                 insert_temp_outcome(outcome, event_row_id, scan_ts)
         except Exception as e:
             logger.error(f"DB write failed for {analysis.get('city')} {analysis.get('date')}: {e}")
+
+        # ----- Decision snapshot (one row per outcome, grouped by run) -----
+        try:
+            _write_decision_snapshots(analysis, snapshot_group_id, scan_ts)
+        except Exception as e:
+            logger.debug(f"Decision snapshot write failed for {analysis.get('city')}: {e}")
 
         all_events_analyzed.append(analysis)
 

@@ -202,7 +202,11 @@ def fetch_intraday(lat: float, lon: float) -> dict:
     j = _get_vc(path, {
         "unitGroup": "metric",
         "include":   "hours,current,days",
-        "elements":  "datetime,datetimeEpoch,temp,tempmax,tempmin,source,stations",
+        "elements":  (
+            "datetime,datetimeEpoch,temp,tempmax,tempmin,"
+            "humidity,cloudcover,windspeed,precip,precipprob,conditions,"
+            "source,stations"
+        ),
     })
 
     days = j.get("days") or []
@@ -216,6 +220,12 @@ def fetch_intraday(lat: float, lon: float) -> dict:
             "datetime":       h.get("datetime"),
             "datetime_epoch": h.get("datetimeEpoch"),
             "temp_c":         h.get("temp"),
+            "humidity":       h.get("humidity"),
+            "cloudcover":     h.get("cloudcover"),
+            "windspeed_kph":  h.get("windspeed"),
+            "precip_mm":      h.get("precip"),
+            "precip_prob":    h.get("precipprob"),
+            "conditions":     h.get("conditions"),
             "source":         h.get("source"),
             "stations":       list(h.get("stations") or []),
         }
@@ -239,9 +249,16 @@ def fetch_intraday(lat: float, lon: float) -> dict:
         "resolved_address":         j.get("resolvedAddress"),
         "timezone":                 j.get("timezone"),
         "current_temp_c":           current.get("temp"),
+        "current_humidity":         current.get("humidity"),
+        "current_cloudcover":       current.get("cloudcover"),
+        "current_windspeed_kph":    current.get("windspeed"),
+        "current_precip_mm":        current.get("precip"),
+        "current_conditions":       current.get("conditions"),
+        "current_vc_source":        current.get("source"),
         "current_time":             current.get("datetime"),
         "current_stations":         list(current.get("stations") or []),
         "day_tempmax_estimate_c":   day.get("tempmax"),
+        "day_vc_source":            day.get("source"),
         "observed_hours":           observed,
         "forecast_hours":           forecast,
         "observed_max_so_far_c":    observed_max,
