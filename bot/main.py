@@ -32,7 +32,10 @@ from risk import run_all_checks
 from execution import get_clob_client, execute_signal
 from sizing import get_bankroll
 from monitor import run_monitor_loop
-from loops import forecast_pull_run, live_observation_run, retention_run
+from loops import (
+    forecast_pull_run, live_observation_run, retention_run,
+    vc_future_diagnostic_run,
+)
 
 # Ensure logs directory exists before FileHandler is created
 os.makedirs("logs", exist_ok=True)
@@ -274,6 +277,23 @@ def main():
         id="retention",
         name="Hourly/obs retention purge",
         misfire_grace_time=3600,
+        coalesce=True,
+    )
+
+    # VC future-day diagnostic: every 2 hours at :07 (runs just after the
+    # forecast pull at :05 so it uses fresh μ context in disagreement metrics).
+    def _vc_future_diag_job() -> None:
+        try:
+            vc_future_diagnostic_run(events=_cached_events)
+        except Exception as e:
+            logger.exception(f"VC future-day diagnostic run failed: {e}")
+
+    scheduler.add_job(
+        _vc_future_diag_job,
+        trigger=CronTrigger(hour="*/2", minute=7, timezone="UTC"),
+        id="vc_future_diag",
+        name="VC forecast diagnostics (future day)",
+        misfire_grace_time=600,
         coalesce=True,
     )
 

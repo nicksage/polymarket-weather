@@ -27,6 +27,7 @@ from config import (
     EDGE_THRESHOLD, MIN_LIQUIDITY_USD, MAX_FORECAST_DAYS,
     NORM_WARNING_LOW, NORM_WARNING_HIGH,
     USE_LIVE_ADJUSTMENT, LIVE_ADJ_OBS_FLOOR,
+    USE_LIVE_ADJUSTMENT_SIGMA_SHRINK, LIVE_ADJ_TAIL_FLATTEN_EXPONENT,
 )
 from live_adjustment import compute_live_adjustment, components_to_json
 from weather import (
@@ -43,6 +44,7 @@ from db import (
     get_latest_forecast_run,
     get_previous_forecast_run,
     get_latest_observation,
+    get_latest_vc_forecast_diagnostic,
 )
 from sizing import calculate_kelly_size
 
@@ -114,6 +116,7 @@ def _write_decision_snapshots(
     latest_gfs   = get_latest_forecast_run(event_id, "gfs")
     prev_ecmwf   = get_previous_forecast_run(event_id, "ecmwf")
     latest_obs   = get_latest_observation(event_id)
+    latest_vc_diag = get_latest_vc_forecast_diagnostic(event_id) or {}
 
     # Forecast delta vs prior pull (ECMWF only; GFS delta is tracked on
     # temp_events.forecast_delta_mu_c as an average in loops.py)
@@ -184,6 +187,15 @@ def _write_decision_snapshots(
             "live_adjustment_score":     analysis.get("live_adjustment_score"),
             "live_adjustment_components": analysis.get("live_adjustment_components"),
             "obs_floor_applied":         analysis.get("obs_floor_applied", 0),
+            # Phase 2c — VC forecast diagnostics at decision time
+            "vc_projected_day_max_c":       latest_vc_diag.get("vc_projected_day_max_c"),
+            "vc_vs_blended_mu_c":           latest_vc_diag.get("vc_vs_blended_mu_c"),
+            "vc_vs_adjusted_mu_c":          latest_vc_diag.get("vc_vs_adjusted_mu_c"),
+            "vc_hourly_path_rmse_c":        latest_vc_diag.get("vc_hourly_path_rmse_c"),
+            "vc_bins_apart":                latest_vc_diag.get("vc_bins_apart"),
+            "flag_vc_disagreement_large":   latest_vc_diag.get("flag_vc_disagreement_large", 0),
+            "flag_vc_warns_hotter":         latest_vc_diag.get("flag_vc_warns_hotter", 0),
+            "flag_vc_warns_colder":         latest_vc_diag.get("flag_vc_warns_colder", 0),
         }
         try:
             insert_decision_snapshot(snap)
@@ -256,6 +268,8 @@ def analyze_temp_event(event: dict, bankroll: float) -> dict | None:
         blended_sigma_c = sigma_c,
         target_date     = date_str,
         timezone_str    = tz_str,
+        lat             = lat,
+        lon             = lon,
     )
     adjusted_mu    = adj["adjusted_mu_c"]
     adjusted_sigma = adj["adjusted_sigma_c"]
@@ -344,6 +358,18 @@ def analyze_temp_event(event: dict, bankroll: float) -> dict | None:
         ]
     else:
         model_probs_blended = [None] * n_outcomes
+
+    # Tail flattening — applied to the ACTIVE probabilities (model_probs) only,
+    # when the v2 σ shrink path is on.  Preserves ranking; trims overconfident
+    # tail spikes.  Exponent == 1.0 disables.
+    if (USE_LIVE_ADJUSTMENT
+            and USE_LIVE_ADJUSTMENT_SIGMA_SHRINK
+            and LIVE_ADJ_TAIL_FLATTEN_EXPONENT != 1.0):
+        e = LIVE_ADJ_TAIL_FLATTEN_EXPONENT
+        raised = [((p ** e) if p is not None else None) for p in model_probs]
+        total = sum(p for p in raised if p is not None)
+        if total > 0:
+            model_probs = [((p / total) if p is not None else None) for p in raised]
 
     # Step 3: market overround
     market_prices  = [o.get("yes_price", 0.5) for o in outcomes]

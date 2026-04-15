@@ -169,6 +169,72 @@ def fetch_daily_history(
 # Integration 2 — Intraday observed + forecast snapshot
 # ---------------------------------------------------------------------------
 
+def fetch_future_day(lat: float, lon: float, target_date: date) -> dict:
+    """Pull VC forecast for a single FUTURE date (D+1, D+2...).  Used by the
+    Phase 2c diagnostic layer only — does NOT feed production μ/σ.
+
+    Returns a dict shaped like fetch_intraday() so downstream code can use
+    the same diagnostic builder.  Cost: 24 queryCost per call.
+    """
+    path = f"/{lat},{lon}/{target_date.isoformat()}"
+    j = _get_vc(path, {
+        "unitGroup": "metric",
+        "include":   "hours,days",
+        "elements":  (
+            "datetime,datetimeEpoch,temp,tempmax,tempmin,"
+            "humidity,cloudcover,windspeed,precip,precipprob,conditions,"
+            "source,stations"
+        ),
+    })
+    days = j.get("days") or []
+    if not days:
+        raise RuntimeError(f"VC returned no days for ({lat},{lon})/{target_date}")
+    day = days[0]
+    hours = day.get("hours") or []
+
+    def _norm(h: dict) -> dict:
+        return {
+            "datetime":       h.get("datetime"),
+            "datetime_epoch": h.get("datetimeEpoch"),
+            "temp_c":         h.get("temp"),
+            "humidity":       h.get("humidity"),
+            "cloudcover":     h.get("cloudcover"),
+            "windspeed_kph":  h.get("windspeed"),
+            "precip_mm":      h.get("precip"),
+            "precip_prob":    h.get("precipprob"),
+            "conditions":     h.get("conditions"),
+            "source":         h.get("source"),
+            "stations":       list(h.get("stations") or []),
+        }
+
+    forecast = [_norm(h) for h in hours if h.get("source") == "fcst"]
+    forecast_max = max((h["temp_c"] for h in forecast if h["temp_c"] is not None),
+                       default=None)
+
+    result = {
+        "as_of":                    datetime.utcnow().isoformat() + "Z",
+        "resolved_address":         j.get("resolvedAddress"),
+        "timezone":                 j.get("timezone"),
+        "current_temp_c":           None,
+        "day_tempmax_estimate_c":   day.get("tempmax"),
+        "day_vc_source":            day.get("source"),
+        "observed_hours":           [],
+        "forecast_hours":           forecast,
+        "observed_max_so_far_c":    None,
+        "forecast_remaining_max_c": forecast_max,
+        "projected_day_max_c":      day.get("tempmax"),
+        "stations":                 j.get("stations") or {},
+        "query_cost":               j.get("queryCost"),
+        "raw_day":                  day,
+    }
+    logger.info(
+        f"VC future_day ({lat:.3f},{lon:.3f}) {target_date}: "
+        f"day_max={result['day_tempmax_estimate_c']}°C fcst_hours={len(forecast)} "
+        f"queryCost={result['query_cost']}"
+    )
+    return result
+
+
 def fetch_intraday(lat: float, lon: float) -> dict:
     """
     Get a single snapshot of today at this location.  One API call returns:

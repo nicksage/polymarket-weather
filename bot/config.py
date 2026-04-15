@@ -41,6 +41,12 @@ MAX_DAILY_DRAWDOWN_PCT: float = _float("MAX_DAILY_DRAWDOWN_PCT", 0.10)
 # from the project root and the dashboard is run from bot/.
 _BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH: str = os.path.join(_BOT_DIR, "data", "signals.db")
+
+# Separate DB for backtest data — kept out of the live trading DB so
+# backfills/rebuilds cannot accidentally touch production state.
+BACKTEST_DB_PATH: str = os.getenv(
+    "BACKTEST_DB_PATH", os.path.join(_BOT_DIR, "data", "backtest.db")
+)
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
 # ---------------------------------------------------------------------------
@@ -178,3 +184,63 @@ LIVE_ADJ_OBS_FLOOR: bool = _bool("LIVE_ADJ_OBS_FLOOR", True)
 
 # Rolling window for residual smoothing (minutes).
 LIVE_ADJ_SMOOTH_WINDOW_MIN: int = int(os.getenv("LIVE_ADJ_SMOOTH_WINDOW_MIN", "60"))
+
+# ---------------------------------------------------------------------------
+# Live adjustment v2 — dynamic σ shrinkage (Phase 2b-v2)
+# Time-of-day based σ shrinkage with an optional residual-widening term that
+# prevents overconfidence on days that behave unexpectedly.  Disabled by
+# default in production; enable only after the floor+shrinkage combination
+# passes the backtest decision criteria (Brier, late-day Brier, reliability
+# improvement in the high-probability range).
+# ---------------------------------------------------------------------------
+
+USE_LIVE_ADJUSTMENT_SIGMA_SHRINK: bool = _bool("LIVE_ADJ_SIGMA_SHRINK", False)
+
+# Enable/disable each factor independently.  Keeping them separable lets the
+# backtest compare time_only vs time+residual cleanly.
+LIVE_ADJ_SIGMA_TIME_ENABLED: bool = _bool("LIVE_ADJ_SIGMA_TIME_ENABLED", True)
+LIVE_ADJ_SIGMA_RESIDUAL_ENABLED: bool = _bool("LIVE_ADJ_SIGMA_RESIDUAL_ENABLED", True)
+
+# Time factor: shrunk_factor_time = max(sqrt(remaining_daylight_frac), TIME_MIN)
+LIVE_ADJ_SIGMA_TIME_MIN: float = _float("LIVE_ADJ_SIGMA_TIME_MIN", 0.35)
+
+# Residual factor: 1 + min(|residual| / DIV, CAP) — widens σ on surprising days
+LIVE_ADJ_SIGMA_RESIDUAL_DIV: float = _float("LIVE_ADJ_SIGMA_RESIDUAL_DIV", 3.0)
+LIVE_ADJ_SIGMA_RESIDUAL_CAP: float = _float("LIVE_ADJ_SIGMA_RESIDUAL_CAP", 0.5)
+
+# Hard floors — protect against runaway collapse even when both factors push σ low.
+LIVE_ADJ_SIGMA_ABS_FLOOR_C: float = _float("LIVE_ADJ_SIGMA_ABS_FLOOR_C", 1.0)
+LIVE_ADJ_SIGMA_REL_FLOOR: float = _float("LIVE_ADJ_SIGMA_REL_FLOOR", 0.35)
+
+# ---------------------------------------------------------------------------
+# VC forecast diagnostic layer (Phase 2c)
+# Shadow / measurement layer — captures what VC is forecasting alongside our
+# model so we can measure whether VC disagreement contains useful information.
+# Purely diagnostic: does NOT feed the μ/σ blend or alter trade decisions.
+# ---------------------------------------------------------------------------
+
+# Disagreement thresholds (degrees Celsius).
+VC_DIAG_DISAGREE_LARGE_C: float = _float("VC_DIAG_DISAGREE_LARGE_C", 2.5)
+VC_DIAG_WARN_DIRECTIONAL_C: float = _float("VC_DIAG_WARN_DIRECTIONAL_C", 1.5)
+
+# Future-day horizon.  0 = disabled, 1 = pull diagnostics for D+1 events,
+# 2 = D+1 and D+2, etc.  Adds one VC call per future-day event per 2-hour pull.
+VC_DIAG_FUTURE_DAY_HORIZON: int = int(os.getenv("VC_DIAG_FUTURE_DAY_HORIZON", "1"))
+
+# Hour window used for vc_hourly_path_rmse_c (same-day only).  Default 6
+# hours gives a cleaner near-term signal than the full remaining day.
+VC_DIAG_RMSE_WINDOW_HOURS: int = int(os.getenv("VC_DIAG_RMSE_WINDOW_HOURS", "6"))
+
+# Approximate bin width (°C) used to translate disagreements into a rough
+# "bins apart" metric.  Most Polymarket bins are 1°F = ~0.556°C; set via env
+# if the market bin size changes.
+VC_DIAG_BIN_WIDTH_C: float = _float("VC_DIAG_BIN_WIDTH_C", 0.556)
+
+
+# Tail-probability flattening — applied AFTER per-event bin normalization:
+#     p' = p ** LIVE_ADJ_TAIL_FLATTEN_EXPONENT
+# Then re-normalized across bins so probabilities still sum to 1.  Preserves
+# bin ranking while trimming overconfident spikes in the upper tail.  Only
+# applied when USE_LIVE_ADJUSTMENT_SIGMA_SHRINK is True (bundled with v2).
+# Exponent of 1.0 disables flattening.
+LIVE_ADJ_TAIL_FLATTEN_EXPONENT: float = _float("LIVE_ADJ_TAIL_FLATTEN_EXPONENT", 0.95)

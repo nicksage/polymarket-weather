@@ -25,17 +25,26 @@ import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import Iterable
 
-from config import MAX_FORECAST_DAYS
+from config import (
+    MAX_FORECAST_DAYS,
+    VC_DIAG_BIN_WIDTH_C,
+    VC_DIAG_DISAGREE_LARGE_C,
+    VC_DIAG_FUTURE_DAY_HORIZON,
+    VC_DIAG_RMSE_WINDOW_HOURS,
+    VC_DIAG_WARN_DIRECTIONAL_C,
+)
 from db import (
     insert_forecast_run,
     insert_forecast_hourly_bulk,
     get_latest_forecast_run,
+    get_latest_forecast_hourly,
     get_previous_forecast_run,
     insert_live_observation,
     get_latest_observation,
     get_recent_observations,
     update_event_current_state,
     bump_vc_usage,
+    insert_vc_forecast_diagnostic,
 )
 
 logger = logging.getLogger(__name__)
@@ -371,6 +380,164 @@ def _temp_change(event_id: str, current_temp_c: float | None, hours: int) -> flo
     return current_temp_c - best["current_temp_c"]
 
 
+def _build_vc_diagnostic_row(
+    *,
+    event_id: str,
+    city: str | None,
+    target_date: str,
+    pulled_at_utc: str,
+    kind: str,
+    vc_payload: dict,
+    event_state: dict | None,
+) -> dict | None:
+    """Compute disagreement metrics + flags from a VC payload and write a
+    vc_forecast_diagnostics row.  Returns the inserted row dict (or None if
+    VC didn't provide a usable day-max estimate)."""
+    import json
+    import math
+
+    vc_day_max = vc_payload.get("day_tempmax_estimate_c")
+    if vc_day_max is None:
+        return None
+
+    vc_fcst_remaining = vc_payload.get("forecast_remaining_max_c")
+    vc_day_source = vc_payload.get("day_vc_source")
+
+    blended_mu    = (event_state or {}).get("forecast_mu_c")
+    blended_sigma = (event_state or {}).get("forecast_sigma_c")
+    adjusted_mu   = (event_state or {}).get("adjusted_mu_c")
+    adjusted_sigma= (event_state or {}).get("adjusted_sigma_c")
+    cur_temp      = vc_payload.get("current_temp_c")
+    obs_max       = vc_payload.get("observed_max_so_far_c")
+
+    def _sub(a, b):
+        if a is None or b is None:
+            return None
+        return float(a) - float(b)
+
+    d_blended = _sub(vc_day_max, blended_mu)
+    d_adjusted = _sub(vc_day_max, adjusted_mu)
+    d_obs     = _sub(vc_day_max, obs_max)
+
+    abs_blended  = abs(d_blended)  if d_blended  is not None else None
+    abs_adjusted = abs(d_adjusted) if d_adjusted is not None else None
+
+    # Bins-apart uses disagreement vs blended (the model's production number)
+    if abs_blended is not None and VC_DIAG_BIN_WIDTH_C > 0:
+        bins_apart = int(round(abs_blended / VC_DIAG_BIN_WIDTH_C))
+    else:
+        bins_apart = None
+
+    # Flags
+    flag_large   = int(abs_blended is not None and abs_blended >= VC_DIAG_DISAGREE_LARGE_C)
+    flag_hotter  = int(d_blended   is not None and d_blended   >=  VC_DIAG_WARN_DIRECTIONAL_C)
+    flag_colder  = int(d_blended   is not None and d_blended   <= -VC_DIAG_WARN_DIRECTIONAL_C)
+
+    # Hourly-path RMSE: compare next-6h VC forecast_hours to our stored
+    # forecast_hourly for the latest ECMWF run.  Same-day only; NULL for
+    # future_day rows (caller passes empty vc.forecast_hours then).
+    rmse_c = None
+    n_rmse = None
+    if kind == "same_day":
+        vc_future_hours = [h for h in (vc_payload.get("forecast_hours") or [])
+                           if h.get("source") == "fcst" and h.get("temp_c") is not None]
+        if vc_future_hours:
+            latest_ecmwf = get_latest_forecast_run(event_id, "ecmwf")
+            our_hours_map: dict[str, float] = {}
+            if latest_ecmwf:
+                hrs = get_latest_forecast_hourly(latest_ecmwf["id"]) or []
+                for h in hrs:
+                    ts = h.get("hour_ts_utc")
+                    t = h.get("temp_c")
+                    if ts and t is not None:
+                        # normalize to "YYYY-MM-DDTHH" prefix for hour-match
+                        our_hours_map[ts[:13]] = float(t)
+            if our_hours_map:
+                diffs: list[float] = []
+                for h in vc_future_hours[:VC_DIAG_RMSE_WINDOW_HOURS]:
+                    vc_dt = h.get("datetime")  # "YYYY-MM-DD HH:MM:SS" (local per VC)
+                    if not vc_dt:
+                        continue
+                    # VC returns local-time datetime; match only by hour in UTC
+                    # is hard, so match by datetime_epoch → ISO hour.
+                    epoch = h.get("datetime_epoch")
+                    if epoch is None:
+                        continue
+                    from datetime import datetime, timezone as _tz
+                    utc_hr = datetime.fromtimestamp(int(epoch), _tz.utc).strftime("%Y-%m-%dT%H")
+                    our_t = our_hours_map.get(utc_hr)
+                    if our_t is None:
+                        continue
+                    diffs.append(float(h["temp_c"]) - our_t)
+                if diffs:
+                    n_rmse = len(diffs)
+                    rmse_c = math.sqrt(sum(d * d for d in diffs) / n_rmse)
+
+    # Compact JSON of VC hourly forecast path (future hours only) for later
+    # re-analysis; skip for future_day where the payload format differs.
+    vc_hourly_json = None
+    try:
+        future_hours = [
+            {"dt": h.get("datetime"), "epoch": h.get("datetime_epoch"),
+             "temp": h.get("temp_c"), "src": h.get("source")}
+            for h in (vc_payload.get("forecast_hours") or [])
+        ]
+        if future_hours:
+            vc_hourly_json = json.dumps(future_hours, default=str,
+                                        separators=(",", ":"))
+    except Exception:
+        vc_hourly_json = None
+
+    return {
+        "event_id": event_id, "city": city,
+        "target_date": target_date, "pulled_at_utc": pulled_at_utc, "kind": kind,
+        "vc_projected_day_max_c":      vc_day_max,
+        "vc_forecast_remaining_max_c": vc_fcst_remaining,
+        "vc_day_vc_source":            vc_day_source,
+        "blended_mu_c":                blended_mu,
+        "blended_sigma_c":             blended_sigma,
+        "adjusted_mu_c":               adjusted_mu,
+        "adjusted_sigma_c":            adjusted_sigma,
+        "current_temp_c":              cur_temp,
+        "observed_max_so_far_c":       obs_max,
+        "vc_vs_blended_mu_c":          d_blended,
+        "vc_vs_adjusted_mu_c":         d_adjusted,
+        "vc_vs_observed_max_c":        d_obs,
+        "abs_vc_vs_blended":           abs_blended,
+        "abs_vc_vs_adjusted":          abs_adjusted,
+        "vc_bins_apart":               bins_apart,
+        "vc_hourly_path_rmse_c":       rmse_c,
+        "vc_hourly_path_n":            n_rmse,
+        "flag_vc_disagreement_large":  flag_large,
+        "flag_vc_warns_hotter":        flag_hotter,
+        "flag_vc_warns_colder":        flag_colder,
+        "vc_hourly_forecast_json":     vc_hourly_json,
+    }
+
+
+def _get_event_state(event_id: str) -> dict | None:
+    """Return the most recent temp_events row with forecast/adjusted μ/σ."""
+    if not event_id:
+        return None
+    try:
+        import sqlite3
+        from config import DB_PATH
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT forecast_mu_c, forecast_sigma_c, adjusted_mu_c, "
+                "adjusted_sigma_c FROM temp_events WHERE event_id = ? "
+                "ORDER BY scan_timestamp DESC LIMIT 1",
+                (event_id,),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
 def live_observation_run(events: list[dict] | None = None) -> dict:
     """
     Poll Visual Crossing for every active event, insert a live_observations
@@ -463,6 +630,37 @@ def live_observation_run(events: list[dict] | None = None) -> dict:
         except Exception as e:
             logger.debug(f"event-state update failed for {event_id}: {e}")
 
+        # --- VC forecast diagnostic (Phase 2c, shadow-only) ---
+        try:
+            diag = _build_vc_diagnostic_row(
+                event_id      = event_id,
+                city          = city,
+                target_date   = date_str,
+                pulled_at_utc = pulled_at,
+                kind          = "same_day",
+                vc_payload    = j,
+                event_state   = _get_event_state(event_id),
+            )
+            if diag:
+                insert_vc_forecast_diagnostic(diag)
+                if diag.get("flag_vc_disagreement_large") or \
+                   diag.get("flag_vc_warns_hotter") or \
+                   diag.get("flag_vc_warns_colder"):
+                    tags = []
+                    if diag.get("flag_vc_disagreement_large"): tags.append("LARGE")
+                    if diag.get("flag_vc_warns_hotter"): tags.append("hotter")
+                    if diag.get("flag_vc_warns_colder"): tags.append("colder")
+                    logger.info(
+                        f"VCDiag: {city} {date_str} | vc_day_max="
+                        f"{diag['vc_projected_day_max_c']:.2f}°C "
+                        f"blended_mu={diag.get('blended_mu_c')} "
+                        f"Δ={diag.get('vc_vs_blended_mu_c'):+.2f}°C "
+                        f"bins={diag.get('vc_bins_apart')} "
+                        f"flags={','.join(tags)}"
+                    )
+        except Exception as e:
+            logger.debug(f"VC diagnostic write failed for {event_id}: {e}")
+
     logger.info(
         f"Live observations: events={counts['events']} "
         f"observations={counts['observations']} errors={counts['errors']}"
@@ -476,13 +674,102 @@ def live_observation_run(events: list[dict] | None = None) -> dict:
 # ---------------------------------------------------------------------------
 
 def retention_run(older_than_days: int = 90) -> dict:
-    """Nightly retention: purge forecast_hourly + live_observations older
-    than N days.  Summary tables are kept indefinitely."""
-    from db import purge_forecast_hourly, purge_live_observations
+    """Nightly retention: purge forecast_hourly + live_observations +
+    vc_forecast_diagnostics older than N days.  Summary tables are kept
+    indefinitely."""
+    from db import (
+        purge_forecast_hourly, purge_live_observations,
+        purge_vc_forecast_diagnostics,
+    )
     logger.info("=== RETENTION RUN START ===")
     fh = purge_forecast_hourly(older_than_days)
     lo = purge_live_observations(older_than_days)
+    vd = purge_vc_forecast_diagnostics(older_than_days)
     logger.info(f"Retention: purged forecast_hourly={fh} live_observations={lo} "
-                f"(older than {older_than_days}d)")
+                f"vc_forecast_diagnostics={vd} (older than {older_than_days}d)")
     logger.info("=== RETENTION RUN END ===")
-    return {"forecast_hourly_deleted": fh, "live_observations_deleted": lo}
+    return {
+        "forecast_hourly_deleted":         fh,
+        "live_observations_deleted":       lo,
+        "vc_forecast_diagnostics_deleted": vd,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Future-day VC diagnostic loop (Phase 2c)
+# ---------------------------------------------------------------------------
+
+def vc_future_diagnostic_run(events: list[dict] | None = None) -> dict:
+    """Pull VC forecast diagnostics for events that are 1..VC_DIAG_FUTURE_DAY_HORIZON
+    days out.  Shadow-only — writes vc_forecast_diagnostics rows tagged
+    kind='future_day'.  Runs every 2 hours alongside the forecast pull."""
+    if VC_DIAG_FUTURE_DAY_HORIZON <= 0:
+        logger.debug("VC future-day diagnostic disabled (horizon=0)")
+        return {"events": 0, "diagnostics": 0, "skipped": 0, "errors": 0}
+
+    logger.info("=== VC FUTURE-DAY DIAGNOSTIC RUN START ===")
+    pulled_at = _utc_now_iso()
+
+    if events is None:
+        from polymarket import search_temp_high_events
+        from config import MIN_LIQUIDITY_USD
+        events = search_temp_high_events(min_liquidity=MIN_LIQUIDITY_USD)
+
+    try:
+        from visualcrossing import fetch_future_day
+    except Exception as e:
+        logger.error(f"Cannot import fetch_future_day: {e}")
+        return {"events": 0, "diagnostics": 0, "errors": 1}
+
+    counts = {"events": 0, "diagnostics": 0, "skipped": 0, "errors": 0}
+
+    for ev in _event_iter(events):
+        d = ev.get("date")
+        da = _days_ahead(d)
+        if da is None or da < 1 or da > VC_DIAG_FUTURE_DAY_HORIZON:
+            counts["skipped"] += 1
+            continue
+        counts["events"] += 1
+        event_id = ev.get("event_id") or ""
+        city = ev.get("city")
+        lat, lon = ev["lat"], ev["lon"]
+        try:
+            from datetime import date as _date
+            j = fetch_future_day(lat, lon, _date.fromisoformat(d))
+        except Exception as e:
+            logger.warning(f"VC future_day failed for {city} {d}: {e}")
+            counts["errors"] += 1
+            continue
+
+        bump_vc_usage(j.get("query_cost"))
+
+        try:
+            diag = _build_vc_diagnostic_row(
+                event_id      = event_id,
+                city          = city,
+                target_date   = d,
+                pulled_at_utc = pulled_at,
+                kind          = "future_day",
+                vc_payload    = j,
+                event_state   = _get_event_state(event_id),
+            )
+            if diag:
+                insert_vc_forecast_diagnostic(diag)
+                counts["diagnostics"] += 1
+                if diag.get("flag_vc_disagreement_large"):
+                    logger.info(
+                        f"VCDiag[D+{da}]: {city} {d} | "
+                        f"vc_day_max={diag['vc_projected_day_max_c']:.2f}°C "
+                        f"blended_mu={diag.get('blended_mu_c')} "
+                        f"Δ={diag.get('vc_vs_blended_mu_c'):+.2f}°C LARGE"
+                    )
+        except Exception as e:
+            logger.debug(f"future_day diag insert failed for {event_id}: {e}")
+
+    logger.info(
+        f"VC future-day diagnostics: events={counts['events']} "
+        f"diagnostics={counts['diagnostics']} "
+        f"skipped={counts['skipped']} errors={counts['errors']}"
+    )
+    logger.info("=== VC FUTURE-DAY DIAGNOSTIC RUN END ===")
+    return counts

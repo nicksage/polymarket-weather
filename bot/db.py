@@ -187,6 +187,15 @@ def init_db():
             "ALTER TABLE decision_snapshots ADD COLUMN live_adjustment_score REAL",
             "ALTER TABLE decision_snapshots ADD COLUMN live_adjustment_components TEXT",
             "ALTER TABLE decision_snapshots ADD COLUMN obs_floor_applied INTEGER DEFAULT 0",
+            # --- Phase 2c: VC forecast diagnostic layer ---
+            "ALTER TABLE decision_snapshots ADD COLUMN vc_projected_day_max_c REAL",
+            "ALTER TABLE decision_snapshots ADD COLUMN vc_vs_blended_mu_c REAL",
+            "ALTER TABLE decision_snapshots ADD COLUMN vc_vs_adjusted_mu_c REAL",
+            "ALTER TABLE decision_snapshots ADD COLUMN vc_hourly_path_rmse_c REAL",
+            "ALTER TABLE decision_snapshots ADD COLUMN vc_bins_apart INTEGER",
+            "ALTER TABLE decision_snapshots ADD COLUMN flag_vc_disagreement_large INTEGER DEFAULT 0",
+            "ALTER TABLE decision_snapshots ADD COLUMN flag_vc_warns_hotter INTEGER DEFAULT 0",
+            "ALTER TABLE decision_snapshots ADD COLUMN flag_vc_warns_colder INTEGER DEFAULT 0",
         ]:
             try:
                 conn.execute(col_def)
@@ -400,6 +409,53 @@ def init_db():
                 ON decision_snapshots(event_snapshot_group_id);
             CREATE INDEX IF NOT EXISTS idx_ds_date_time
                 ON decision_snapshots(date, evaluated_at_utc DESC);
+
+            -- Phase 2c — VC forecast diagnostic layer (shadow-only).
+            -- Captures what VC is forecasting alongside our model at each
+            -- evaluation point so disagreement can be analyzed retrospectively.
+            -- NEVER feeds the production μ/σ blend.
+            CREATE TABLE IF NOT EXISTS vc_forecast_diagnostics (
+                id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id                   TEXT NOT NULL,
+                city                       TEXT,
+                target_date                TEXT NOT NULL,
+                pulled_at_utc              TEXT NOT NULL,
+                kind                       TEXT NOT NULL,         -- 'same_day' | 'future_day'
+                -- VC forecast-side output
+                vc_projected_day_max_c     REAL,
+                vc_forecast_remaining_max_c REAL,
+                vc_day_vc_source           TEXT,
+                -- Context at pull time
+                blended_mu_c               REAL,
+                blended_sigma_c            REAL,
+                adjusted_mu_c              REAL,
+                adjusted_sigma_c           REAL,
+                current_temp_c             REAL,
+                observed_max_so_far_c      REAL,
+                -- Disagreement metrics (precomputed on write)
+                vc_vs_blended_mu_c         REAL,
+                vc_vs_adjusted_mu_c        REAL,
+                vc_vs_observed_max_c       REAL,
+                abs_vc_vs_blended          REAL,
+                abs_vc_vs_adjusted         REAL,
+                vc_bins_apart              INTEGER,
+                -- Hourly path (same-day only)
+                vc_hourly_path_rmse_c      REAL,
+                vc_hourly_path_n           INTEGER,
+                -- Flags (informational; never trade-gating in v1)
+                flag_vc_disagreement_large INTEGER DEFAULT 0,
+                flag_vc_warns_hotter       INTEGER DEFAULT 0,
+                flag_vc_warns_colder       INTEGER DEFAULT 0,
+                -- Raw VC hourly path preserved for re-analysis
+                vc_hourly_forecast_json    TEXT,
+                UNIQUE(event_id, pulled_at_utc)
+            );
+            CREATE INDEX IF NOT EXISTS idx_vcdiag_event_time
+                ON vc_forecast_diagnostics(event_id, pulled_at_utc DESC);
+            CREATE INDEX IF NOT EXISTS idx_vcdiag_date_time
+                ON vc_forecast_diagnostics(target_date, pulled_at_utc DESC);
+            CREATE INDEX IF NOT EXISTS idx_vcdiag_large
+                ON vc_forecast_diagnostics(flag_vc_disagreement_large, target_date);
 
             -- VC cost accounting (cheap surface so we don't scan obs table).
             CREATE TABLE IF NOT EXISTS vc_usage_daily (
@@ -1452,6 +1508,9 @@ def insert_decision_snapshot(snapshot: dict) -> int:
         "adjusted_mu_c", "adjusted_sigma_c",
         "live_adjustment_score", "live_adjustment_components",
         "obs_floor_applied",
+        "vc_projected_day_max_c", "vc_vs_blended_mu_c", "vc_vs_adjusted_mu_c",
+        "vc_hourly_path_rmse_c", "vc_bins_apart",
+        "flag_vc_disagreement_large", "flag_vc_warns_hotter", "flag_vc_warns_colder",
     ]
     placeholders = ",".join("?" * len(cols))
     sql = f"INSERT INTO decision_snapshots ({','.join(cols)}) VALUES ({placeholders})"
@@ -1527,6 +1586,58 @@ def purge_live_observations(older_than_days: int = 90) -> int:
 # ---------------------------------------------------------------------------
 # Phase 2 — VC usage cost accounting
 # ---------------------------------------------------------------------------
+
+def insert_vc_forecast_diagnostic(row: dict) -> int:
+    """Insert one vc_forecast_diagnostics row.  UNIQUE on (event_id,
+    pulled_at_utc) — re-insertions with the same timestamp are ignored."""
+    cols = [
+        "event_id", "city", "target_date", "pulled_at_utc", "kind",
+        "vc_projected_day_max_c", "vc_forecast_remaining_max_c", "vc_day_vc_source",
+        "blended_mu_c", "blended_sigma_c", "adjusted_mu_c", "adjusted_sigma_c",
+        "current_temp_c", "observed_max_so_far_c",
+        "vc_vs_blended_mu_c", "vc_vs_adjusted_mu_c", "vc_vs_observed_max_c",
+        "abs_vc_vs_blended", "abs_vc_vs_adjusted", "vc_bins_apart",
+        "vc_hourly_path_rmse_c", "vc_hourly_path_n",
+        "flag_vc_disagreement_large", "flag_vc_warns_hotter", "flag_vc_warns_colder",
+        "vc_hourly_forecast_json",
+    ]
+    placeholders = ",".join("?" * len(cols))
+    sql = (f"INSERT OR IGNORE INTO vc_forecast_diagnostics "
+           f"({','.join(cols)}) VALUES ({placeholders})")
+    vals = [row.get(c) for c in cols]
+    with _get_conn() as conn:
+        cur = conn.execute(sql, vals)
+        return cur.lastrowid or 0
+
+
+def get_latest_vc_forecast_diagnostic(
+    event_id: str, since_utc: str | None = None,
+) -> dict | None:
+    """Return the most recent vc_forecast_diagnostics row for an event.
+    Optionally restricted to rows newer than `since_utc` (ISO string)."""
+    if since_utc:
+        sql = ("SELECT * FROM vc_forecast_diagnostics "
+               "WHERE event_id = ? AND pulled_at_utc >= ? "
+               "ORDER BY pulled_at_utc DESC LIMIT 1")
+        params = (event_id, since_utc)
+    else:
+        sql = ("SELECT * FROM vc_forecast_diagnostics "
+               "WHERE event_id = ? "
+               "ORDER BY pulled_at_utc DESC LIMIT 1")
+        params = (event_id,)
+    with _get_conn() as conn:
+        row = conn.execute(sql, params).fetchone()
+        return dict(row) if row else None
+
+
+def purge_vc_forecast_diagnostics(older_than_days: int = 90) -> int:
+    from datetime import datetime, timedelta, timezone
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+    sql = "DELETE FROM vc_forecast_diagnostics WHERE pulled_at_utc < ?"
+    with _get_conn() as conn:
+        cur = conn.execute(sql, (cutoff,))
+        return cur.rowcount
+
 
 def bump_vc_usage(query_cost: int | None) -> None:
     """Increment the daily VC cost counter by `query_cost` (default 0) and
