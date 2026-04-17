@@ -1,0 +1,66 @@
+Yes — the bot captures full attribution on every exit, and yes, you can analyze whether early exits were right or wrong after the fact. Here's how it works end to end.
+
+What gets captured at exit
+When the exit engine closes a position, three things are written to the positions row:
+
+exit_reason — a structured string like INVALIDATED:observed_max=25.1 > range_high=23.5+0.5 or DYING:prob_collapse: entry=0.312 current=0.018 or WEAKENED:mu_shift=+2.31 > 1.50 against; losing. This tells you exactly which classification fired and the specific numbers that triggered it.
+
+exit_snapshot_id — the primary key of the decision_snapshots row that was current at exit time. That snapshot contains the full model context at the moment of exit: blended μ/σ, adjusted μ/σ, current temp, observed max, market price, model probability, edge, the live adjustment components, and the VC diagnostic fields. So you can reconstruct what the model believed and what the market was pricing at the exact instant the bot decided to sell.
+
+entry_snapshot_id — already captured at entry time. Contains the same fields as above but frozen at the moment the trade was placed.
+
+Together, these two snapshots let you diff the entry state against the exit state and see exactly what changed: how much did μ shift, how much did the model probability drop, was the live adjustment confirming or contradicting, what was the observed max at each moment.
+
+The monitor loop also tracks max_favorable_excursion (the highest unrealized P&L the position reached during its lifetime) and max_adverse_excursion (the lowest). These tell you whether the position was ever deeply profitable before it deteriorated, or whether it was underwater from the start.
+
+How to analyze whether exits were right
+After a market resolves, the actual temperature lands in historical_observed_daily.tempmax_c. You can join that to any closed position and answer: "Did the bin I exited actually win?"
+
+A simple diagnostic query:
+
+
+SELECT
+    p.id, p.city, p.date, p.side,
+    p.range_low, p.range_high, p.unit,
+    p.exit_reason,
+    p.entry_price, p.exit_price, p.pnl,
+    p.max_favorable_excursion, p.max_adverse_excursion,
+    h.tempmax_c AS actual_high,
+    CASE
+        WHEN h.tempmax_c >= p.range_low AND h.tempmax_c < p.range_high
+        THEN 'BIN_HIT'
+        ELSE 'BIN_MISS'
+    END AS outcome,
+    CASE
+        WHEN p.exit_reason LIKE 'INVALIDATED%' OR p.exit_reason LIKE 'DYING%'
+             OR p.exit_reason LIKE 'WEAKENED%'
+        THEN CASE
+            WHEN h.tempmax_c >= p.range_low AND h.tempmax_c < p.range_high
+            THEN 'PREMATURE_EXIT'
+            ELSE 'CORRECT_EXIT'
+        END
+    END AS exit_quality
+FROM positions p
+JOIN historical_observed_daily h
+  ON h.city = p.city AND h.date = p.date
+WHERE p.status = 'closed'
+  AND p.exit_reason IS NOT NULL
+  AND p.exit_reason != ''
+ORDER BY p.date DESC, p.city
+The exit_quality column is the key output: PREMATURE_EXIT means the bot sold a position that would have won if held to resolution (we left money on the table), and CORRECT_EXIT means the bin didn't hit and the bot was right to sell early (we saved money). For premature exits on YES positions, the cost of the early exit is $1.00 − exit_price per share — that's what we gave up. For correct exits, the savings is exit_price − $0.00 per share — that's what we recovered instead of riding to zero.
+
+You can aggregate this across all exits to get the headline metrics: what percentage of early exits were premature, and what was the net dollar impact (savings from correct exits minus foregone profit from premature exits). If the net is positive, the exit engine is adding value. If it's negative, one or more thresholds need loosening.
+
+What to look for specifically
+INVALIDATED exits that were premature — these would mean the observed max exceeded the bin ceiling + buffer, but the actual official daily high ended up back inside the bin. This would indicate the buffer (EXIT_DEAD_BUFFER_C = 0.5°C) is too small, or that the observation source diverges from the resolution source. Widen the buffer or tighten the time-of-day gate.
+
+DYING exits that were premature — these would mean the model probability collapsed below 5% but the bin still won. This would indicate either the model was wrong about the probability shift (the forecast overcorrected), or the threshold is too aggressive. Raise EXIT_DYING_PROB_THRESHOLD from 0.05 to 0.08 or 0.10.
+
+WEAKENED exits that were premature — these are the most interesting to study because "thesis weakened" is a judgment call. The entry and exit snapshots will show you exactly how much μ shifted and whether the shift was real (confirmed by subsequent observations) or a model wobble that reversed. If you see a pattern of weakened exits where the forecast shifted 1.2σ against the position but then shifted back on the next pull, the threshold (EXIT_WEAKENED_SIGMA_SHIFT = 1.0) may need raising to 1.5.
+
+THRIVING (take-profit) exits that left money on the table — these sold because the executable bid captured ≥95% of hold EV. If the bin frequently went to $1.00 after these exits, lowering EXIT_EV_CAPTURE_RATIO from 0.95 to 0.90 would let more winners ride. If the bin frequently reversed after these exits (the market price dropped back), the current threshold is right and the take-profit saved you from reversal risk.
+
+The max_favorable_excursion field is particularly useful here: if a WEAKENED exit shows MFE of +$0.45 but exit P&L of +$0.08, you know the position was once deeply profitable before the thesis degraded — the question is whether the degradation was real or temporary.
+
+When to run this analysis
+After the bot has been running for a week or two with the exit engine active, you'll have enough closed positions with exit_reason populated to see patterns. The query above can be run anytime directly against signals.db. If you want a more structured report, we could build a script similar to vc_diagnostic_report.py that computes premature-exit rates, net dollar impact by exit classification, and identifies which thresholds should be tuned. That would be a natural follow-up once the first batch of data accumulates.

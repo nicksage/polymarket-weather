@@ -1,0 +1,14 @@
+HOW TO RUN BOT & DASHBOARD:
+
+# full both with scheduler
+python main.py
+
+# single run then exit
+python main.py --dry-run
+
+# start monitoring UI
+streamlit run dashboard.py
+streamlit run dashboard.py --server.port 8501
+
+# run all tests
+pytest ../tests/

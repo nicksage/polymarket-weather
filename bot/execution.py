@@ -22,7 +22,7 @@ from py_clob_client.clob_types import OrderArgs, OrderType
 from py_clob_client.constants import POLYGON
 
 from config import PAPER_TRADE
-from db import insert_position, mark_outcome_executed
+from db import insert_position, mark_outcome_executed, get_latest_snapshot_id_for_contract
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +86,11 @@ def execute_signal(signal: dict, client: ClobClient | None = None) -> dict:
     # Shares = dollars risked / price per share
     shares = round(size_usdc / entry_price, 4) if entry_price > 0 else 0
 
+    # Look up the decision snapshot that produced this signal so we can
+    # link the position to its exact entry-time context for later exit
+    # comparison (thesis-shift detection).
+    entry_snapshot_id = get_latest_snapshot_id_for_contract(contract_id)
+
     # Common position metadata drawn from the signal
     position_kwargs = dict(
         contract_id     = contract_id,
@@ -112,6 +117,7 @@ def execute_signal(signal: dict, client: ClobClient | None = None) -> dict:
         lat              = signal.get("lat"),
         lon              = signal.get("lon"),
         forecast_sigma_c = signal.get("forecast_sigma_c"),
+        entry_snapshot_id = entry_snapshot_id,
     )
 
     # -------------------------------------------------------------------------

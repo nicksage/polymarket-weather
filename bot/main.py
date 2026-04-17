@@ -28,7 +28,7 @@ from datetime import datetime
 from config import LOG_LEVEL, PAPER_TRADE, DB_PATH
 from db import init_db
 from edge import run_edge_scan
-from risk import run_all_checks
+from risk import run_all_checks, run_pre_checks, run_portfolio_checks
 from execution import get_clob_client, execute_signal
 from sizing import get_bankroll
 from monitor import run_monitor_loop
@@ -36,6 +36,7 @@ from loops import (
     forecast_pull_run, live_observation_run, retention_run,
     vc_future_diagnostic_run,
 )
+from position_eval import evaluate_open_positions
 
 # Ensure logs directory exists before FileHandler is created
 os.makedirs("logs", exist_ok=True)
@@ -57,6 +58,85 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 # Cache of the most recently discovered events, shared between discovery and
 # trading runs to avoid a redundant Gamma API call within the same hour.
 _cached_events: list[dict] | None = None
+
+
+# ---------------------------------------------------------------------------
+# Exit execution helper (Phase 3)
+# ---------------------------------------------------------------------------
+
+def _execute_exit_actions(actions, client) -> int:
+    """Execute queued exit actions from position_eval.  Paper mode logs the
+    exit; live mode places CLOB sell orders.  Returns count of exits executed."""
+    from datetime import timezone
+    from zoneinfo import ZoneInfo
+    from db import (
+        update_position_outcome,
+        update_position_excursions,
+        get_latest_snapshot_id_for_contract,
+    )
+    from execution import cancel_order
+
+    executed = 0
+    now = datetime.now(ZoneInfo("America/Chicago")).isoformat()
+
+    for ea in actions:
+        if ea.action == "HOLD":
+            continue
+
+        exit_price = ea.exit_price or 0.0
+        # For paper mode we simulate the sell at the executable bid
+        shares = 0.0
+        entry_price = 0.0
+        try:
+            from db import _get_conn
+            from config import DB_PATH
+            import sqlite3
+            conn = sqlite3.connect(DB_PATH)
+            row = conn.execute(
+                "SELECT shares, entry_price, unrealized_pnl FROM positions WHERE id = ?",
+                (ea.position_id,)
+            ).fetchone()
+            conn.close()
+            if row:
+                shares = float(row[0] or 0)
+                entry_price = float(row[1] or 0)
+        except Exception:
+            pass
+
+        if ea.action == "REDUCE_50":
+            # For paper: close half the position; for live: sell half shares
+            shares = shares * 0.5
+            # In paper mode we can't actually split — log as a note and
+            # keep the position open with reduced effective size.
+            # For v1: treat REDUCE_50 as a full sell with a note.
+            # TODO: implement partial position closes when live trading.
+            logger.info(
+                f"[EXIT] REDUCE_50 treated as SELL for pos={ea.position_id} "
+                f"(partial closes not yet implemented)"
+            )
+
+        pnl = round((exit_price - entry_price) * shares, 4)
+        exit_snap_id = get_latest_snapshot_id_for_contract(ea.contract_id)
+
+        update_position_outcome(
+            position_id    = ea.position_id,
+            exit_price     = exit_price,
+            exit_time      = now,
+            pnl            = pnl,
+            status         = "closed",
+            exit_reason    = f"{ea.classification}:{ea.reason}",
+            exit_snapshot_id = exit_snap_id,
+        )
+        executed += 1
+        logger.info(
+            f"[EXIT] pos={ea.position_id} {ea.city} {ea.date} {ea.side} "
+            f"| {ea.classification} | exit@{exit_price:.4f} pnl=${pnl:+.4f} "
+            f"| {ea.reason}"
+        )
+
+    if executed:
+        logger.info(f"[EXIT] {executed} position(s) exited this cycle")
+    return executed
 
 
 # ---------------------------------------------------------------------------
@@ -109,23 +189,83 @@ def trading_run():
     all_events, signals = run_edge_scan(bankroll=bankroll, events=events)
     logger.info(f"Analyzed {len(all_events)} events -> {len(signals)} raw signals")
 
-    # Sort by EV descending so that when MAX_BIN_BUYS blocks subsequent signals
-    # for the same event, the highest-EV signal is always the one that executes.
-    signals.sort(key=lambda s: float(s.get("ev") or 0), reverse=True)
+    # Two-pass signal processing:
+    #   Pass 1 — risk-check filter: remove signals that can never execute
+    #            (expiry, side, liquidity, drawdown, live-data, etc.)
+    #   Pass 2 — rank survivors by composite priority score, then execute
+    #            top-to-bottom until portfolio exposure caps bind.
+    #
+    # This ensures the ranking only scores tradeable opportunities, and
+    # capital-dependent checks (exposure caps) are evaluated in priority
+    # order so the best signals get funded first.
 
-    client   = get_clob_client()
-    executed = 0
+    from sizing import rank_signals
+
+    eligible = []
     skipped  = 0
-
     for signal in signals:
-        passed, failures = run_all_checks(signal, bankroll)
-
+        passed, failures = run_pre_checks(signal, bankroll)
         if not passed:
+            skipped += 1
             logger.info(
                 f"Signal skipped [{signal.get('city')} {signal.get('date')} "
                 f"{signal.get('question', '')[:30]}]: {'; '.join(failures)}"
             )
-            skipped += 1
+        else:
+            eligible.append(signal)
+
+    logger.info(f"Risk pre-filter: {len(eligible)} eligible, {skipped} skipped")
+
+    # Rank only the eligible signals
+    eligible = rank_signals(eligible, bankroll)
+
+    if eligible:
+        logger.info("--- SIGNAL PRIORITY RANKING ---")
+        for rank, s in enumerate(eligible, 1):
+            pc = s.get("priority_components", {})
+            logger.info(
+                f"[RANK] #{rank} {s.get('city')} {s.get('date')} "
+                f"[{s.get('question', '')[:25]}] {s.get('recommended_side')} "
+                f"| score={s.get('priority_score', 0):.4f} "
+                f"ev/$={pc.get('ev_per_dollar', 0):.3f} "
+                f"thesis={pc.get('thesis_margin', 0):.2f} "
+                f"conf={pc.get('confidence', 0):.2f} "
+                f"time={pc.get('time_efficiency', 0):.4f} "
+                f"hrs={pc.get('hours_to_resolve', 0):.0f} "
+                f"confirm={pc.get('confirmation', 0):.1f}"
+            )
+        logger.info("--- END RANKING ---")
+
+    client   = get_clob_client()
+    executed = 0
+    unfunded = 0
+
+    for signal in eligible:
+        # Only portfolio-level checks remain (exposure caps) — these are
+        # capital-dependent and must be evaluated in priority order.
+        passed, failures = run_portfolio_checks(signal, bankroll)
+
+        if not passed:
+            unfunded += 1
+            logger.info(
+                f"Signal unfunded [{signal.get('city')} {signal.get('date')} "
+                f"{signal.get('question', '')[:30]}]: {'; '.join(failures)}"
+            )
+            continue
+
+        # Skip if we already hold this exact contract (prevents bracket
+        # promotion from double-buying the same bin in the same cycle).
+        from db import get_open_positions
+        already_held = any(
+            p.get("contract_id") == signal.get("contract_id")
+            for p in get_open_positions()
+            if p.get("status") == "open"
+        )
+        if already_held:
+            logger.debug(
+                f"Skipping duplicate contract {signal.get('contract_id', '')[:12]} "
+                f"— already held"
+            )
             continue
 
         result = execute_signal(signal, client=client)
@@ -136,7 +276,8 @@ def trading_run():
                 f"Executed: {signal['recommended_side']} ${signal['kelly_size']:.2f} "
                 f"on {signal['contract_id'][:12]} "
                 f"[{signal.get('city')} {signal.get('question', '')[:20]}] "
-                f"| status={result['status']} pos_id={result.get('position_id')}"
+                f"| status={result['status']} pos_id={result.get('position_id')} "
+                f"priority=#{executed}"
             )
         else:
             logger.error(
@@ -144,8 +285,19 @@ def trading_run():
             )
 
     logger.info(
-        f"Trading run complete: {executed} executed, {skipped} skipped by risk rules"
+        f"Trading run complete: {executed} executed, {skipped} pre-filtered, "
+        f"{unfunded} unfunded (capital exhausted), "
+        f"{len(signals)} raw signals -> {len(eligible)} eligible"
     )
+
+    # --- Phase 3: Active position management (exit engine) ---
+    try:
+        exit_actions = evaluate_open_positions()
+        if exit_actions:
+            _execute_exit_actions(exit_actions, client)
+    except Exception as e:
+        logger.exception(f"Exit evaluation failed (non-fatal): {e}")
+
     logger.info("=== TRADING RUN END ===")
 
 
@@ -159,6 +311,43 @@ def main():
     logger.info(f"Database: {DB_PATH}")
 
     init_db()
+
+    # ----- Startup health check: validate ensemble API connectivity -----
+    # Both ECMWF and GFS must return ensemble member data.  If either fails,
+    # the bot cannot produce a valid blended distribution and should NOT
+    # trade.  This catches model-name changes, API outages, and auth issues
+    # before any capital is deployed.
+    from weather import _get_ecmwf_ensemble_distribution, _get_gfs_ensemble_distribution
+    from datetime import timedelta
+    _test_date = (datetime.now().date() + timedelta(days=1)).isoformat()
+    _test_lat, _test_lon = 41.85, -87.65   # Chicago
+    logger.info(f"Startup health check: testing ECMWF + GFS for Chicago {_test_date}...")
+    _ecmwf_test = _get_ecmwf_ensemble_distribution(_test_lat, _test_lon, _test_date)
+    _gfs_test   = _get_gfs_ensemble_distribution(_test_lat, _test_lon, _test_date)
+    _health_ok = True
+    if _ecmwf_test is None:
+        logger.error(
+            "STARTUP HEALTH CHECK FAILED: ECMWF ensemble returned no data. "
+            "The model name may have changed on the Open-Meteo Ensemble API. "
+            "Check weather.py OPENMETEO_ENSEMBLE params. "
+            "Bot will NOT trade until this is resolved."
+        )
+        _health_ok = False
+    else:
+        logger.info(f"  ECMWF OK: n={_ecmwf_test['n']} members, mu={_ecmwf_test['mu_c']:.2f}")
+    if _gfs_test is None:
+        logger.error(
+            "STARTUP HEALTH CHECK FAILED: GFS ensemble returned no data. "
+            "Check weather.py GFS model params. "
+            "Bot will NOT trade until this is resolved."
+        )
+        _health_ok = False
+    else:
+        logger.info(f"  GFS OK: n={_gfs_test['n']} members, mu={_gfs_test['mu_c']:.2f}")
+    if not _health_ok:
+        logger.error("Exiting due to failed ensemble health check.")
+        sys.exit(1)
+    logger.info("Ensemble health check passed — both ECMWF and GFS operational.")
 
     # Run all loops immediately on startup so the bot is fully current before
     # the scheduler takes over.  Monitor runs last so any positions from the
@@ -175,6 +364,24 @@ def main():
     events = discovery_run()
     _cached_events_ref = events  # seed the module-level cache
     globals()["_cached_events"] = events
+
+    # Phase 3: run forecast pull + live observations BEFORE the first trading
+    # cycle so the live adjustment layer has data (hourly forecast path +
+    # VC observations + observed_max_so_far) when computing probabilities.
+    # Without this, same-day trades would use the raw blended mu/sigma with
+    # no floor truncation and no sigma shrinkage.
+    try:
+        logger.info("Startup: running forecast pull before first trade cycle...")
+        forecast_pull_run(events=events)
+    except Exception as e:
+        logger.warning(f"Startup forecast pull failed (non-fatal): {e}")
+
+    try:
+        logger.info("Startup: running live observations before first trade cycle...")
+        live_observation_run(events=events)
+    except Exception as e:
+        logger.warning(f"Startup live observation run failed (non-fatal): {e}")
+
     trading_run()
     run_monitor_loop()
 

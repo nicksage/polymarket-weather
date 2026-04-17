@@ -37,6 +37,7 @@ from db import (
     update_position_fill,
     update_position_outcome,
     update_position_market_price,
+    update_position_excursions,
     cancel_position,
     backfill_gamma_market_ids,
     backfill_position_coords,
@@ -286,6 +287,7 @@ def _update_unrealized_pnl(data_api_index: dict) -> int:
         local_time     = _local_time_str(lat, lon)
 
         update_position_market_price(pos_id, current_price, unrealized_pnl, local_time)
+        update_position_excursions(pos_id, unrealized_pnl, unrealized_pnl)
         updated += 1
 
     return updated

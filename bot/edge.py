@@ -46,7 +46,7 @@ from db import (
     get_latest_observation,
     get_latest_vc_forecast_diagnostic,
 )
-from sizing import calculate_kelly_size
+from sizing import calculate_kelly_size, compute_confidence_multiplier, compute_time_scale
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +72,28 @@ def _lookup_event_timezone(event_id: str) -> str | None:
                 (event_id,),
             ).fetchone()
             return row[0] if row else None
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
+def _lookup_event_agreement(event_id: str) -> float | None:
+    """Return forecast_agreement_c from the most recent temp_events row."""
+    if not event_id:
+        return None
+    try:
+        import sqlite3
+        from config import DB_PATH
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            row = conn.execute(
+                "SELECT forecast_agreement_c FROM temp_events WHERE event_id = ? "
+                "AND forecast_agreement_c IS NOT NULL "
+                "ORDER BY scan_timestamp DESC LIMIT 1",
+                (event_id,),
+            ).fetchone()
+            return float(row[0]) if row else None
         finally:
             conn.close()
     except Exception:
@@ -294,6 +316,20 @@ def analyze_temp_event(event: dict, bankroll: float) -> dict | None:
     outcomes   = event.get("outcomes", [])
     n_outcomes = len(outcomes)
 
+    # Guard: if any single bin is trading at >=95%, the market has
+    # effectively resolved this event.  The forecast-based model cannot
+    # compete with actual observational data already priced in — every
+    # "edge" we see is the model disagreeing with reality, not the market
+    # being mispriced.  Skip the entire event.
+    for o in outcomes:
+        yp = o.get("yes_price", o.get("market_price", 0))
+        if yp is not None and float(yp) >= 0.95:
+            logger.info(
+                f"Skipping {city} {date_str}: bin {o.get('question', '')[:30]} "
+                f"trading at {float(yp)*100:.0f}% — market has effectively resolved"
+            )
+            return None
+
     # Step 1: compute raw model probabilities for each bin — two parallel
     # passes: blended (no floor, base model) and active (chosen by flag).
     raw_probs:         list[float | None] = []
@@ -427,9 +463,10 @@ def analyze_temp_event(event: dict, bankroll: float) -> dict | None:
         market_at_extreme = market_price <= 0.0 or market_price >= 1.0
         is_signal = abs_edge >= EDGE_THRESHOLD and side is not None and not market_at_extreme
 
-        # Kelly sizing — halved when normalization warning is active
+        # Kelly sizing with sign-aware confidence multiplier (Phase 3).
+        # Replaces the old binary norm_warning half-Kelly with a smooth
+        # multi-factor confidence score.
         if is_signal:
-            # Odds are safe to compute here because market_at_extreme is False
             if side == "YES":
                 odds = (1.0 - market_price) / market_price
             else:
@@ -439,9 +476,39 @@ def analyze_temp_event(event: dict, bankroll: float) -> dict | None:
                 odds     = odds,
                 bankroll = bankroll,
             )
-            kelly_size = round(kelly_raw * (0.5 if norm_warning else 1.0), 2)
+            conf_signal = {
+                "range_low": o.get("range_low"),
+                "range_high": o.get("range_high"),
+                "recommended_side": side,
+                "unit": o.get("unit", "celsius"),
+                "days_ahead": days_ahead,
+                "normalization_warning": norm_warning,
+            }
+            conf_state = {
+                "forecast_agreement_c": _lookup_event_agreement(event_id),
+                "adjusted_mu_c": adjusted_mu,
+                "forecast_mu_c": mu_c,
+                "live_adjustment_score": adj.get("live_adjustment_score"),
+            }
+            confidence = compute_confidence_multiplier(conf_signal, conf_state)
+            # Two-regime time scaling — observation-driven (same-day)
+            # gets full or boosted sizing mid-day; forecast-driven gets a
+            # gentle discount as expiry approaches.
+            local_hr = None
+            if tz_str:
+                try:
+                    from datetime import datetime as _dt, timezone as _tz
+                    from zoneinfo import ZoneInfo
+                    now_local = _dt.now(ZoneInfo(tz_str))
+                    local_hr = float(now_local.hour) + now_local.minute / 60.0
+                except Exception:
+                    pass
+            time_scale = compute_time_scale(days_ahead, local_hr)
+            kelly_size = round(kelly_raw * confidence * time_scale, 2)
         else:
             kelly_size = 0.0
+            confidence = 1.0
+            time_scale = 1.0
 
         enriched_outcomes.append({
             # Identity
@@ -468,6 +535,13 @@ def analyze_temp_event(event: dict, bankroll: float) -> dict | None:
             "recommended_side": side,
             "kelly_size":       kelly_size,
             "is_signal":        is_signal,
+            # Priority ranking inputs (flow through to signal dict)
+            "confidence_multiplier": confidence,
+            "time_scale":            time_scale,
+            "days_ahead":            days_ahead,
+            "live_adjustment_score": adj.get("live_adjustment_score"),
+            "adjusted_mu_c":         adjusted_mu,
+            "forecast_mu_c":         mu_c,
         })
 
     # Build event-level analysis dict
@@ -502,7 +576,7 @@ def analyze_temp_event(event: dict, bankroll: float) -> dict | None:
     _comp = adj.get("components", {})
     logger.info(
         f"LiveAdj: {city} {date_str} | blended_mu={mu_c:.2f} adj_mu={adjusted_mu:.2f} "
-        f"Δ={adj.get('mu_adjustment_c'):+.2f} score={adj.get('live_adjustment_score'):.3f} "
+        f"delta={adj.get('mu_adjustment_c'):+.2f} score={adj.get('live_adjustment_score'):.3f} "
         f"floor={adj.get('observed_max_so_far_c')} "
         f"reason={_comp.get('reason')} n_obs={_comp.get('n_obs_used')} "
         f"mode={'LIVE' if USE_LIVE_ADJUSTMENT else 'SHADOW'}"
@@ -628,6 +702,25 @@ def run_edge_scan(
             except Exception as e:
                 logger.debug(f"Legacy signal insert failed: {e}")
 
+    # ----- Ensemble health monitoring (ongoing) -----
+    # If a high fraction of events were skipped because one model was missing,
+    # log a prominent warning so the operator notices mid-session degradation.
+    total_attempted = len(all_events_analyzed) + skipped_no_dist
+    if total_attempted > 0 and skipped_no_dist > total_attempted * 0.50:
+        logger.error(
+            f"ENSEMBLE HEALTH WARNING: {skipped_no_dist}/{total_attempted} events "
+            f"({skipped_no_dist/total_attempted*100:.0f}%) had no usable distribution. "
+            f"A model source may be down or returning empty data. "
+            f"Check ECMWF/GFS connectivity and model names."
+        )
+
+    # ----- Phase 3: 2-bin bracket promotion -----
+    from config import BRACKET_ENABLED, BRACKET_MAX_BINS, BRACKET_MIN_ADJACENT_EDGE
+    if BRACKET_ENABLED:
+        signals = _promote_bracket_bins(signals, all_events_analyzed, bankroll,
+                                        BRACKET_MIN_ADJACENT_EDGE, BRACKET_MAX_BINS,
+                                        scan_ts)
+
     logger.info(
         f"Edge scan complete: {len(all_events_analyzed)} events analyzed | "
         f"{len(signals)} signals | "
@@ -635,3 +728,102 @@ def run_edge_scan(
     )
 
     return all_events_analyzed, signals
+
+
+def _promote_bracket_bins(
+    signals: list[dict],
+    all_events: list[dict],
+    bankroll: float,
+    min_edge: float,
+    max_bins: int,
+    scan_ts: str,
+) -> list[dict]:
+    """Identify adjacent bins that qualify for bracket promotion and add them
+    as signals.  Bins must be contiguous to an existing signal bin (by
+    range_low/range_high adjacency) and have edge >= min_edge."""
+    from collections import defaultdict
+
+    # Group existing signals by event_id
+    signal_events: dict[str, set[str]] = defaultdict(set)
+    for s in signals:
+        signal_events[s.get("event_id", "")].add(s.get("contract_id", ""))
+
+    promoted = 0
+    new_signals: list[dict] = list(signals)
+
+    for analysis in all_events:
+        eid = analysis.get("event_id", "")
+        sig_cids = signal_events.get(eid, set())
+        if not sig_cids:
+            continue
+
+        # Count existing signal bins for this event — respect max_bins
+        n_existing = len(sig_cids)
+        if n_existing >= max_bins:
+            continue
+
+        outcomes = analysis.get("outcomes", [])
+        # Build ordered list with edge info
+        bins = []
+        for o in outcomes:
+            if o.get("range_low") is None or o.get("range_high") is None:
+                continue
+            bins.append(o)
+        # Sort by range_low
+        bins.sort(key=lambda o: (o.get("range_low") or 0))
+
+        # Find bins adjacent to signal bins that qualify
+        for i, b in enumerate(bins):
+            if b.get("contract_id") in sig_cids:
+                # Check neighbors
+                for neighbor_idx in (i - 1, i + 1):
+                    if neighbor_idx < 0 or neighbor_idx >= len(bins):
+                        continue
+                    nb = bins[neighbor_idx]
+                    if nb.get("contract_id") in sig_cids:
+                        continue
+                    nb_cid = nb.get("contract_id")
+                    if not nb_cid or nb_cid in sig_cids:
+                        continue
+                    nb_edge = nb.get("edge")
+                    if nb_edge is None:
+                        continue
+                    nb_side = nb.get("recommended_side")
+                    if nb_side is None:
+                        continue
+                    if abs(nb_edge) < min_edge:
+                        continue
+                    if n_existing >= max_bins:
+                        break
+
+                    # Promote: create signal dict with reduced sizing
+                    bracket_signal = {
+                        **nb,
+                        "city":        analysis.get("city"),
+                        "date":        analysis.get("date"),
+                        "lat":         analysis.get("lat"),
+                        "lon":         analysis.get("lon"),
+                        "event_id":    eid,
+                        "event_title": analysis.get("event_title"),
+                        "scan_timestamp": scan_ts,
+                        "contract_id":      nb.get("contract_id"),
+                        "recommended_side": nb_side,
+                        "kelly_size":       round(nb.get("kelly_size", 0) * 0.75, 2),
+                        "market_p":         nb.get("market_price"),
+                        "model_p":          nb.get("model_prob"),
+                        "is_bracket":       True,
+                        "metadata": {
+                            "date":     analysis.get("date"),
+                            "lat":      analysis.get("lat"),
+                            "lon":      analysis.get("lon"),
+                            "variable": "temp_high",
+                        },
+                    }
+                    new_signals.append(bracket_signal)
+                    sig_cids.add(nb.get("contract_id"))
+                    n_existing += 1
+                    promoted += 1
+
+    if promoted:
+        logger.info(f"Bracket promotion: {promoted} adjacent bins promoted to signals")
+    return new_signals

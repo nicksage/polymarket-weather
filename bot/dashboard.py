@@ -77,6 +77,7 @@ def load_outcomes(signals_only: bool = False) -> pd.DataFrame:
                 e.city,
                 e.date,
                 e.event_title,
+                e.event_id,
                 e.forecast_mu_c,
                 e.forecast_sigma_c,
                 e.clim_mu_c,
@@ -231,15 +232,41 @@ def _show_event_modal(city: str, date_str: str, rows: list[dict]) -> None:
         sigma_c  = r0.get("forecast_sigma_c")
         clim_mu  = r0.get("clim_mu_c")
 
-        mc1, mc2, mc3 = st.columns(3)
+        # Fetch individual ECMWF / GFS predictions from forecast_runs
+        _ecmwf_mu = None
+        _gfs_mu = None
+        try:
+            _event_id = r0.get("event_id") if "event_id" in r0 else None
+            if _event_id:
+                from db import get_latest_forecast_run
+                _ecmwf_run = get_latest_forecast_run(_event_id, "ecmwf")
+                _gfs_run = get_latest_forecast_run(_event_id, "gfs")
+                if _ecmwf_run and _ecmwf_run.get("forecast_mu_c") is not None:
+                    _ecmwf_mu = float(_ecmwf_run["forecast_mu_c"])
+                    if ev_unit == "fahrenheit":
+                        _ecmwf_mu = _ecmwf_mu * 9 / 5 + 32
+                if _gfs_run and _gfs_run.get("forecast_mu_c") is not None:
+                    _gfs_mu = float(_gfs_run["forecast_mu_c"])
+                    if ev_unit == "fahrenheit":
+                        _gfs_mu = _gfs_mu * 9 / 5 + 32
+        except Exception:
+            pass
+
+        mc1, mc2, mc3, mc4, mc5 = st.columns(5)
         with mc1:
-            if not _is_missing(mu_disp):
-                st.metric("Forecast Avg", f"{float(mu_disp):.1f}{sym}")
+            if _ecmwf_mu is not None:
+                st.metric("ECMWF", f"{_ecmwf_mu:.1f}{sym}")
         with mc2:
+            if _gfs_mu is not None:
+                st.metric("GFS", f"{_gfs_mu:.1f}{sym}")
+        with mc3:
+            if not _is_missing(mu_disp):
+                st.metric("Blended Avg", f"{float(mu_disp):.1f}{sym}")
+        with mc4:
             if not _is_missing(sigma_c):
                 sd = float(sigma_c) if ev_unit == "celsius" else float(sigma_c) * 9 / 5
-                st.metric("Uncertainty (σ)", f"{sd:.1f}{sym}")
-        with mc3:
+                st.metric("Uncertainty", f"{sd:.1f}{sym}")
+        with mc5:
             if not _is_missing(clim_mu):
                 cd = float(clim_mu) if ev_unit == "celsius" else float(clim_mu) * 9 / 5 + 32
                 st.metric("Historical Avg", f"{cd:.1f}{sym}")
@@ -491,7 +518,7 @@ def _do_light_refresh():
 # ===========================================================================
 # Main tabs
 # ===========================================================================
-_tab_contract, _tab_paper, _tab_live = st.tabs(["Contract Data", "Paper Trade Data", "Live Trade Data"])
+_tab_contract, _tab_paper, _tab_live, _tab_accuracy = st.tabs(["Contract Data", "Paper Trade Data", "Live Trade Data", "Forecast Accuracy"])
 
 # ===========================================================================
 # TAB 1 — Contract Data
@@ -767,10 +794,29 @@ with _tab_contract:
 
                         with col_stats:
                             st.markdown("**Forecast**")
+                            # Individual model predictions
+                            try:
+                                _eid = grp["event_id"].iloc[0] if "event_id" in grp.columns else None
+                                if _eid:
+                                    from db import get_latest_forecast_run
+                                    _er = get_latest_forecast_run(_eid, "ecmwf")
+                                    _gr = get_latest_forecast_run(_eid, "gfs")
+                                    if _er and _er.get("forecast_mu_c") is not None:
+                                        _em = float(_er["forecast_mu_c"])
+                                        if ev_unit == "fahrenheit":
+                                            _em = _em * 9 / 5 + 32
+                                        st.markdown(f"**ECMWF:** {_em:.1f}{sym}")
+                                    if _gr and _gr.get("forecast_mu_c") is not None:
+                                        _gm = float(_gr["forecast_mu_c"])
+                                        if ev_unit == "fahrenheit":
+                                            _gm = _gm * 9 / 5 + 32
+                                        st.markdown(f"**GFS:** {_gm:.1f}{sym}")
+                            except Exception:
+                                pass
                             if not _is_missing(mu_disp):
                                 st.markdown(
-                                    f"**Forecast Avg:** {_fmt_temp(mu_disp, ev_unit)}",
-                                    help="Model's predicted mean max temperature (ECMWF + GFS blend)."
+                                    f"**Blended Avg:** {_fmt_temp(mu_disp, ev_unit)}",
+                                    help="Weighted blend of ECMWF (65%) + GFS (35%) + bias correction."
                                 )
                             if not _is_missing(sigma_c):
                                 sd  = float(sigma_c) if ev_unit == "celsius" else float(sigma_c) * 9 / 5
@@ -1369,3 +1415,159 @@ with _tab_live:
     st.divider()
     if st.button("🔄 Refresh Data", key="refresh_live"):
         _do_refresh("refresh_live")
+
+# ===========================================================================
+# TAB 4 — Forecast Accuracy
+# ===========================================================================
+with _tab_accuracy:
+
+    _show_refresh_messages()
+
+    st.subheader("Forecast vs Actual High Temperature")
+    st.caption(
+        "Compares the model's blended forecast (ECMWF + GFS) against the "
+        "actual observed daily high from Visual Crossing station data.  "
+        "Only shows dates where both a forecast and an observation exist."
+    )
+
+    @st.cache_data(ttl=300)
+    def _load_accuracy_data():
+        """Load forecast predictions paired with actual observations."""
+        conn = sqlite3.connect(DB_PATH)
+        # Use historical_forecasts_previous_runs (model predictions at lead=3)
+        # paired with historical_observed_daily (actual tmax).
+        # Also include temp_events forecast_mu for recent dates.
+        df = pd.read_sql("""
+            SELECT
+                h.city,
+                h.date,
+                h.tempmax_c AS actual_c,
+                -- ECMWF prediction
+                (SELECT f.forecast_tempmax_c
+                 FROM historical_forecasts_previous_runs f
+                 WHERE f.city = h.city AND f.date = h.date
+                   AND f.model = 'ecmwf_ifs025'
+                 ORDER BY f.lead_days ASC LIMIT 1) AS ecmwf_c,
+                -- GFS prediction
+                (SELECT f.forecast_tempmax_c
+                 FROM historical_forecasts_previous_runs f
+                 WHERE f.city = h.city AND f.date = h.date
+                   AND f.model = 'gfs_global'
+                 ORDER BY f.lead_days ASC LIMIT 1) AS gfs_c
+            FROM historical_observed_daily h
+            WHERE h.tempmax_c IS NOT NULL
+              AND h.date >= DATE('now', '-30 days')
+            ORDER BY h.city, h.date
+        """, conn)
+        if df.empty:
+            return df
+        # Compute blended (65/35)
+        mask = df["ecmwf_c"].notna() & df["gfs_c"].notna()
+        df.loc[mask, "blended_c"] = df.loc[mask, "ecmwf_c"] * 0.65 + df.loc[mask, "gfs_c"] * 0.35
+        df.loc[~mask & df["ecmwf_c"].notna(), "blended_c"] = df.loc[~mask & df["ecmwf_c"].notna(), "ecmwf_c"]
+        df.loc[~mask & df["gfs_c"].notna(), "blended_c"] = df.loc[~mask & df["gfs_c"].notna(), "gfs_c"]
+        df["error_c"] = df["actual_c"] - df["blended_c"]
+        return df
+
+    accuracy_df = _load_accuracy_data()
+
+    if accuracy_df.empty:
+        st.info("No forecast vs actual data available yet.")
+    else:
+        # City selector
+        all_cities = sorted(accuracy_df["city"].dropna().unique().tolist())
+        sel_city = st.selectbox("Select City", all_cities, key="accuracy_city")
+
+        city_df = accuracy_df[accuracy_df["city"] == sel_city].copy()
+        city_df = city_df.dropna(subset=["actual_c", "blended_c"])
+        city_df["date"] = pd.to_datetime(city_df["date"])
+        city_df = city_df.sort_values("date")
+
+        if city_df.empty:
+            st.warning(f"No paired forecast+actual data for {sel_city}")
+        else:
+            import plotly.graph_objects as go
+
+            fig = go.Figure()
+
+            # Actual observed
+            fig.add_trace(go.Scatter(
+                x=city_df["date"], y=city_df["actual_c"],
+                mode="lines+markers", name="Actual High",
+                line=dict(color="#2ecc71", width=3),
+                marker=dict(size=6),
+            ))
+
+            # Blended forecast
+            fig.add_trace(go.Scatter(
+                x=city_df["date"], y=city_df["blended_c"],
+                mode="lines+markers", name="Blended Forecast",
+                line=dict(color="#3498db", width=2, dash="dash"),
+                marker=dict(size=5),
+            ))
+
+            # ECMWF
+            if city_df["ecmwf_c"].notna().any():
+                fig.add_trace(go.Scatter(
+                    x=city_df["date"], y=city_df["ecmwf_c"],
+                    mode="lines", name="ECMWF",
+                    line=dict(color="#e74c3c", width=1, dash="dot"),
+                    opacity=0.6,
+                ))
+
+            # GFS
+            if city_df["gfs_c"].notna().any():
+                fig.add_trace(go.Scatter(
+                    x=city_df["date"], y=city_df["gfs_c"],
+                    mode="lines", name="GFS",
+                    line=dict(color="#f39c12", width=1, dash="dot"),
+                    opacity=0.6,
+                ))
+
+            fig.update_layout(
+                title=f"{sel_city} - Forecast vs Actual Daily High",
+                xaxis_title="Date",
+                yaxis_title="Temperature (C)",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                height=450,
+                margin=dict(t=60, b=40),
+                hovermode="x unified",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Summary stats
+            sc1, sc2, sc3, sc4 = st.columns(4)
+            mae = city_df["error_c"].abs().mean()
+            rmse = (city_df["error_c"] ** 2).mean() ** 0.5
+            bias = city_df["error_c"].mean()
+            n_days = len(city_df)
+            with sc1:
+                st.metric("MAE", f"{mae:.2f}C")
+            with sc2:
+                st.metric("RMSE", f"{rmse:.2f}C")
+            with sc3:
+                st.metric("Bias", f"{bias:+.2f}C",
+                          help="Positive = model too cold, Negative = model too warm")
+            with sc4:
+                st.metric("Days", str(n_days))
+
+            # Error distribution
+            st.divider()
+            st.markdown("**Daily Forecast Error (Actual - Blended)**")
+            fig2 = go.Figure()
+            fig2.add_trace(go.Bar(
+                x=city_df["date"], y=city_df["error_c"],
+                marker_color=["#2ecc71" if e >= 0 else "#e74c3c" for e in city_df["error_c"]],
+            ))
+            fig2.update_layout(
+                xaxis_title="Date",
+                yaxis_title="Error (C)",
+                height=250,
+                margin=dict(t=20, b=40),
+            )
+            fig2.add_hline(y=0, line_dash="solid", line_color="gray", opacity=0.5)
+            st.plotly_chart(fig2, use_container_width=True)
+
+    st.divider()
+    if st.button("Refresh Data", key="refresh_accuracy"):
+        _do_refresh("refresh_accuracy")

@@ -29,7 +29,13 @@ EDGE_THRESHOLD: float = _float("EDGE_THRESHOLD", 0.07)
 
 # Risk Limits
 MAX_POSITION_PCT: float = _float("MAX_POSITION_PCT", 0.02)
-MAX_TOTAL_EXPOSURE_PCT: float = _float("MAX_TOTAL_EXPOSURE_PCT", 0.20)
+MAX_TOTAL_EXPOSURE_PCT: float = _float("MAX_TOTAL_EXPOSURE_PCT", 0.15)
+
+# Event-level and city-day concentration caps (Phase 3).
+# MAX_EVENT_EXPOSURE_PCT caps total capital across all bins in one event.
+# MAX_CITY_DAY_EXPOSURE caps total capital across all events for one (city, date).
+MAX_EVENT_EXPOSURE_PCT: float = _float("MAX_EVENT_EXPOSURE_PCT", 0.03)
+MAX_CITY_DAY_EXPOSURE: float = _float("MAX_CITY_DAY_EXPOSURE", 0.05)
 MIN_LIQUIDITY_USD: float = _float("MIN_LIQUIDITY_USD", 500.0)
 MIN_HOURS_TO_EXPIRY: float = _float("MIN_HOURS_TO_EXPIRY", 6.0)
 MAX_DAILY_DRAWDOWN_PCT: float = _float("MAX_DAILY_DRAWDOWN_PCT", 0.10)
@@ -235,6 +241,47 @@ VC_DIAG_RMSE_WINDOW_HOURS: int = int(os.getenv("VC_DIAG_RMSE_WINDOW_HOURS", "6")
 # "bins apart" metric.  Most Polymarket bins are 1°F = ~0.556°C; set via env
 # if the market bin size changes.
 VC_DIAG_BIN_WIDTH_C: float = _float("VC_DIAG_BIN_WIDTH_C", 0.556)
+
+
+# ---------------------------------------------------------------------------
+# Exit engine (Phase 3)
+# Active position management: classify open positions as INVALIDATED /
+# DYING / WEAKENED / THRIVING / HEALTHY and execute accordingly.
+# ---------------------------------------------------------------------------
+
+EXIT_EVAL_ENABLED: bool = _bool("EXIT_EVAL_ENABLED", True)
+
+# INVALIDATED — observed max exceeds bin's upper bound + buffer
+EXIT_DEAD_BUFFER_C: float = _float("EXIT_DEAD_BUFFER_C", 0.5)
+
+# DYING — current model_prob collapsed vs entry
+EXIT_DYING_PROB_THRESHOLD: float = _float("EXIT_DYING_PROB_THRESHOLD", 0.05)
+EXIT_DYING_ENTRY_MIN: float = _float("EXIT_DYING_ENTRY_MIN", 0.15)
+
+# WEAKENED — cumulative μ shift since entry exceeds N × entry_sigma
+EXIT_WEAKENED_SIGMA_SHIFT: float = _float("EXIT_WEAKENED_SIGMA_SHIFT", 1.0)
+EXIT_EDGE_REVERSED_ENABLED: bool = _bool("EXIT_EDGE_REVERSED_ENABLED", True)
+
+# THRIVING — EV-based hold vs sell comparison
+EXIT_EV_CAPTURE_RATIO: float = _float("EXIT_EV_CAPTURE_RATIO", 0.95)
+
+# Hard stop-loss (circuit breaker, configurable)
+EXIT_HARD_STOP_ENABLED: bool = _bool("EXIT_HARD_STOP_ENABLED", True)
+EXIT_HARD_STOP_PCT: float = _float("EXIT_HARD_STOP_PCT", -0.70)
+
+# ---------------------------------------------------------------------------
+# Confidence-weighted Kelly (Phase 3)
+# ---------------------------------------------------------------------------
+
+CONFIDENCE_AGREEMENT_THRESHOLD: float = _float("CONFIDENCE_AGREEMENT_THRESHOLD", 2.0)
+
+# ---------------------------------------------------------------------------
+# Bracket entry (Phase 3)
+# ---------------------------------------------------------------------------
+
+BRACKET_ENABLED: bool = _bool("BRACKET_ENABLED", True)
+BRACKET_MAX_BINS: int = int(os.getenv("BRACKET_MAX_BINS", "2"))
+BRACKET_MIN_ADJACENT_EDGE: float = _float("BRACKET_MIN_ADJACENT_EDGE", 0.04)
 
 
 # Tail-probability flattening — applied AFTER per-event bin normalization:

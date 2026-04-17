@@ -1,0 +1,45 @@
+Bot schedule — every loop and when it fires
+Discovery loop
+When: Every 4 hours at :00 UTC (00:00, 04:00, 08:00, 12:00, 16:00, 20:00)
+What it does: Queries the Polymarket Gamma API for all active highest-temperature events. Parses city, date, lat/lon, bin structure, and market prices. Results are cached in memory (_cached_events) and reused by every other loop until the next discovery run. This is how the bot knows what markets exist and what bins are available to trade.
+
+Forecast pull loop
+When: Every 2 hours at :05 UTC (00:05, 02:05, 04:05, ... 22:05)
+What it does: For each active event within the forecast horizon, fetches fresh ECMWF and GFS ensemble distributions from Open-Meteo. Writes one forecast_runs row per source per event (capturing the raw μ/σ at this pull time) and up to 72 forecast_hourly rows with the hourly temperature/humidity/cloud/wind/precip path. Computes forecast deltas vs the prior pull and updates temp_events current-state columns (forecast_delta_mu_c, forecast_agreement_c, latest_forecast_ts). This is what keeps the model's forecast fresh between trading cycles.
+
+VC future-day diagnostic loop
+When: Every 2 hours at :07 UTC (00:07, 02:07, ... 22:07)
+What it does: For each active event that is 1 day out (D+1), calls Visual Crossing to get VC's projected daily high and hourly forecast path. Computes disagreement metrics (VC vs our blended μ, in °C and bins-apart) and warning flags. Writes one vc_forecast_diagnostics row per event tagged kind='future_day'. Runs 2 minutes after the forecast pull so disagreement metrics use fresh blended μ context. Shadow-only — does not influence trades.
+
+Trading loop
+When: Every hour at :10 UTC
+What it does: The main decision cycle. Runs the full edge scan: for each discovered event, computes the blended temperature distribution, applies the live adjustment (μ residual + σ shrinkage + observed-max floor), calculates model probabilities per bin, compares to market prices, flags signals where edge ≥ 7%. New signals go through confidence-weighted Kelly sizing (with sign-aware forecast agreement and live adjustment factors) and two-regime time scaling. Bracket promotion checks whether adjacent bins qualify as a 2-bin bracket. All signals then pass through 13 risk checks (including the new event-level and city-day exposure caps). Surviving signals are executed (paper-logged or CLOB order placed). Decision snapshots are written for every bin evaluated. After entries, the exit engine runs: evaluates all open positions, classifies each as INVALIDATED/DYING/WEAKENED/THRIVING/HEALTHY, and executes sells for positions that should be closed.
+
+Live observation loop
+When: Every 20 minutes at :00, :20, :40 UTC
+What it does: For each active event, calls Visual Crossing fetch_intraday() to get the current temperature, humidity, cloud cover, wind, precip, conditions, and the observed hourly path for today. Writes one live_observations row per event. Also writes one vc_forecast_diagnostics row tagged kind='same_day' with VC's projected daily high and disagreement metrics. Updates temp_events current-state columns: current_temp_c, observed_max_so_far_c, expected_temp_now_c, actual_minus_expected_c, timezone, latest_observation_ts. This is the 20-minute heartbeat that feeds the live adjustment layer and the exit engine's INVALIDATED classification.
+
+Monitor loop
+When: Every hour at :30 UTC
+What it does: Three responsibilities. First, cancels any pending unfilled CLOB orders (orders that were placed at :10 but haven't filled in ~20 minutes). Second, checks every open position against the Gamma API to detect resolved markets — when a market closes and a winner is determined, computes realized P&L and marks the position closed. Third, updates unrealized P&L and current market price for all still-open positions, and tracks max favorable/adverse excursion (MFE/MAE) for later exit-quality analysis.
+
+Retention loop
+When: Daily at 04:30 UTC
+What it does: Purges forecast_hourly, live_observations, and vc_forecast_diagnostics rows older than 90 days. Summary tables (forecast_runs, decision_snapshots, positions, temp_events, temp_outcomes) are kept indefinitely. Runs before the bias update so the DB is clean before heavy writes.
+
+Bias update loop
+When: Daily at 05:00 UTC
+What it does: Fetches the last 14 days of Visual Crossing station observations and Open-Meteo Previous Runs ECMWF/GFS forecasts for every active city. Rebuilds forecast_errors (the per-model, per-city bias correction table) by comparing what each model forecasted against what actually happened. This is what feeds the bias correction applied to the ECMWF and GFS forecasts in the probability model.
+
+Startup sequence (on boot, before scheduler takes over)
+What runs: Bias update → Discovery → Trading → Monitor, in that order. Ensures the bot is fully current before the scheduler's first tick. The forecast pull and live observation loops do NOT run on startup — they wait for their first scheduled cron tick (:05 and :00/:20/:40 respectively).
+
+Visual timeline of a typical hour
+
+:00  Live observation (20-min)  +  Discovery (if 4h boundary)
+:05  Forecast pull (if 2h boundary)
+:07  VC future-day diagnostic (if 2h boundary)
+:10  Trading scan + exit engine
+:20  Live observation (20-min)
+:30  Monitor (cancel/resolve/P&L)
+:40  Live observation (20-min)

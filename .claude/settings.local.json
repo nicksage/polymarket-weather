@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import edge, sizing; print\\('steps 6+7 OK'\\)\")"
+    ]
+  }
+}

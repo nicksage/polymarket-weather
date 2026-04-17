@@ -158,7 +158,7 @@ def _get_ecmwf_ensemble_distribution(
                 "daily":      "temperature_2m_max",
                 "start_date": date_str,
                 "end_date":   date_str,
-                "models":     "ecmwf_ifs04",
+                "models":     "ecmwf_ifs025",
             },
             timeout=15,
         )
@@ -760,12 +760,34 @@ def get_temp_distribution_for_event(
         _dist_cache[cache_key] = None
         return None
 
-    # Ensemble sources
+    # Ensemble sources — BOTH are required for a tradeable distribution.
+    # Single-model forecasts are unreliable (no cross-model validation,
+    # no blend diversification) and should not drive trade decisions.
     ecmwf = _get_ecmwf_ensemble_distribution(lat, lon, date_str)
     gfs   = _get_gfs_ensemble_distribution(lat, lon, date_str)
 
     if ecmwf is None and gfs is None:
         logger.warning(f"No ensemble data for ({lat:.2f},{lon:.2f}) {date_str}")
+        _dist_cache[cache_key] = None
+        return None
+
+    if ecmwf is None:
+        logger.error(
+            f"ECMWF MISSING for ({lat:.2f},{lon:.2f}) {date_str} — "
+            f"skipping event. GFS alone is not sufficient for trading. "
+            f"Check if the ECMWF model name has changed on the Open-Meteo "
+            f"Ensemble API (current: ecmwf_ifs025)."
+        )
+        _dist_cache[cache_key] = None
+        return None
+
+    if gfs is None:
+        logger.error(
+            f"GFS MISSING for ({lat:.2f},{lon:.2f}) {date_str} — "
+            f"skipping event. ECMWF alone is not sufficient for trading. "
+            f"Check if the GFS model name has changed on the Open-Meteo "
+            f"Ensemble API (current: gfs025)."
+        )
         _dist_cache[cache_key] = None
         return None
 

@@ -11,6 +11,8 @@ except Exception:
 from config import (
     MAX_POSITION_PCT,
     MAX_TOTAL_EXPOSURE_PCT,
+    MAX_EVENT_EXPOSURE_PCT,
+    MAX_CITY_DAY_EXPOSURE,
     MIN_LIQUIDITY_USD,
     MIN_HOURS_TO_EXPIRY,
     MAX_DAILY_DRAWDOWN_PCT,
@@ -23,7 +25,10 @@ from config import (
     MAX_TRADE_DAYS,
     PAPER_TRADE,
 )
-from db import get_open_positions, get_daily_pnl, count_open_bins_for_event
+from db import (
+    get_open_positions, get_daily_pnl, count_open_bins_for_event,
+    get_latest_observation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +79,58 @@ def check_total_exposure(new_position_size: float, bankroll: float) -> RiskCheck
             f"Total {mode} exposure ${new_total:,.2f} would exceed "
             f"{MAX_TOTAL_EXPOSURE_PCT*100:.0f}% cap (${cap:,.2f}); "
             f"current={current_exposure:,.2f} over {len(relevant)} position(s)"
+        )
+    return RiskCheck(True)
+
+
+def check_event_exposure(
+    event_id: str, new_position_size: float, bankroll: float,
+) -> RiskCheck:
+    """Total capital across all bins in one event must not exceed
+    MAX_EVENT_EXPOSURE_PCT of bankroll."""
+    if MAX_EVENT_EXPOSURE_PCT >= 1.0:
+        return RiskCheck(True)
+    open_positions = get_open_positions()
+    is_paper_int = 1 if PAPER_TRADE else 0
+    current = sum(
+        p.get("size_usdc", 0) for p in open_positions
+        if p.get("event_id") == event_id
+        and p.get("is_paper", 1) == is_paper_int
+        and p.get("fill_status") != "cancelled"
+    )
+    new_total = current + new_position_size
+    cap = MAX_EVENT_EXPOSURE_PCT * bankroll
+    if new_total > cap:
+        return RiskCheck(
+            False,
+            f"Event exposure ${new_total:,.2f} would exceed "
+            f"{MAX_EVENT_EXPOSURE_PCT*100:.0f}% cap (${cap:,.2f}) for {event_id[:16]}"
+        )
+    return RiskCheck(True)
+
+
+def check_city_day_exposure(
+    city: str, date_str: str, new_position_size: float, bankroll: float,
+) -> RiskCheck:
+    """Total capital across all events for one (city, date) must not exceed
+    MAX_CITY_DAY_EXPOSURE of bankroll."""
+    if MAX_CITY_DAY_EXPOSURE >= 1.0:
+        return RiskCheck(True)
+    open_positions = get_open_positions()
+    is_paper_int = 1 if PAPER_TRADE else 0
+    current = sum(
+        p.get("size_usdc", 0) for p in open_positions
+        if p.get("city") == city and p.get("date") == date_str
+        and p.get("is_paper", 1) == is_paper_int
+        and p.get("fill_status") != "cancelled"
+    )
+    new_total = current + new_position_size
+    cap = MAX_CITY_DAY_EXPOSURE * bankroll
+    if new_total > cap:
+        return RiskCheck(
+            False,
+            f"City-day exposure ${new_total:,.2f} would exceed "
+            f"{MAX_CITY_DAY_EXPOSURE*100:.0f}% cap (${cap:,.2f}) for {city} {date_str}"
         )
     return RiskCheck(True)
 
@@ -180,6 +237,35 @@ def check_allowed_side(side: str) -> RiskCheck:
     return RiskCheck(True)
 
 
+def check_event_side_consistency(
+    event_id: str, city: str, date_str: str, side: str,
+) -> RiskCheck:
+    """All positions within a single event must be on the same side.
+    If we already hold YES positions for this event, block NO entries
+    (and vice versa).  Prevents contradictory positions within the
+    same city+date event."""
+    open_positions = get_open_positions()
+    is_paper_int = 1 if PAPER_TRADE else 0
+    existing = [
+        p for p in open_positions
+        if (p.get("event_id") == event_id or
+            (p.get("city") == city and p.get("date") == date_str))
+        and p.get("is_paper", 1) == is_paper_int
+        and p.get("fill_status") != "cancelled"
+    ]
+    if not existing:
+        return RiskCheck(True)
+
+    existing_side = existing[0].get("side")
+    if existing_side and existing_side != side:
+        return RiskCheck(
+            False,
+            f"Side conflict: already hold {existing_side} for {city} {date_str} "
+            f"— cannot enter {side} on same event"
+        )
+    return RiskCheck(True)
+
+
 def check_bin_limit(city: str, date: str) -> RiskCheck:
     """
     Block trade if the bot already holds MAX_BIN_BUYS open positions
@@ -233,6 +319,26 @@ def check_trade_days(resolution_date_str: str) -> RiskCheck:
         return RiskCheck(False, "Could not parse resolution date for trade-day check")
 
 
+def check_same_day_live_data(
+    event_id: str, days_ahead: int | None,
+) -> RiskCheck:
+    """Block same-day trades when the live adjustment layer has no
+    observation data yet.  Without observations, the observed-max floor
+    and sigma shrinkage are inactive, meaning the model trades on a
+    less-informed probability distribution.  Future-day trades (D+1+)
+    are unaffected — the live layer contributes little for those anyway."""
+    if days_ahead is None or days_ahead >= 1:
+        return RiskCheck(True)
+    latest_obs = get_latest_observation(event_id or "")
+    if latest_obs is None:
+        return RiskCheck(
+            False,
+            f"Same-day trade blocked: no live observations for {event_id[:16]} — "
+            f"live adjustment layer has no data yet"
+        )
+    return RiskCheck(True)
+
+
 def check_daily_drawdown(bankroll: float) -> RiskCheck:
     """
     Halt trading if today's realized P&L loss exceeds MAX_DAILY_DRAWDOWN_PCT
@@ -249,32 +355,32 @@ def check_daily_drawdown(bankroll: float) -> RiskCheck:
     return RiskCheck(True)
 
 
-def run_all_checks(signal: dict, bankroll: float) -> tuple[bool, list[str]]:
+def run_pre_checks(signal: dict, bankroll: float) -> tuple[bool, list[str]]:
     """
-    Run all risk checks for a trade signal (individual temperature-range outcome).
+    Signal-level risk checks that are INDEPENDENT of portfolio state.
+    These filter out signals that can never execute regardless of capital
+    availability: wrong side, expired, illiquid, no live data, etc.
 
-    Returns (all_passed, list_of_failure_reasons).
+    Run BEFORE ranking so only tradeable signals get scored.
     """
     failures: list[str] = []
 
     checks = [
         check_allowed_side(signal.get("recommended_side", "")),
-        check_bin_limit(signal.get("city", ""), signal.get("date", "")),
+        check_event_side_consistency(
+            signal.get("event_id", ""), signal.get("city", ""),
+            signal.get("date", ""), signal.get("recommended_side", "")),
         check_position_size(signal.get("kelly_size", 0), bankroll),
-        check_total_exposure(signal.get("kelly_size", 0), bankroll),
         check_liquidity(signal.get("liquidity_usd", 0)),
         check_daily_drawdown(bankroll),
         check_normalization_warning(signal),
         check_us_only(signal.get("lat"), signal.get("lon")),
     ]
 
-    # Forecast quality check — sigma is carried in the signal via event context
-    # (edge.py attaches forecast_sigma_c if available via the event dict)
     sigma_c = signal.get("forecast_sigma_c")
     if sigma_c is not None:
         checks.append(check_forecast_sigma(sigma_c))
 
-    # Time-to-expiry check — resolution is end-of-day in the city's local timezone
     resolution_date = signal.get("metadata", {}).get("date") or signal.get("date", "")
     if resolution_date:
         checks.append(check_trade_days(resolution_date))
@@ -284,13 +390,61 @@ def run_all_checks(signal: dict, bankroll: float) -> tuple[bool, list[str]]:
             lon=signal.get("lon"),
         ))
 
+    days_ahead = signal.get("days_ahead")
+    if days_ahead is None and resolution_date:
+        try:
+            from datetime import date as _d
+            days_ahead = (_d.fromisoformat(resolution_date[:10]) - _d.today()).days
+        except Exception:
+            pass
+    checks.append(check_same_day_live_data(
+        signal.get("event_id", ""), days_ahead,
+    ))
+
     for check in checks:
         if not check:
             failures.append(check.reason)
-            logger.info(
-                f"Risk FAIL [{signal.get('city', '')} {signal.get('date', '')} "
-                f"{signal.get('question', '')[:30]}]: {check.reason}"
-            )
 
-    all_passed = len(failures) == 0
-    return all_passed, failures
+    return (len(failures) == 0, failures)
+
+
+def run_portfolio_checks(signal: dict, bankroll: float) -> tuple[bool, list[str]]:
+    """
+    Portfolio-level risk checks that DEPEND on current capital state.
+    These are evaluated in priority order (after ranking) so that the
+    highest-scored signals get funded first.
+
+    Checks: total exposure, event exposure, city-day exposure, bin limit.
+    """
+    failures: list[str] = []
+
+    checks = [
+        check_bin_limit(signal.get("city", ""), signal.get("date", "")),
+        check_total_exposure(signal.get("kelly_size", 0), bankroll),
+        check_event_exposure(
+            signal.get("event_id", ""), signal.get("kelly_size", 0), bankroll),
+        check_city_day_exposure(
+            signal.get("city", ""), signal.get("date", ""),
+            signal.get("kelly_size", 0), bankroll),
+    ]
+
+    for check in checks:
+        if not check:
+            failures.append(check.reason)
+
+    return (len(failures) == 0, failures)
+
+
+def run_all_checks(signal: dict, bankroll: float) -> tuple[bool, list[str]]:
+    """
+    Run all risk checks for a trade signal (individual temperature-range outcome).
+    Combines pre-checks and portfolio checks.  Retained for backward
+    compatibility with any callers that use the combined interface.
+
+    Returns (all_passed, list_of_failure_reasons).
+    """
+    passed1, failures1 = run_pre_checks(signal, bankroll)
+    passed2, failures2 = run_portfolio_checks(signal, bankroll)
+    failures = failures1 + failures2
+
+    return (len(failures) == 0, failures)

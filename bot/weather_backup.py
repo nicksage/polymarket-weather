@@ -583,7 +583,7 @@ def _get_noaa_nbm_distribution(lat: float, lon: float, date_str: str) -> dict | 
 
     logger.debug(
         f"NOAA NBM [{icao}]: Q10={q10} Q25={q25} Q50={q50} Q75={q75} Q90={q90}°F "
-        f"→ μ={mu_c:.2f}°C σ={sigma_c:.2f}°C"
+        f"-> mu={mu_c:.2f}C sigma={sigma_c:.2f}C"
     )
     return {
         "mu_c":       round(mu_c, 2),
@@ -656,7 +656,7 @@ def _get_nws_hourly_distribution(
 
     logger.debug(
         f"NWS hourly: {len(day_temps_f)} hourly temps, "
-        f"max={mu_f:.1f}°F → μ={mu_c:.2f}°C σ={sigma_c:.2f}°C"
+        f"max={mu_f:.1f}F -> mu={mu_c:.2f}C sigma={sigma_c:.2f}C"
     )
     return {"mu_c": mu_c, "sigma_c": sigma_c, "source": "nws_hourly"}
 
@@ -845,7 +845,7 @@ def get_temp_distribution_for_event(
         if deviation > 5.0:
             logger.warning(
                 f"Tomorrow.io sanity check: forecast μ={mu_c:.1f}°C but "
-                f"Tomorrow.io={tio_temp:.1f}°C (Δ={deviation:.1f}°C)"
+                f"Tomorrow.io={tio_temp:.1f}°C (delta={deviation:.1f}°C)"
             )
 
     # Final sanity gate

@@ -654,7 +654,7 @@ def live_observation_run(events: list[dict] | None = None) -> dict:
                         f"VCDiag: {city} {date_str} | vc_day_max="
                         f"{diag['vc_projected_day_max_c']:.2f}°C "
                         f"blended_mu={diag.get('blended_mu_c')} "
-                        f"Δ={diag.get('vc_vs_blended_mu_c'):+.2f}°C "
+                        f"delta={diag.get('vc_vs_blended_mu_c'):+.2f}°C "
                         f"bins={diag.get('vc_bins_apart')} "
                         f"flags={','.join(tags)}"
                     )
@@ -761,7 +761,7 @@ def vc_future_diagnostic_run(events: list[dict] | None = None) -> dict:
                         f"VCDiag[D+{da}]: {city} {d} | "
                         f"vc_day_max={diag['vc_projected_day_max_c']:.2f}°C "
                         f"blended_mu={diag.get('blended_mu_c')} "
-                        f"Δ={diag.get('vc_vs_blended_mu_c'):+.2f}°C LARGE"
+                        f"delta={diag.get('vc_vs_blended_mu_c'):+.2f}°C LARGE"
                     )
         except Exception as e:
             logger.debug(f"future_day diag insert failed for {event_id}: {e}")

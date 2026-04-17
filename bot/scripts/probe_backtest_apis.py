@@ -74,7 +74,7 @@ def probe_previous_runs_ensemble(lat: float, lon: float, target_date: date) -> d
                 "daily":      "temperature_2m_max",
                 "start_date": target_date.isoformat(),
                 "end_date":   target_date.isoformat(),
-                "models":     "ecmwf_ifs04",
+                "models":     "ecmwf_ifs025",
             },
             timeout=20,
         )
@@ -112,7 +112,7 @@ def probe_previous_runs_hourly(lat: float, lon: float, target_date: date) -> dic
                 "hourly":     "temperature_2m",
                 "start_date": target_date.isoformat(),
                 "end_date":   target_date.isoformat(),
-                "models":     "ecmwf_ifs04",
+                "models":     "ecmwf_ifs025",
             },
             timeout=20,
         )

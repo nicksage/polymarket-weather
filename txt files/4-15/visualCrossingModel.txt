@@ -1,0 +1,24 @@
+What we built and why it matters
+The core idea behind this update is simple: Visual Crossing publishes its own forecast for the daily high temperature at every city we trade. Our model uses ECMWF + GFS + climatology to produce its own forecast. These two numbers don't always agree. When they disagree significantly, one of them is probably closer to reality — and if VC is systematically right in those disagreement cases, that's tradeable information we're currently ignoring.
+
+Rather than blindly adding VC's forecast into our probability model (which would change every trade immediately and make it impossible to measure whether it helped), we built a diagnostic shadow layer. Every 20 minutes for same-day events, and every 2 hours for tomorrow's events, the bot now records what VC is forecasting alongside what our model believes. It computes the disagreement in degrees Celsius, translates that into a rough "bins apart" number (how many Polymarket temperature bins separate the two predictions), and flags cases where the disagreement is large (currently ≥2°C) or directionally concerning (VC says meaningfully hotter or colder than our model). All of this is stored in a new table called vc_forecast_diagnostics, and the key metrics are also copied into every decision_snapshots row at the moment we evaluate a trade. That last part is critical — it means we can later look at any trade and see exactly what VC was saying at the time we decided to enter.
+
+None of this changes how the bot trades. The probability model, the signal generation, the risk checks, the execution — all untouched. The diagnostic layer is purely observational. It watches and records, but never acts.
+
+How to get the results
+After the bot has been running for at least a week or two (longer is better — two weeks gives you roughly 1,000+ diagnostic rows across all events), run this from the bot/ directory:
+
+python scripts/vc_diagnostic_report.py --days 14
+
+That produces a markdown report in bot/logs/ with four sections. The first section groups all events by how much VC disagreed with our model and shows the forecast accuracy (MAE against the actual observed daily high) for our blended model, our adjusted model, and VC's forecast, side by side. If VC's MAE is consistently lower in the high-disagreement buckets, that's direct evidence that VC contains information we're missing. The second section is a directional contingency table — when VC said "hotter than your model," was the actual temperature indeed hotter? A lift value above 1.0 means VC's directional calls have predictive power. The third section splits closed trades by whether they had a VC warning flag at entry and compares win rates and average P&L between flagged and unflagged trades. The fourth section is the most actionable: it lists every closed trade that carried a large-disagreement flag at entry, sorted by P&L from worst to best, and computes what total P&L would have been if those trades had been blocked.
+
+You can also adjust the lookback window — --days 30 for a month of data, or --days 7 for a quick recent check.
+
+What you could build with this data
+If the report consistently shows that VC disagreement predicts worse trade outcomes — specifically, if flagged trades have a materially lower win rate or worse average P&L than unflagged trades — then the simplest next step is a risk-layer filter. You'd add a check in risk.py that blocks or reduces position size on any signal where flag_vc_disagreement_large is true at evaluation time. That's a small, reversible change: one if statement in the risk checks, gated by a config flag. It doesn't change the model at all; it just says "we believe this trade has edge, but VC strongly disagrees, so we'll pass or size down."
+
+If the directional lift is strong (say, above 1.2), a more ambitious next step would be to add VC's projected daily high as a third forecast source in the blend alongside ECMWF and GFS. That would mean VC actually shifts the probability distribution and changes which bins get flagged as signals. This is a bigger change and should only be done after the diagnostic data clearly supports it, because once VC is in the blend, you can't easily separate its contribution from ECMWF/GFS to measure whether it's helping.
+
+A middle-ground option is a "caution penalty" — when VC disagrees significantly, halve the Kelly size (similar to how we already halve it on normalization warnings). This lets the signal through but limits exposure on trades where an independent source disagrees.
+
+All three paths — filter, blend, penalty — can be evaluated using the data this layer is already collecting. You don't need to build anything new to answer "should I do this?" — just run the report, look at the numbers, and decide.

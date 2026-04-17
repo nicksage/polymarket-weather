@@ -308,7 +308,7 @@ def write_report(
         if not warn_list:
             f.write("_No flagged closed trades in window._\n\n")
         else:
-            f.write("| City | Date | Side | Entry px | P&L | VC Δ (°C) | "
+            f.write("| City | Date | Side | Entry px | P&L | VC delta (C) | "
                     "bins_apart | Warns |\n")
             f.write("|---|---|---|---:|---:|---:|---:|---|\n")
             for p in warn_list[:50]:   # cap at 50

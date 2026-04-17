@@ -531,6 +531,7 @@ def insert_position(
     lat: float = None,
     lon: float = None,
     forecast_sigma_c: float = None,
+    entry_snapshot_id: int = None,
 ) -> int:
     sql = """
         INSERT INTO positions (
@@ -541,8 +542,8 @@ def insert_position(
             unrealized_pnl, current_price, gamma_market_id,
             range_low, range_high, unit,
             yes_token_id, no_token_id, lat, lon,
-            forecast_sigma_c
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            forecast_sigma_c, entry_snapshot_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     with _get_conn() as conn:
         cur = conn.execute(sql, (
@@ -555,6 +556,7 @@ def insert_position(
             range_low, range_high, unit,
             yes_token_id, no_token_id, lat, lon,
             forecast_sigma_c,
+            entry_snapshot_id,
         ))
         return cur.lastrowid
 
@@ -604,15 +606,44 @@ def update_position_outcome(
     exit_time: str,
     pnl: float,
     status: str = "closed",
+    exit_reason: str | None = None,
+    exit_snapshot_id: int | None = None,
 ) -> None:
     sql = """
         UPDATE positions
         SET exit_price = ?, exit_time = ?, pnl = ?, status = ?,
-            unrealized_pnl = 0
+            unrealized_pnl = 0,
+            exit_reason = COALESCE(?, exit_reason),
+            exit_snapshot_id = COALESCE(?, exit_snapshot_id)
         WHERE id = ?
     """
     with _get_conn() as conn:
-        conn.execute(sql, (exit_price, exit_time, pnl, status, position_id))
+        conn.execute(sql, (exit_price, exit_time, pnl, status,
+                           exit_reason, exit_snapshot_id, position_id))
+
+
+def update_position_excursions(
+    position_id: int,
+    max_favorable: float | None,
+    max_adverse: float | None,
+) -> None:
+    """Track peak-to-trough during position lifetime for attribution."""
+    sql = """
+        UPDATE positions SET
+            max_favorable_excursion = CASE
+                WHEN max_favorable_excursion IS NULL THEN ?
+                WHEN ? > max_favorable_excursion THEN ?
+                ELSE max_favorable_excursion END,
+            max_adverse_excursion = CASE
+                WHEN max_adverse_excursion IS NULL THEN ?
+                WHEN ? < max_adverse_excursion THEN ?
+                ELSE max_adverse_excursion END
+        WHERE id = ?
+    """
+    with _get_conn() as conn:
+        conn.execute(sql, (max_favorable, max_favorable, max_favorable,
+                           max_adverse, max_adverse, max_adverse,
+                           position_id))
 
 
 def update_position_fill(
@@ -1523,6 +1554,37 @@ def insert_decision_snapshot(snapshot: dict) -> int:
 # ---------------------------------------------------------------------------
 # Phase 2 — temp_events current-state updater
 # ---------------------------------------------------------------------------
+
+def get_snapshot_by_id(snapshot_id: int) -> dict | None:
+    """Fetch a single decision_snapshots row by primary key."""
+    sql = "SELECT * FROM decision_snapshots WHERE id = ?"
+    with _get_conn() as conn:
+        row = conn.execute(sql, (snapshot_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_latest_snapshot_for_contract(contract_id: str) -> dict | None:
+    """Return the most recent decision_snapshots row for a contract."""
+    sql = ("SELECT * FROM decision_snapshots WHERE contract_id = ? "
+           "ORDER BY evaluated_at_utc DESC LIMIT 1")
+    with _get_conn() as conn:
+        row = conn.execute(sql, (contract_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_latest_snapshot_id_for_contract(contract_id: str) -> int | None:
+    """Return the most recent decision_snapshots.id for a contract.
+    Used by execution.py to populate positions.entry_snapshot_id."""
+    sql = """
+        SELECT id FROM decision_snapshots
+        WHERE contract_id = ?
+        ORDER BY evaluated_at_utc DESC
+        LIMIT 1
+    """
+    with _get_conn() as conn:
+        row = conn.execute(sql, (contract_id,)).fetchone()
+        return int(row[0]) if row else None
+
 
 _EVENT_STATE_COLS = {
     "timezone", "latest_forecast_ts", "latest_observation_ts",
