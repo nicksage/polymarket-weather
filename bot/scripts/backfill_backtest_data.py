@@ -31,7 +31,7 @@ _BOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _BOT_DIR not in sys.path:
     sys.path.insert(0, _BOT_DIR)
 
-from backtest_db import (
+from backtest.backtest_db import (
     init_backtest_db, upsert_historical_hourly_obs, get_historical_hourly_obs,
 )
 from config import DB_PATH

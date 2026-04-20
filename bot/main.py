@@ -29,6 +29,7 @@ from config import LOG_LEVEL, PAPER_TRADE, DB_PATH
 from db import init_db
 from edge import run_edge_scan
 from risk import run_all_checks, run_pre_checks, run_portfolio_checks
+from strategies import get_active_strategy
 from execution import get_clob_client, execute_signal
 from sizing import get_bankroll
 from monitor import run_monitor_loop
@@ -185,8 +186,14 @@ def trading_run():
         logger.info("No cached events — running inline discovery")
         events = discovery_run()
 
-    # Analyze events and generate signals
-    all_events, signals = run_edge_scan(bankroll=bankroll, events=events)
+    # Use the active strategy to generate signals
+    strategy = get_active_strategy()
+    logger.info(f"Active strategy: {strategy.name}")
+
+    from datetime import timezone as _tz
+    _scan_ts = datetime.now(_tz.utc).isoformat()
+
+    all_events, signals = strategy.generate_signals(events, bankroll, _scan_ts)
     logger.info(f"Analyzed {len(all_events)} events -> {len(signals)} raw signals")
 
     # Two-pass signal processing:
@@ -198,8 +205,6 @@ def trading_run():
     # This ensures the ranking only scores tradeable opportunities, and
     # capital-dependent checks (exposure caps) are evaluated in priority
     # order so the best signals get funded first.
-
-    from sizing import rank_signals
 
     eligible = []
     skipped  = 0
@@ -216,8 +221,8 @@ def trading_run():
 
     logger.info(f"Risk pre-filter: {len(eligible)} eligible, {skipped} skipped")
 
-    # Rank only the eligible signals
-    eligible = rank_signals(eligible, bankroll)
+    # Rank only the eligible signals using the active strategy's ranking
+    eligible = strategy.rank_signals(eligible, bankroll)
 
     if eligible:
         logger.info("--- SIGNAL PRIORITY RANKING ---")
@@ -292,7 +297,7 @@ def trading_run():
 
     # --- Phase 3: Active position management (exit engine) ---
     try:
-        exit_actions = evaluate_open_positions()
+        exit_actions = strategy.evaluate_positions()
         if exit_actions:
             _execute_exit_actions(exit_actions, client)
     except Exception as e:
@@ -356,7 +361,7 @@ def main():
     # Bias update runs first — it ensures forecast_errors is fresh before the
     # trading scan reads per-model bias corrections.
     try:
-        from bias_updater import run_bias_update
+        from bias_correction.bias_updater import run_bias_update
         run_bias_update()
     except Exception as e:
         logger.warning(f"Startup bias update failed (non-fatal): {e}")
@@ -423,7 +428,7 @@ def main():
     # ERA5-reanalysis-based bias recorder.
     def _scheduled_bias_update() -> None:
         try:
-            from bias_updater import run_bias_update
+            from bias_correction.bias_updater import run_bias_update
             run_bias_update()
         except Exception as e:
             logger.exception(f"Scheduled bias update failed (non-fatal): {e}")

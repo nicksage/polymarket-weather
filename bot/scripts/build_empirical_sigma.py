@@ -30,7 +30,7 @@ _BOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _BOT_DIR not in sys.path:
     sys.path.insert(0, _BOT_DIR)
 
-from backtest_db import init_backtest_db, upsert_empirical_sigma
+from backtest.backtest_db import init_backtest_db, upsert_empirical_sigma
 from config import DB_PATH
 
 logging.basicConfig(
@@ -94,7 +94,7 @@ def main() -> int:
         )
 
     # Verify
-    from backtest_db import _get_conn
+    from backtest.backtest_db import _get_conn
     with _get_conn() as c:
         total = c.execute("SELECT COUNT(*) FROM empirical_sigma_by_lead").fetchone()[0]
     log.info(f"empirical_sigma_by_lead rows: {total}")

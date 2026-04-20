@@ -43,7 +43,7 @@ if _BOT_DIR not in sys.path:
     sys.path.insert(0, _BOT_DIR)
 
 import config
-from backtest_db import (
+from backtest.backtest_db import (
     init_backtest_db, get_historical_hourly_obs, get_empirical_sigma,
     insert_backtest_run, finalize_backtest_run, insert_backtest_results_bulk,
 )

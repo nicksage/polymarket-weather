@@ -157,6 +157,13 @@ ALLOWED_SIDES: str = os.getenv("ALLOWED_SIDES", "both").lower().strip()
 WALLET_ADDRESS: str = os.getenv("WALLET_ADDRESS", "")
 
 # ---------------------------------------------------------------------------
+# Strategy selection
+# ---------------------------------------------------------------------------
+# Which trading strategy to use.  Each strategy has its own signal generation,
+# ranking, and exit logic.  Available: "edge_disagreement", "top_bin_value".
+ACTIVE_STRATEGY: str = os.getenv("ACTIVE_STRATEGY", "edge_disagreement")
+
+# ---------------------------------------------------------------------------
 # Live adjustment layer (Phase 2b)
 # Additive adjustment on top of the ECMWF + GFS + climatology blend, driven
 # by Visual Crossing live observations.  Shadow mode by default — both

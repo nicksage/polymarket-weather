@@ -1,0 +1,34 @@
+Strategy framework and top-bin-value implementation
+
+What changed and why:
+The bot previously had a single hardcoded trading approach embedded across several files: find bins where the model disagrees with the market by more than 7%, buy them with Kelly sizing, and hold until resolution. After watching the bot trade, we identified a fundamental problem with this approach: it hunted for mathematical edge on low-probability tail bins (buying YES on 7% model-probability bins because the market had them at 2%) while ignoring the bins the model actually thought would win. In mutually exclusive bin markets, a bin either pays $1.00 or $0.00 — there's no price convergence to "fair value" like in a stock market. This means low-probability "positive EV" trades are effectively lottery tickets with high variance and unreliable edge, while high-probability bins that the model genuinely believes in are much more likely to produce real returns.
+
+To address this without destroying the existing approach (which may still be useful in certain conditions), we built a strategy framework that lets the bot run different trading strategies selectable via a single .env variable. The framework cleanly separates strategy-specific logic (what to buy, how to rank, when to exit) from shared infrastructure (weather models, risk checks, execution, monitoring, database). You can switch strategies by changing one line in the config and restarting — no code edits required.
+
+The new strategy: top_bin_value
+The top_bin_value strategy flips the trading philosophy from "find disagreement" to "buy what the model believes in." Instead of scanning every bin for edge, it looks at the model's top bins by probability and buys them as long as the model has meaningful conviction (currently ≥10% model probability). It does not require the market to underprice the bin — it will buy at fair price or even slightly above if the model is confident. However, when capital is limited and the bot must choose between signals, underpricing becomes a ranking factor so the cheapest bins relative to model value get funded first.
+
+The exit logic for this strategy is tailored to the "conviction-based" approach. The most important new exit condition is TOP_BIN_CONFIRMED: once the model's probability for any single bin in an event reaches 90% or higher (configurable via TBV_CONFIRM_PROB), all other YES positions for that event are exited because the model is now highly confident in one outcome and holding alternatives is no longer justified. NO positions are kept because they benefit from the confirmed bin being somewhere other than their range. The strategy also inherits the INVALIDATED exit (observed max exceeds the bin + buffer), DYING exit (model probability collapsed since entry), and the hard stop-loss circuit breaker. It deliberately does not include an OVERPRICED exit in v1 — the strategy is designed to hold positions to resolution when the model's conviction remains, rather than selling early because the market repriced.
+
+Things to be aware of before running:
+The strategy is set to top_bin_value in the .env file. Because this strategy does not require underpricing to enter, it will buy bins at market price when the model is confident. This means it can enter trades with zero edge in the traditional sense — the thesis is purely "the model thinks this bin will win" rather than "the model thinks the market is wrong." If the model is miscalibrated (σ too narrow, μ biased), the strategy will confidently buy the wrong bins at full price. The σ floor at 1.5°C, the ECMWF+GFS dual-model requirement, and the confidence-weighted Kelly sizing are the safeguards against this. Watch the first few trading cycles carefully to ensure the signals look reasonable — the model should be selecting bins near its blended μ, not extreme tail bins.
+
+The strategy respects all existing risk controls: MAX_BIN_BUYS limits how many bins per event, ALLOWED_SIDES controls whether YES, NO, or both are permitted, MAX_TOTAL_EXPOSURE_PCT caps portfolio exposure, and the event-level and city-day concentration caps still apply. The ranking system prioritizes bins by model conviction first, then market discount, then confidence and time efficiency — so when capital is limited, the model's highest-probability bins at the cheapest market prices get funded first.
+
+New variables in .env:
+ACTIVE_STRATEGY=top_bin_value — selects which strategy the bot runs. Change to edge_disagreement to revert to the original approach.
+TBV_MIN_MODEL_PROB=0.10 — minimum model probability for a bin to qualify as a YES signal. Bins below 10% are skipped. Raise this to be more selective (e.g., 0.15 means only bins the model gives 15%+ probability).
+TBV_CONFIRM_PROB=0.90 — once any bin's model probability reaches this level, all other YES bins for the event are exited. This is the "model is now very confident in one outcome" trigger.
+TBV_KELLY_FRACTION=0.25 — Kelly fraction for this strategy (same default as edge_disagreement but independently configurable).
+TBV_TOP_N_BINS=4 — how many of the model's top bins to consider per event. Set to match MAX_BIN_BUYS or lower.
+
+New files:
+bot/strategies/__init__.py — the strategy registry and factory function. Contains get_active_strategy() which reads ACTIVE_STRATEGY from config and returns the corresponding strategy instance. New strategies are registered by importing their module.
+bot/strategies/base.py — the abstract Strategy base class that defines the three methods every strategy must implement: generate_signals, rank_signals, and evaluate_positions. Also provides shared utilities like analyze_event_base() (which calls the weather model and live adjustment layer), flatten_signal() (which builds the standard signal dict format), and helper functions for EV calculation and unit conversion.
+bot/strategies/edge_disagreement.py — the original trading logic wrapped in the strategy interface. It delegates to the existing run_edge_scan, rank_signals, and evaluate_open_positions functions with zero behavior change. This exists so you can switch back to the original approach at any time.
+bot/strategies/top_bin_value.py — the new strategy. Contains the signal selection logic (top N bins by model probability), the conviction-based ranking function, and the custom exit engine with TOP_BIN_CONFIRMED logic.
+
+Changes to existing files:
+bot/main.py — the trading_run() function now calls get_active_strategy() at the start of each cycle and delegates signal generation, ranking, and position evaluation to the strategy instance instead of hardcoded function calls. The risk check two-pass filter (pre-filter then portfolio checks), execution loop, exit action handler, and logging all remain in main.py as shared infrastructure.
+bot/config.py — added ACTIVE_STRATEGY configuration variable with default edge_disagreement.
+.env — added ACTIVE_STRATEGY=top_bin_value and the four TBV-specific configuration variables.
