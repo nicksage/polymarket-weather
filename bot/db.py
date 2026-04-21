@@ -176,6 +176,9 @@ def init_db():
             "ALTER TABLE positions ADD COLUMN max_favorable_excursion REAL",
             "ALTER TABLE positions ADD COLUMN max_adverse_excursion REAL",
             "ALTER TABLE positions ADD COLUMN exit_reason TEXT",
+            # Phase 3: liquidity-aware sizing
+            "ALTER TABLE positions ADD COLUMN target_size_usdc REAL",
+            "ALTER TABLE positions ADD COLUMN stop_loss_price REAL",
             # --- Phase 2b: live adjustment layer ---
             "ALTER TABLE temp_events ADD COLUMN adjusted_mu_c REAL",
             "ALTER TABLE temp_events ADD COLUMN adjusted_sigma_c REAL",
@@ -457,6 +460,43 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_vcdiag_large
                 ON vc_forecast_diagnostics(flag_vc_disagreement_large, target_date);
 
+            -- Per-city forecast accuracy metrics (rebuilt daily by bias updater).
+            -- Rolling 30-day window.  Used for city ranking and per-city
+            -- confidence adjustments in trading strategies.
+            CREATE TABLE IF NOT EXISTS city_forecast_accuracy (
+                city                TEXT PRIMARY KEY,
+                lat                 REAL,
+                lon                 REAL,
+                window_days         INTEGER,
+                n_days              INTEGER,
+                -- Core metrics
+                mae_c               REAL,
+                rmse_c              REAL,
+                bias_c              REAL,
+                -- Stability
+                error_std_c         REAL,
+                max_error_c         REAL,
+                -- Trading usefulness
+                pct_within_1c       REAL,        -- fraction of days |error| <= 1.0
+                pct_within_2c       REAL,        -- fraction of days |error| <= 2.0
+                -- Direction
+                pct_underpredicted  REAL,        -- fraction of days actual > forecast
+                pct_overpredicted   REAL,        -- fraction of days actual < forecast
+                -- Time horizon (MAE by lead)
+                mae_d0_c            REAL,
+                mae_d1_c            REAL,
+                mae_d2_c            REAL,
+                n_d0                INTEGER,
+                n_d1                INTEGER,
+                n_d2                INTEGER,
+                -- Average forecast uncertainty (sigma) across recent events
+                avg_uncertainty_c   REAL,
+                -- Composite score (0-100, higher = more accurate/tradeable)
+                accuracy_score      REAL,
+                -- Metadata
+                updated_at          TEXT
+            );
+
             -- VC cost accounting (cheap surface so we don't scan obs table).
             CREATE TABLE IF NOT EXISTS vc_usage_daily (
                 date              TEXT PRIMARY KEY,       -- YYYY-MM-DD UTC
@@ -532,6 +572,8 @@ def insert_position(
     lon: float = None,
     forecast_sigma_c: float = None,
     entry_snapshot_id: int = None,
+    target_size_usdc: float = None,
+    stop_loss_price: float = None,
 ) -> int:
     sql = """
         INSERT INTO positions (
@@ -542,8 +584,9 @@ def insert_position(
             unrealized_pnl, current_price, gamma_market_id,
             range_low, range_high, unit,
             yes_token_id, no_token_id, lat, lon,
-            forecast_sigma_c, entry_snapshot_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            forecast_sigma_c, entry_snapshot_id, target_size_usdc,
+            stop_loss_price
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     with _get_conn() as conn:
         cur = conn.execute(sql, (
@@ -557,6 +600,8 @@ def insert_position(
             yes_token_id, no_token_id, lat, lon,
             forecast_sigma_c,
             entry_snapshot_id,
+            target_size_usdc,
+            stop_loss_price,
         ))
         return cur.lastrowid
 
@@ -620,6 +665,41 @@ def update_position_outcome(
     with _get_conn() as conn:
         conn.execute(sql, (exit_price, exit_time, pnl, status,
                            exit_reason, exit_snapshot_id, position_id))
+
+
+def update_position_topup(
+    position_id: int,
+    added_usdc: float,
+    added_shares: float,
+    new_avg_price: float,
+) -> None:
+    """Add to an existing position's size (liquidity-aware top-up).
+    Updates size_usdc, shares, and recalculates entry_price as a
+    weighted average."""
+    sql = """
+        UPDATE positions
+        SET size_usdc = size_usdc + ?,
+            shares = shares + ?,
+            entry_price = ?,
+            current_price = ?
+        WHERE id = ?
+    """
+    with _get_conn() as conn:
+        conn.execute(sql, (added_usdc, added_shares, new_avg_price,
+                           new_avg_price, position_id))
+
+
+def get_underfilled_positions() -> list[dict]:
+    """Return open positions where size_usdc < target_size_usdc."""
+    sql = """
+        SELECT * FROM positions
+        WHERE status = 'open' AND fill_status = 'filled'
+          AND target_size_usdc IS NOT NULL
+          AND size_usdc < target_size_usdc
+        ORDER BY entry_time ASC
+    """
+    with _get_conn() as conn:
+        return [dict(r) for r in conn.execute(sql).fetchall()]
 
 
 def update_position_excursions(
@@ -1440,6 +1520,44 @@ def get_previous_forecast_run(event_id: str, source: str) -> dict | None:
         return dict(row) if row else None
 
 
+def get_latest_forecast_distribution(
+    lat: float, lon: float, date_str: str, source: str,
+    max_age_hours: float = 3.0,
+) -> dict | None:
+    """Read the most recent forecast_runs row for a (location, date, source).
+
+    Returns {"mu_c", "sigma_c", "source", "n", "pulled_at"} matching the
+    format of _get_ecmwf_ensemble_distribution / _get_gfs_ensemble_distribution,
+    or None if no data exists within the age window.
+
+    Used by the trading scan to avoid redundant API calls when the forecast
+    pull loop already wrote fresh data 5 minutes ago.
+    """
+    from datetime import datetime, timedelta, timezone
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).isoformat()
+    sql = """
+        SELECT forecast_mu_c, forecast_sigma_c, source, pulled_at
+        FROM forecast_runs
+        WHERE ABS(lat - ?) < 0.05 AND ABS(lon - ?) < 0.05
+          AND date = ? AND source = ?
+          AND pulled_at >= ?
+          AND forecast_mu_c IS NOT NULL
+        ORDER BY pulled_at DESC
+        LIMIT 1
+    """
+    with _get_conn() as conn:
+        row = conn.execute(sql, (lat, lon, date_str, source, cutoff)).fetchone()
+        if not row:
+            return None
+        return {
+            "mu_c":      float(row[0]),
+            "sigma_c":   float(row[1]),
+            "source":    row[2],
+            "n":         0,
+            "pulled_at": row[3],
+        }
+
+
 def get_latest_forecast_hourly(run_id: int) -> list[dict]:
     sql = """
         SELECT * FROM forecast_hourly
@@ -1699,6 +1817,196 @@ def purge_vc_forecast_diagnostics(older_than_days: int = 90) -> int:
     with _get_conn() as conn:
         cur = conn.execute(sql, (cutoff,))
         return cur.rowcount
+
+
+def purge_temp_scan_data(older_than_days: int = 30) -> dict:
+    """Purge old scan data from temp_outcomes and temp_events.
+
+    Deletes outcomes first (FK dependency), then events.  Only removes
+    rows whose scan_timestamp is older than the cutoff.  Positions,
+    decision_snapshots, and other tables are unaffected.
+
+    Returns {"events_deleted": int, "outcomes_deleted": int}.
+    """
+    from datetime import datetime, timedelta, timezone
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+    with _get_conn() as conn:
+        outcomes = conn.execute(
+            "DELETE FROM temp_outcomes WHERE scan_timestamp < ?", (cutoff,)
+        ).rowcount
+        events = conn.execute(
+            "DELETE FROM temp_events WHERE scan_timestamp < ?", (cutoff,)
+        ).rowcount
+    return {"events_deleted": events, "outcomes_deleted": outcomes}
+
+
+def rebuild_city_forecast_accuracy(window_days: int = 30) -> int:
+    """Recompute per-city forecast accuracy metrics from forecast_errors
+    + historical_observed_daily over a rolling window.  Called daily by
+    the bias updater.  Returns the number of cities updated."""
+    import math
+    from datetime import date, timedelta, timezone
+
+    cutoff = (date.today() - timedelta(days=window_days)).isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    with _get_conn() as conn:
+        # Get distinct cities with enough error data
+        cities = conn.execute("""
+            SELECT DISTINCT city, lat_key, lon_key
+            FROM forecast_errors
+            WHERE city IS NOT NULL AND target_date >= ?
+            GROUP BY city
+            HAVING COUNT(*) >= 5
+        """, (cutoff,)).fetchall()
+
+        updated = 0
+        # Collect all scores for normalization pass
+        all_metrics: list[dict] = []
+
+        for city_row in cities:
+            city = city_row[0]
+            lat = city_row[1]
+            lon = city_row[2]
+
+            # All errors for this city in the window
+            rows = conn.execute("""
+                SELECT error_c, days_ahead
+                FROM forecast_errors
+                WHERE city = ? AND target_date >= ? AND error_c IS NOT NULL
+            """, (city, cutoff)).fetchall()
+
+            if len(rows) < 5:
+                continue
+
+            errors = [float(r[0]) for r in rows]
+            abs_errors = [abs(e) for e in errors]
+            n = len(errors)
+
+            # Core
+            mae = sum(abs_errors) / n
+            rmse = math.sqrt(sum(e * e for e in errors) / n)
+            bias = sum(errors) / n
+
+            # Stability
+            mean_err = sum(errors) / n
+            error_std = math.sqrt(sum((e - mean_err) ** 2 for e in errors) / n) if n > 1 else 0.0
+            max_error = max(abs_errors)
+
+            # Trading usefulness
+            within_1 = sum(1 for e in abs_errors if e <= 1.0) / n
+            within_2 = sum(1 for e in abs_errors if e <= 2.0) / n
+
+            # Direction (error_c = actual - forecast; positive = underpredicted)
+            underpredicted = sum(1 for e in errors if e > 0) / n
+            overpredicted = sum(1 for e in errors if e < 0) / n
+
+            # By lead time (days_ahead may be None for some rows)
+            def _mae_by_lead(target_lead):
+                lead_errors = [abs(float(r[0])) for r in rows
+                               if r[1] is not None and int(r[1]) == target_lead]
+                if not lead_errors:
+                    return (None, 0)
+                return (sum(lead_errors) / len(lead_errors), len(lead_errors))
+
+            mae_d0, n_d0 = _mae_by_lead(0)
+            mae_d1, n_d1 = _mae_by_lead(1)
+            mae_d2, n_d2 = _mae_by_lead(2)
+
+            # Average forecast uncertainty (sigma) from recent temp_events
+            avg_unc = None
+            try:
+                unc_rows = conn.execute(
+                    "SELECT forecast_sigma_c FROM temp_events "
+                    "WHERE LOWER(city) = LOWER(?) AND forecast_sigma_c IS NOT NULL "
+                    "AND scan_timestamp >= ? "
+                    "GROUP BY date ORDER BY scan_timestamp DESC",
+                    (city, cutoff),
+                ).fetchall()
+                if unc_rows:
+                    avg_unc = sum(float(r[0]) for r in unc_rows) / len(unc_rows)
+            except Exception:
+                pass
+
+            all_metrics.append({
+                "city": city, "lat": lat, "lon": lon,
+                "n": n, "mae": mae, "rmse": rmse, "bias": bias,
+                "error_std": error_std, "max_error": max_error,
+                "within_1": within_1, "within_2": within_2,
+                "underpredicted": underpredicted, "overpredicted": overpredicted,
+                "mae_d0": mae_d0, "mae_d1": mae_d1, "mae_d2": mae_d2,
+                "n_d0": n_d0, "n_d1": n_d1, "n_d2": n_d2,
+                "avg_uncertainty": avg_unc,
+            })
+
+        if not all_metrics:
+            return 0
+
+        # Normalization pass: scale MAE, std, max_error to [0,1] across cities
+        all_mae = [m["mae"] for m in all_metrics]
+        all_std = [m["error_std"] for m in all_metrics]
+        all_max = [m["max_error"] for m in all_metrics]
+
+        def _normalize(val, vals):
+            lo, hi = min(vals), max(vals)
+            if hi == lo:
+                return 0.5
+            return (val - lo) / (hi - lo)
+
+        for m in all_metrics:
+            norm_mae = _normalize(m["mae"], all_mae)
+            norm_std = _normalize(m["error_std"], all_std)
+            norm_max = _normalize(m["max_error"], all_max)
+
+            score = (
+                m["within_1"] * 35
+                + (1 - norm_std) * 25
+                + (1 - norm_mae) * 20
+                + m["within_2"] * 10
+                + (1 - norm_max) * 10
+            )
+
+            conn.execute("""
+                INSERT INTO city_forecast_accuracy (
+                    city, lat, lon, window_days, n_days,
+                    mae_c, rmse_c, bias_c,
+                    error_std_c, max_error_c,
+                    pct_within_1c, pct_within_2c,
+                    pct_underpredicted, pct_overpredicted,
+                    mae_d0_c, mae_d1_c, mae_d2_c,
+                    n_d0, n_d1, n_d2,
+                    avg_uncertainty_c,
+                    accuracy_score, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(city) DO UPDATE SET
+                    lat=excluded.lat, lon=excluded.lon,
+                    window_days=excluded.window_days, n_days=excluded.n_days,
+                    mae_c=excluded.mae_c, rmse_c=excluded.rmse_c, bias_c=excluded.bias_c,
+                    error_std_c=excluded.error_std_c, max_error_c=excluded.max_error_c,
+                    pct_within_1c=excluded.pct_within_1c, pct_within_2c=excluded.pct_within_2c,
+                    pct_underpredicted=excluded.pct_underpredicted,
+                    pct_overpredicted=excluded.pct_overpredicted,
+                    mae_d0_c=excluded.mae_d0_c, mae_d1_c=excluded.mae_d1_c,
+                    mae_d2_c=excluded.mae_d2_c,
+                    n_d0=excluded.n_d0, n_d1=excluded.n_d1, n_d2=excluded.n_d2,
+                    avg_uncertainty_c=excluded.avg_uncertainty_c,
+                    accuracy_score=excluded.accuracy_score, updated_at=excluded.updated_at
+            """, (
+                m["city"], m["lat"], m["lon"], window_days, m["n"],
+                round(m["mae"], 4), round(m["rmse"], 4), round(m["bias"], 4),
+                round(m["error_std"], 4), round(m["max_error"], 4),
+                round(m["within_1"], 4), round(m["within_2"], 4),
+                round(m["underpredicted"], 4), round(m["overpredicted"], 4),
+                round(m["mae_d0"], 4) if m["mae_d0"] is not None else None,
+                round(m["mae_d1"], 4) if m["mae_d1"] is not None else None,
+                round(m["mae_d2"], 4) if m["mae_d2"] is not None else None,
+                m["n_d0"], m["n_d1"], m["n_d2"],
+                round(m["avg_uncertainty"], 4) if m["avg_uncertainty"] is not None else None,
+                round(score, 2), now_iso,
+            ))
+            updated += 1
+
+    return updated
 
 
 def bump_vc_usage(query_cost: int | None) -> None:

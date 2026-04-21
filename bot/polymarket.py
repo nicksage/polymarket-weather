@@ -479,13 +479,15 @@ def search_temp_high_events(min_liquidity: float = 500.0) -> list[dict]:
         Fallback: if the tag returns 0 results (API change), fall back to a
                   full event scan filtered by title keywords.
     """
-    # Primary: fetch via the Polymarket temperature tag slug
-    all_events = _fetch_events_by_tag_slug("temperature")
+    # Primary: fetch via the Polymarket temperature tag slug.
+    # As of April 2026, "highest-temperature" is the correct tag.
+    # Previously "temperature" (deprecated, now returns 0 results).
+    all_events = _fetch_events_by_tag_slug("highest-temperature")
 
     # Fallback: full scan (slow — only used if tag approach fails)
     if not all_events:
         logger.warning(
-            "tag_slug=temperature returned 0 events — falling back to full event scan. "
+            "tag_slug=highest-temperature returned 0 events — falling back to full event scan. "
             "This is slow (~60 API pages). Check if the tag slug has changed."
         )
         page_size = 100

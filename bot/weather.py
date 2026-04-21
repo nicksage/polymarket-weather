@@ -45,6 +45,7 @@ from config import (
     CLIM_LOOKBACK_YEARS, CLIM_WINDOW_DAYS,
     MIN_FORECAST_SIGMA_C, MAX_FORECAST_SIGMA_C,
     USE_KDE_CLIM, MIN_BIAS_OBSERVATIONS,
+    FORECAST_DB_READ_ENABLED, FORECAST_DB_MAX_AGE_HOURS,
 )
 
 logger = logging.getLogger(__name__)
@@ -188,6 +189,49 @@ def _get_ecmwf_ensemble_distribution(
     mu, sigma = fit
     logger.debug(f"ECMWF ensemble: n={len(values)} mu={mu:.2f}°C sd={sigma:.2f}°C")
     return {"mu_c": mu, "sigma_c": sigma, "source": "ecmwf", "n": len(values)}
+
+
+# ---------------------------------------------------------------------------
+# DB-cached ensemble read (avoids redundant API calls when forecast_pull
+# has already written fresh data to forecast_runs)
+# ---------------------------------------------------------------------------
+
+def _get_ensemble_from_db(
+    lat: float, lon: float, date_str: str, source: str,
+) -> dict | None:
+    """Try to read a recent ensemble distribution from forecast_runs.
+
+    Returns the same dict format as _get_ecmwf_ensemble_distribution /
+    _get_gfs_ensemble_distribution, or None if no fresh data exists.
+    """
+    if not FORECAST_DB_READ_ENABLED:
+        return None
+    try:
+        from db import get_latest_forecast_distribution
+        result = get_latest_forecast_distribution(
+            lat, lon, date_str, source,
+            max_age_hours=FORECAST_DB_MAX_AGE_HOURS,
+        )
+        if result is None:
+            return None
+
+        # Compute how old the data is for logging
+        try:
+            from datetime import datetime, timezone
+            pulled = datetime.fromisoformat(
+                result["pulled_at"].replace("Z", "+00:00"))
+            age_min = (datetime.now(timezone.utc) - pulled).total_seconds() / 60
+            logger.debug(
+                f"{source}(db) for ({lat:.2f},{lon:.2f}) {date_str}: "
+                f"mu={result['mu_c']:.2f} sigma={result['sigma_c']:.2f} "
+                f"(pulled {age_min:.0f} min ago)"
+            )
+        except Exception:
+            pass
+
+        return result
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -533,6 +577,16 @@ def _get_noaa_nbm_distribution(lat: float, lon: float, date_str: str) -> dict | 
         logger.debug(f"NOAA NBM text product unavailable for {icao}")
         return None
 
+    # Guard: the MDL endpoint now returns HTML instead of raw text.
+    # If we got HTML back, the text product is broken — fall through
+    # to the NWS hourly fallback.
+    if "<html" in raw_text[:500].lower() or "<!doctype" in raw_text[:500].lower():
+        logger.warning(
+            f"NOAA NBM returned HTML instead of text for {icao} — "
+            f"endpoint may have changed. Falling back to NWS hourly."
+        )
+        return None
+
     # Parse the target date's quantile row.
     # The text product contains one column per valid time; we look for the
     # row containing five temperature values that are plausible (°F range).
@@ -761,10 +815,21 @@ def get_temp_distribution_for_event(
         return None
 
     # Ensemble sources — BOTH are required for a tradeable distribution.
-    # Single-model forecasts are unreliable (no cross-model validation,
-    # no blend diversification) and should not drive trade decisions.
-    ecmwf = _get_ecmwf_ensemble_distribution(lat, lon, date_str)
-    gfs   = _get_gfs_ensemble_distribution(lat, lon, date_str)
+    # Try reading from forecast_runs DB first (populated by the forecast pull
+    # at :05).  Fall back to live API calls if no recent data exists.
+    ecmwf = _get_ensemble_from_db(lat, lon, date_str, "ecmwf")
+    gfs   = _get_ensemble_from_db(lat, lon, date_str, "gfs")
+
+    _ecmwf_source = "db" if ecmwf else None
+    _gfs_source   = "db" if gfs else None
+
+    # API fallback for whichever model wasn't in the DB
+    if ecmwf is None:
+        ecmwf = _get_ecmwf_ensemble_distribution(lat, lon, date_str)
+        _ecmwf_source = "api" if ecmwf else None
+    if gfs is None:
+        gfs = _get_gfs_ensemble_distribution(lat, lon, date_str)
+        _gfs_source = "api" if gfs else None
 
     if ecmwf is None and gfs is None:
         logger.warning(f"No ensemble data for ({lat:.2f},{lon:.2f}) {date_str}")
@@ -773,7 +838,7 @@ def get_temp_distribution_for_event(
 
     if ecmwf is None:
         logger.error(
-            f"ECMWF MISSING for ({lat:.2f},{lon:.2f}) {date_str} — "
+            f"ECMWF MISSING for ({lat:.2f},{lon:.2f}) {date_str} -- "
             f"skipping event. GFS alone is not sufficient for trading. "
             f"Check if the ECMWF model name has changed on the Open-Meteo "
             f"Ensemble API (current: ecmwf_ifs025)."
@@ -783,13 +848,18 @@ def get_temp_distribution_for_event(
 
     if gfs is None:
         logger.error(
-            f"GFS MISSING for ({lat:.2f},{lon:.2f}) {date_str} — "
+            f"GFS MISSING for ({lat:.2f},{lon:.2f}) {date_str} -- "
             f"skipping event. ECMWF alone is not sufficient for trading. "
             f"Check if the GFS model name has changed on the Open-Meteo "
             f"Ensemble API (current: gfs025)."
         )
         _dist_cache[cache_key] = None
         return None
+
+    logger.debug(
+        f"Ensemble sources for ({lat:.2f},{lon:.2f}) {date_str}: "
+        f"ecmwf={_ecmwf_source} gfs={_gfs_source}"
+    )
 
     # ---- Per-model bias correction (applied BEFORE blending) --------------
     # Each model's systematic error is its own — correct ECMWF with the
@@ -829,7 +899,10 @@ def get_temp_distribution_for_event(
             gfs["mu_c"],   gfs["sigma_c"],   GFS_WEIGHT,
         )
         n_members = ecmwf["n"] + gfs["n"]
-        sources   = ["ecmwf", "gfs"]
+        sources   = [
+            f"ecmwf({_ecmwf_source})" if _ecmwf_source else "ecmwf",
+            f"gfs({_gfs_source})" if _gfs_source else "gfs",
+        ]
     elif ecmwf:
         mu_fcst, sigma_fcst = ecmwf["mu_c"], ecmwf["sigma_c"]
         n_members = ecmwf["n"]

@@ -21,7 +21,7 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType
 from py_clob_client.constants import POLYGON
 
-from config import PAPER_TRADE
+from config import PAPER_TRADE, EXIT_HARD_STOP_PCT
 from db import insert_position, mark_outcome_executed, get_latest_snapshot_id_for_contract
 
 logger = logging.getLogger(__name__)
@@ -118,6 +118,8 @@ def execute_signal(signal: dict, client: ClobClient | None = None) -> dict:
         lon              = signal.get("lon"),
         forecast_sigma_c = signal.get("forecast_sigma_c"),
         entry_snapshot_id = entry_snapshot_id,
+        target_size_usdc = signal.get("target_size_usdc"),
+        stop_loss_price = round(entry_price * (1.0 + EXIT_HARD_STOP_PCT), 4) if entry_price > 0 else None,
     )
 
     # -------------------------------------------------------------------------
@@ -131,6 +133,12 @@ def execute_signal(signal: dict, client: ClobClient | None = None) -> dict:
             fill_status = "filled",
         )
         mark_outcome_executed(contract_id, signal.get("scan_timestamp", ""))
+        # Subscribe to real-time price updates for this token
+        try:
+            from price_ws import add_tokens
+            add_tokens([token_id])
+        except Exception:
+            pass
         logger.info(
             f"[PAPER] {side} ${size_usdc:.2f} | {contract_id[:12]} "
             f"@ {entry_price:.4f} | {signal.get('city')} {signal.get('date')} "
@@ -210,6 +218,12 @@ def execute_signal(signal: dict, client: ClobClient | None = None) -> dict:
             shares      = actual_shares,
         )
         mark_outcome_executed(contract_id, signal.get("scan_timestamp", ""))
+        # Subscribe to real-time price updates for this token
+        try:
+            from price_ws import add_tokens
+            add_tokens([token_id])
+        except Exception:
+            pass
 
         return {
             "status":       "placed",

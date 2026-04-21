@@ -263,6 +263,18 @@ def _update_unrealized_pnl(data_api_index: dict) -> int:
 
         current_price = None
 
+        # --- Try WebSocket live price cache first (sub-second freshness) ---
+        try:
+            from price_ws import get_live_price, get_price_age
+            token_key = pos.get("yes_token_id") if side == "YES" else pos.get("no_token_id")
+            if token_key:
+                ws_price = get_live_price(token_key)
+                ws_age = get_price_age(token_key)
+                if ws_price is not None and ws_age is not None and ws_age < 300:
+                    current_price = round(ws_price, 4)
+        except Exception:
+            pass
+
         # --- Live: try Data API first ---
         if not is_paper and data_api_index:
             token_key = pos.get("yes_token_id") if side == "YES" else pos.get("no_token_id")

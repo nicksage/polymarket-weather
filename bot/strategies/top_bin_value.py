@@ -53,10 +53,65 @@ logger = logging.getLogger(__name__)
 # Strategy-specific defaults (overridable via .env)
 import os
 
-TBV_MIN_MODEL_PROB = float(os.getenv("TBV_MIN_MODEL_PROB", "0.10"))
-TBV_CONFIRM_PROB   = float(os.getenv("TBV_CONFIRM_PROB", "0.90"))
-TBV_KELLY_FRACTION = float(os.getenv("TBV_KELLY_FRACTION", "0.25"))
-TBV_TOP_N_BINS     = int(os.getenv("TBV_TOP_N_BINS", str(MAX_BIN_BUYS)))
+TBV_MIN_MODEL_PROB  = float(os.getenv("TBV_MIN_MODEL_PROB", "0.10"))
+TBV_MIN_MARKET_PROB = float(os.getenv("TBV_MIN_MARKET_PROB", "0.05"))
+TBV_CONFIRM_PROB    = float(os.getenv("TBV_CONFIRM_PROB", "0.90"))
+TBV_KELLY_FRACTION  = float(os.getenv("TBV_KELLY_FRACTION", "0.25"))
+TBV_TOP_N_BINS      = int(os.getenv("TBV_TOP_N_BINS", str(MAX_BIN_BUYS)))
+TBV_MAX_UNCERTAINTY   = float(os.getenv("TBV_MAX_UNCERTAINTY", "999.0"))
+
+
+def tbv_qualifies_as_signal(
+    model_prob: float,
+    market_prob: float,
+    city: str | None = None,
+    forecast_sigma_c: float | None = None,
+    _city_error_cache: dict | None = None,
+) -> bool:
+    """Single source of truth: does this bin qualify as a YES signal
+    under the top_bin_value strategy?
+
+    Checks ALL entry criteria:
+      - model_prob >= TBV_MIN_MODEL_PROB
+      - market_prob >= TBV_MIN_MARKET_PROB
+      - forecast_sigma_c <= TBV_MAX_UNCERTAINTY (event-level uncertainty)
+      - city error_std <= TBV_MAX_UNCERTAINTY (city-level historical)
+
+    Called by both the strategy (signal generation) and the dashboard
+    (display).  Adding a new filter here automatically applies everywhere.
+    """
+    if model_prob < TBV_MIN_MODEL_PROB:
+        return False
+    if market_prob < TBV_MIN_MARKET_PROB:
+        return False
+
+    # Event-level forecast uncertainty check
+    if (forecast_sigma_c is not None
+            and TBV_MAX_UNCERTAINTY < 900
+            and forecast_sigma_c > TBV_MAX_UNCERTAINTY):
+        return False
+
+    # City-level historical error std check
+    if city and TBV_MAX_UNCERTAINTY < 900:
+        if _city_error_cache is not None:
+            err_std = _city_error_cache.get(city.lower())
+        else:
+            try:
+                import sqlite3
+                from config import DB_PATH
+                conn = sqlite3.connect(DB_PATH)
+                row = conn.execute(
+                    "SELECT error_std_c FROM city_forecast_accuracy "
+                    "WHERE LOWER(city) = LOWER(?)", (city,)
+                ).fetchone()
+                conn.close()
+                err_std = float(row[0]) if row else None
+            except Exception:
+                err_std = None
+        if err_std is not None and err_std > TBV_MAX_UNCERTAINTY:
+            return False
+
+    return True
 
 
 class TopBinValueStrategy(Strategy):
@@ -81,12 +136,39 @@ class TopBinValueStrategy(Strategy):
         clear_forecast_cache()
         reset_tomorrowio_limit()
 
+        # Load city error std for filtering unreliable cities
+        _city_error_std: dict[str, float] = {}
+        try:
+            import sqlite3
+            from config import DB_PATH
+            _acc_conn = sqlite3.connect(DB_PATH)
+            for _r in _acc_conn.execute(
+                "SELECT city, error_std_c FROM city_forecast_accuracy "
+                "WHERE error_std_c IS NOT NULL"
+            ).fetchall():
+                _city_error_std[_r[0].lower()] = float(_r[1])
+            _acc_conn.close()
+        except Exception:
+            pass
+
         snapshot_group_id = str(uuid.uuid4())
         all_events_analyzed: list[dict] = []
         signals: list[dict] = []
         skipped = 0
+        skipped_error_std = 0
 
         for event in events:
+            # Skip cities with forecast error std above threshold
+            _city_name = (event.get("city") or "").lower()
+            _err_std = _city_error_std.get(_city_name)
+            if _err_std is not None and _err_std > TBV_MAX_UNCERTAINTY:
+                logger.debug(
+                    f"[{self.name}] Skipping {event.get('city')} — "
+                    f"error_std={_err_std:.2f} > {TBV_MAX_UNCERTAINTY}"
+                )
+                skipped_error_std += 1
+                skipped += 1
+                continue
             analysis = self.analyze_event_base(event, bankroll)
             if analysis is None:
                 skipped += 1
@@ -108,17 +190,19 @@ class TopBinValueStrategy(Strategy):
             all_events_analyzed.append(analysis)
 
             # --- Strategy-specific signal selection ---
-            event_signals = self._select_signals(analysis, bankroll, scan_ts)
+            event_signals = self._select_signals(analysis, bankroll, scan_ts, _city_error_std)
             signals.extend(event_signals)
 
         logger.info(
             f"[{self.name}] Scan complete: {len(all_events_analyzed)} events, "
             f"{len(signals)} signals, {skipped} skipped"
+            + (f" ({skipped_error_std} high-error cities)" if skipped_error_std else "")
         )
         return all_events_analyzed, signals
 
     def _select_signals(
         self, analysis: dict, bankroll: float, scan_ts: str,
+        city_error_cache: dict | None = None,
     ) -> list[dict]:
         """Select the model's top bins as signals."""
         from sizing import calculate_kelly_size, compute_confidence_multiplier, compute_time_scale
@@ -149,41 +233,62 @@ class TopBinValueStrategy(Strategy):
                 pass
 
         # Build candidates: bins with valid model_prob, sorted by model_prob desc
-        candidates = []
+        all_candidates = []
         for o in outcomes:
             mp = o.get("model_prob")
             if mp is None:
                 continue
             market_price = float(o.get("market_price") or o.get("yes_price") or 0.5)
-            candidates.append({
+            all_candidates.append({
                 "outcome": o,
                 "model_prob": float(mp),
                 "market_price": market_price,
             })
 
-        candidates.sort(key=lambda c: c["model_prob"], reverse=True)
+        all_candidates.sort(key=lambda c: c["model_prob"], reverse=True)
 
-        # Select top N bins
-        top_n = min(TBV_TOP_N_BINS, len(candidates))
-        selected = candidates[:top_n]
+        # Split into YES candidates (top bins by model_prob) and NO candidates
+        # (remaining bins, sorted by NO probability = 1 - model_prob, descending).
+        # TBV_TOP_N_BINS caps YES positions per event.
+        # MAX_BIN_BUYS caps total (YES + NO) per event (enforced by risk layer,
+        # but we also respect it here to avoid generating excess signals).
+        yes_candidates = []
+        no_candidates = []
+        for c in all_candidates:
+            if (tbv_qualifies_as_signal(
+                    c["model_prob"], c["market_price"],
+                    city=city,
+                    forecast_sigma_c=analysis.get("forecast_sigma_c"),
+                    _city_error_cache=city_error_cache)
+                    and len(yes_candidates) < TBV_TOP_N_BINS):
+                yes_candidates.append(c)
+            else:
+                no_candidates.append(c)
+
+        # NO candidates: sort by NO probability (lowest model_prob = highest NO conviction)
+        no_candidates.sort(key=lambda c: c["model_prob"])
+
+        # Cap NO candidates so total YES + NO <= MAX_BIN_BUYS
+        max_no = max(0, MAX_BIN_BUYS - len(yes_candidates))
+        no_candidates = no_candidates[:max_no]
+
+        selected = yes_candidates + no_candidates
+
+        yes_cids = {c["outcome"].get("contract_id") for c in yes_candidates}
 
         signals = []
         for c in selected:
             o = c["outcome"]
             mp = c["model_prob"]
             market_price = c["market_price"]
+            cid = o.get("contract_id")
 
-            # Determine side based on model probability
-            # High model_prob → YES (we think this bin will win)
-            # Low model_prob → NO (we think this bin won't win)
-            if mp >= TBV_MIN_MODEL_PROB:
+            # YES for top bins (high model_prob), NO for the rest
+            if cid in yes_cids:
                 side = "YES"
                 edge = mp - market_price
             else:
                 side = "NO"
-                edge = (1.0 - mp) - (1.0 - market_price)
-                # For NO side: model_no_prob - market_no_prob
-                # = (1-mp) - (1-market) = market - mp
                 edge = market_price - mp
 
             # Check ALLOWED_SIDES
@@ -277,10 +382,13 @@ class TopBinValueStrategy(Strategy):
                 pass
 
         if signals:
+            n_yes = sum(1 for s in signals if s.get("recommended_side") == "YES")
+            n_no  = sum(1 for s in signals if s.get("recommended_side") == "NO")
+            yes_probs = [round(c["model_prob"]*100, 1) for c in yes_candidates[:3]]
             logger.info(
                 f"[{self.name}] {city} {date_str}: "
-                f"{len(signals)} top-bin signals "
-                f"(top model_probs: {[round(c['model_prob']*100, 1) for c in selected[:3]]}%)"
+                f"{n_yes} YES + {n_no} NO signals "
+                f"(top YES probs: {yes_probs}%)"
             )
 
         return signals
@@ -294,14 +402,31 @@ class TopBinValueStrategy(Strategy):
         signals: list[dict],
         bankroll: float,
     ) -> list[dict]:
-        """Rank by model conviction x price discount x confidence x time.
+        """Rank YES signals first (primary thesis), then NO signals (hedges).
 
-        model_prob drives the ranking — we want the bins the model is most
-        confident about.  Price discount is a bonus when the market
-        underprices a bin, but not required.
+        Within each group, rank by model conviction x price discount x
+        confidence x time efficiency.  YES signals always get first claim
+        on capital because they represent "which bin will win" — the core
+        thesis of this strategy.  NO signals fill remaining slots as hedges.
         """
         if not signals:
             return signals
+
+        # Load city accuracy scores for ranking boost
+        city_scores: dict[str, float] = {}
+        try:
+            import sqlite3
+            from config import DB_PATH
+            conn = sqlite3.connect(DB_PATH)
+            rows = conn.execute(
+                "SELECT city, accuracy_score FROM city_forecast_accuracy"
+            ).fetchall()
+            conn.close()
+            if rows:
+                max_score = max(r[1] for r in rows) or 1.0
+                city_scores = {r[0]: r[1] / max_score for r in rows}
+        except Exception:
+            pass
 
         for s in signals:
             model_prob = float(s.get("model_p") or s.get("model_prob") or 0)
@@ -309,37 +434,71 @@ class TopBinValueStrategy(Strategy):
             confidence = float(s.get("confidence_multiplier") or 1.0)
             side = s.get("recommended_side", "YES")
 
-            # Model conviction — directly use model_prob for YES,
-            # (1 - model_prob) for NO
-            if side == "YES":
-                conviction = model_prob
-                price_discount = max(model_prob - market_price, 0) / max(market_price, 0.01)
-            else:
-                conviction = 1.0 - model_prob
-                no_market = 1.0 - market_price
-                price_discount = max((1.0 - model_prob) - no_market, 0) / max(no_market, 0.01)
-
-            # Price discount bonus: 1.0 when no discount, up to 2.0 when
-            # heavily discounted.  Even at 0 discount, the signal survives
-            # because conviction drives the score.
-            discount_bonus = 1.0 + min(price_discount, 1.0)
-
             hours = self._hours_to_resolution(s)
             time_efficiency = 1.0 / max(hours, 1.0)
 
-            score = conviction * discount_bonus * confidence * time_efficiency
+            city = s.get("city", "")
+            city_accuracy = 0.5 + 0.5 * city_scores.get(city, 0.5)
+
+            if side == "YES":
+                # YES ranking: model probability (conviction that this bin wins)
+                # + bonus when market underprices it
+                conviction = model_prob
+                price_discount = max(model_prob - market_price, 0) / max(market_price, 0.01)
+                discount_bonus = 1.0 + min(price_discount, 1.0)
+                score = conviction * discount_bonus * confidence * time_efficiency * city_accuracy
+            else:
+                # NO ranking: prioritize by profit potential and distance from mu.
+                #
+                # profit_per_dollar: how much we earn per dollar risked if correct.
+                #   NO price = 1 - market_price.  Profit = 1 - no_price = market_price.
+                #   So profit_per_dollar = market_price / (1 - market_price).
+                #   A bin at YES $0.30 (NO cost $0.70) yields $0.30/$0.70 = 43%.
+                #   A bin at YES $0.05 (NO cost $0.95) yields $0.05/$0.95 = 5%.
+                #   Cheaper YES price = better NO trade.
+                #
+                # distance_from_mu: how far this bin is from the model's predicted
+                #   temperature (in sigma units).  Bins far from mu are safer NO
+                #   bets — the temperature is very unlikely to land there.
+                no_price = max(1.0 - market_price, 0.01)
+                profit_per_dollar = market_price / no_price
+
+                # Distance from mu in sigma units (further = safer NO bet)
+                blended_mu = float(s.get("forecast_mu_c") or s.get("adjusted_mu_c") or 0)
+                sigma = float(s.get("forecast_sigma_c") or 1.5)
+                range_low = s.get("range_low")
+                range_high = s.get("range_high")
+                unit = s.get("unit", "celsius")
+                if range_low is not None and range_high is not None:
+                    bin_center = self._to_c((float(range_low) + float(range_high)) / 2.0, unit) or 0
+                else:
+                    bin_center = blended_mu
+                distance_sigma = abs(bin_center - blended_mu) / max(sigma, 0.5)
+                # Normalize: 0 sigma = 0.1, 2+ sigma = 1.0
+                distance_factor = min(0.1 + distance_sigma * 0.45, 1.0)
+
+                conviction = distance_factor
+                discount_bonus = 1.0 + min(profit_per_dollar, 1.0)
+                score = conviction * discount_bonus * confidence * time_efficiency * city_accuracy
 
             s["priority_score"] = round(score, 6)
             s["priority_components"] = {
+                "side":            side,
                 "conviction":      round(conviction, 4),
                 "discount_bonus":  round(discount_bonus, 3),
                 "confidence":      round(confidence, 3),
                 "time_efficiency": round(time_efficiency, 5),
                 "hours_to_resolve": round(hours, 1),
+                "city_accuracy":   round(city_accuracy, 3),
             }
 
-        signals.sort(key=lambda s: s.get("priority_score", 0), reverse=True)
-        return signals
+        # Split into YES and NO, rank each independently, YES first
+        yes_signals = [s for s in signals if s.get("recommended_side") == "YES"]
+        no_signals  = [s for s in signals if s.get("recommended_side") == "NO"]
+        yes_signals.sort(key=lambda s: s.get("priority_score", 0), reverse=True)
+        no_signals.sort(key=lambda s: s.get("priority_score", 0), reverse=True)
+
+        return yes_signals + no_signals
 
     # ------------------------------------------------------------------
     # EXIT
@@ -375,15 +534,16 @@ class TopBinValueStrategy(Strategy):
             eid = pos.get("event_id") or f"{pos.get('city')}|{pos.get('date')}"
             by_event[eid].append(pos)
 
-        # Check for confirmed bins (any bin at >= TBV_CONFIRM_PROB)
+        # Check for confirmed bins (any bin's current market price >= TBV_CONFIRM_PROB)
+        # Uses the monitor-updated current_price on the position, which reflects
+        # the latest market price (YES price for YES positions).
         confirmed_events: dict[str, str] = {}  # event_id -> confirmed contract_id
         for eid, event_positions in by_event.items():
             for pos in event_positions:
-                snap = get_latest_snapshot_for_contract(pos.get("contract_id", ""))
-                if snap and snap.get("model_prob") is not None:
-                    if float(snap["model_prob"]) >= TBV_CONFIRM_PROB:
-                        confirmed_events[eid] = pos.get("contract_id", "")
-                        break
+                curr_price = pos.get("current_price")
+                if curr_price is not None and float(curr_price) >= TBV_CONFIRM_PROB:
+                    confirmed_events[eid] = pos.get("contract_id", "")
+                    break
 
         actions: list[ExitAction] = []
 
@@ -498,27 +658,29 @@ class TopBinValueStrategy(Strategy):
             if contract_id != confirmed_cid and side == "YES":
                 return _make("TOP_BIN_CONFIRMED", "SELL",
                              f"bin {confirmed_cid[:12]} confirmed at "
-                             f">={TBV_CONFIRM_PROB*100:.0f}%",
+                             f"market price >={TBV_CONFIRM_PROB*100:.0f}%",
                              urgency=1)
 
-        # ---- 3. DYING ----
-        if (current_prob < EXIT_DYING_PROB_THRESHOLD
-                and entry_prob > EXIT_DYING_ENTRY_MIN
-                and (entry_prob - current_prob) > 0.10):
+        # ---- 3. DYING — based on market price collapse ----
+        _market_price = float(current_price) if current_price is not None else None
+        _entry_market = float(pos.get("market_prob") or pos.get("entry_price") or 0)
+        if (_market_price is not None
+                and _market_price < EXIT_DYING_PROB_THRESHOLD
+                and _entry_market > EXIT_DYING_ENTRY_MIN
+                and (_entry_market - _market_price) > 0.10):
             return _make("DYING", "SELL",
-                         f"prob_collapse: entry={entry_prob:.3f} "
-                         f"current={current_prob:.3f}",
+                         f"market_collapse: entry_mkt={_entry_market:.3f} "
+                         f"current_mkt={_market_price:.3f}",
                          urgency=1)
 
-        # ---- 4. HARD STOP ----
+        # ---- 4. HARD STOP — uses precomputed SL price ----
         if EXIT_HARD_STOP_ENABLED:
-            entry_cost = entry_price * shares
-            unrealized = float(pos.get("unrealized_pnl") or 0)
-            if entry_cost > 0 and unrealized <= entry_cost * EXIT_HARD_STOP_PCT:
+            sl_price = pos.get("stop_loss_price")
+            if (sl_price is not None and current_price is not None
+                    and float(sl_price) > 0 and float(current_price) <= float(sl_price)):
                 return _make("WEAKENED", "SELL",
-                             f"hard_stop: unrealized={unrealized:.2f} <= "
-                             f"{EXIT_HARD_STOP_PCT*100:.0f}% of "
-                             f"cost={entry_cost:.2f}",
+                             f"hard_stop: price={float(current_price):.4f} <= "
+                             f"SL={float(sl_price):.4f} (entry={entry_price:.4f})",
                              urgency=0)
 
         # ---- 5. HEALTHY ----

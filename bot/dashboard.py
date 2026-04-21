@@ -23,6 +23,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from datetime import datetime
+from streamlit_autorefresh import st_autorefresh
 
 from config import DB_PATH, EDGE_THRESHOLD
 
@@ -30,13 +31,39 @@ from config import DB_PATH, EDGE_THRESHOLD
 # Page config
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Temp Arb Dashboard",
+    page_title="Polymarket Weather Bot",
     page_icon="🌡",
     layout="wide",
 )
 
+_REFRESH_INTERVAL_MS = 60_000
+
+# Hide autorefresh bar + center tabs + add metric padding
+st.markdown("""<style>
+    iframe[title="streamlit_autorefresh.st_autorefresh"] { display: none; }
+    .stTabs [data-baseweb="tab-list"] { justify-content: center; }
+    [data-testid="stMetric"] {
+        padding: 20px 0;
+        text-align: center;
+    }
+    [data-testid="stMetricLabel"] {
+        display: flex;
+        justify-content: center;
+        width: 100%;
+    }
+    [data-testid="stMetricValue"] {
+        display: flex;
+        justify-content: center;
+        width: 100%;
+    }
+    th { text-align: center !important; }
+    .stDataFrame th, .stDataFrame td { text-align: center !important; }
+    [data-testid="stDataFrameResizable"] th { text-align: center !important; }
+</style>""", unsafe_allow_html=True)
+st_autorefresh(interval=_REFRESH_INTERVAL_MS, limit=None, key="global_autorefresh")
+
 # ---------------------------------------------------------------------------
-# Data loaders (cached, auto-refresh every 60 s)
+# Data loaders (cached, auto-refresh every 15 s — synced with autorefresh)
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=60)
@@ -166,6 +193,31 @@ def _signal_badge(side) -> str:
         return "🔴 BUY NO"
     return "—"
 
+def _fmt_date_mmddyyyy(d) -> str:
+    """Format a YYYY-MM-DD date string as MM-DD-YYYY."""
+    if not d:
+        return ""
+    try:
+        parts = str(d)[:10].split("-")
+        if len(parts) == 3:
+            return f"{parts[1]}-{parts[2]}-{parts[0]}"
+    except Exception:
+        pass
+    return str(d)[:10]
+
+
+def _fmt_local_time(lt) -> str:
+    """Reformat the local_time string (stored as 'HH:MM MM-DD-YYYY') to MM-DD-YY HH:MM:SS."""
+    if not lt:
+        return ""
+    try:
+        # Parse the stored format: "HH:MM MM-DD-YYYY"
+        dt = datetime.strptime(str(lt).strip(), "%H:%M %m-%d-%Y")
+        return dt.strftime("%m-%d-%y %H:%M:%S")
+    except Exception:
+        return str(lt)
+
+
 def _fmt_entered(ts) -> str:
     """
     Format an ISO timestamp as 'HH:MM:SS AM/PM MM-DD-YYYY' in US Central time.
@@ -180,7 +232,7 @@ def _fmt_entered(ts) -> str:
         dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
         if dt.tzinfo is not None:
             dt = dt.astimezone(ZoneInfo("America/Chicago"))
-        return dt.strftime("%I:%M:%S %p %m-%d-%Y")
+        return dt.strftime("%m-%d-%y %H:%M:%S")
     except Exception:
         return str(ts)[:19]
 
@@ -282,39 +334,107 @@ def _show_event_modal(city: str, date_str: str, rows: list[dict]) -> None:
 
     rows_sorted = sorted(rows, key=_modal_sort_key, reverse=True)
 
+    # Load open positions for this event to show held status
+    _open_pos_by_contract: dict[str, dict] = {}
+    try:
+        _pos_conn = sqlite3.connect(DB_PATH)
+        _pos_conn.row_factory = sqlite3.Row
+        _pos_rows = _pos_conn.execute(
+            "SELECT contract_id, side, size_usdc, target_size_usdc, unrealized_pnl "
+            "FROM positions WHERE city = ? AND date = ? AND status = 'open' "
+            "AND fill_status = 'filled'",
+            (city, date_str),
+        ).fetchall()
+        _pos_conn.close()
+        for _p in _pos_rows:
+            _open_pos_by_contract[_p["contract_id"]] = dict(_p)
+    except Exception:
+        pass
+
     # Full outcome table
     table_rows = []
     for r in rows_sorted:
         u      = r.get("unit", "celsius")
         mdl    = r.get("model_prob")
-        is_sig = bool(r.get("is_signal"))
-        # Prefer stored yes_price/no_price; fall back to market_price / 1-market_price
         yes_p  = r.get("yes_price") or r.get("market_price")
         no_p   = r.get("no_price")
         if _is_missing(no_p) and not _is_missing(yes_p):
             no_p = 1.0 - float(yes_p)
-        # No model prob = 1 - yes model prob (binary contract identity)
         no_mdl = (1.0 - float(mdl)) if not _is_missing(mdl) else None
         edge   = r.get("edge")
         ev     = r.get("ev")
+
+        # Position status: show HELD YES/NO if we have an open position,
+        # otherwise show the strategy's signal recommendation
+        cid = r.get("contract_id")
+        held = _open_pos_by_contract.get(cid)
+        if held:
+            size = float(held.get("size_usdc") or 0)
+            target = held.get("target_size_usdc")
+            side_label = held["side"]
+            if target and float(target) > size:
+                status = f"HELD {side_label} ${size:.0f}/${float(target):.0f}"
+            else:
+                status = f"HELD {side_label} ${size:.0f}"
+        else:
+            # Show signal based on active strategy's criteria, not edge-disagreement
+            from config import ACTIVE_STRATEGY, ALLOWED_SIDES as _allowed
+            _mdl_p = float(mdl) if not _is_missing(mdl) else 0
+            _show_signal = False
+            _sig_side = ""
+
+            if ACTIVE_STRATEGY == "top_bin_value":
+                from strategies.top_bin_value import tbv_qualifies_as_signal
+                _mkt_p = float(yes_p) if not _is_missing(yes_p) else 0
+                if tbv_qualifies_as_signal(_mdl_p, _mkt_p, city=city,
+                        forecast_sigma_c=float(sigma_c) if not _is_missing(sigma_c) else None):
+                    _sig_side = "YES"
+                    _show_signal = True
+            elif bool(r.get("is_signal")):
+                _sig_side = r.get("recommended_side", "")
+                _show_signal = True
+
+            if _show_signal:
+                if (_allowed == "yes" and _sig_side == "NO") or \
+                   (_allowed == "no" and _sig_side == "YES"):
+                    status = "--"
+                else:
+                    status = _signal_badge(_sig_side)
+            else:
+                status = "--"
+
+        # P&L for held positions
+        _pnl_val = None
+        if held:
+            _pnl_val = float(held.get("unrealized_pnl") or 0)
+
         table_rows.append({
             "Range":            _range_label(r.get("range_low"), r.get("range_high"), u),
-            "Yes Price":        _fmt_pct(yes_p),
-            "No Price":         _fmt_pct(no_p),
+            "Yes Market Prob":  _fmt_pct(yes_p),
             "Yes Model Prob":   _fmt_pct(mdl),
+            "No Market Prob":   _fmt_pct(no_p),
             "No Model Prob":    _fmt_pct(no_mdl),
-            # Edge: decimal gap between model prob and market price (e.g. +0.075 = model
-            # thinks YES is 7.5pp more likely than the market does)
-            "Edge":             _fmt_ev(edge),
-            # EV: expected profit per $1 wagered on the recommended side
-            "EV ($/dollar)":    _fmt_ev(ev),
-            "Signal":           _signal_badge(r.get("recommended_side")) if is_sig else "—",
+            "Status":           status,
+            "P&L":              _pnl_val,
             "Volume":           f"${r.get('volume_usd', 0):,.0f}",
         })
 
     df_modal = pd.DataFrame(table_rows)
+
+    def _color_modal_pnl(val):
+        if val is None or pd.isna(val):
+            return ""
+        if val > 0:
+            return "color: #2ecc71"
+        elif val < 0:
+            return "color: #e74c3c"
+        return ""
+
     st.dataframe(
-        df_modal, width="stretch", hide_index=True,
+        df_modal.style.map(
+            _color_modal_pnl, subset=["P&L"]
+        ).format({"P&L": lambda v: f"${v:+,.2f}" if pd.notna(v) and v is not None else ""}),
+        width="stretch", hide_index=True,
         height=min(120 + len(df_modal) * 38, 520),
     )
 
@@ -330,25 +450,48 @@ def _render_event_card(city: str, date_str: str, grp: pd.DataFrame) -> None:
         else f"Highest temperature in {city} on {date_str}"
     )
     total_vol = grp["volume_usd"].sum() if "volume_usd" in grp.columns else 0
-    n_signals = int(grp["is_signal"].sum()) if "is_signal" in grp.columns else 0
+    # Signal count based on active strategy's criteria
+    from config import ACTIVE_STRATEGY as _card_strategy
+    if _card_strategy == "top_bin_value" and "model_prob" in grp.columns:
+        from strategies.top_bin_value import tbv_qualifies_as_signal as _tbv_card
+        _card_city = grp["city"].iloc[0] if "city" in grp.columns else None
+        n_signals = sum(
+            _tbv_card(
+                float(r.get("model_prob") or 0) if not _is_missing(r.get("model_prob")) else 0,
+                float(r.get("yes_price") or r.get("market_price") or 0) if not _is_missing(r.get("yes_price") or r.get("market_price")) else 0,
+                city=_card_city,
+                forecast_sigma_c=float(r.get("forecast_sigma_c")) if not _is_missing(r.get("forecast_sigma_c")) else None,
+            ) for _, r in grp.iterrows()
+        )
+    else:
+        n_signals = int(grp["is_signal"].sum()) if "is_signal" in grp.columns else 0
 
-    # Top 2 outcomes by model probability (parseable only)
+    # Top 4 outcomes by market probability (captures majority of market view)
     parseable = grp[grp["model_prob"].notna()].copy()
-    top2      = parseable.sort_values("model_prob", ascending=False).head(2)
+    top4      = parseable.sort_values("market_price", ascending=False).head(4)
 
     # Unique stable key
     card_key = f"card_{''.join(c if c.isalnum() else '_' for c in f'{city}_{date_str}')}"
 
     with st.container(border=True):
-        st.markdown(f"**{title}**")
+        st.markdown(f"### {title}")
         st.caption(f"{days_out}d out  ·  ${total_vol:,.0f} Vol.")
 
         st.divider()
 
-        if top2.empty:
+        if top4.empty:
             st.caption("No model data available")
         else:
-            for _, row in top2.iterrows():
+            # Column headers
+            h_lbl, h_mkt, h_mdl = st.columns([2, 1, 1])
+            with h_lbl:
+                st.caption("Range")
+            with h_mkt:
+                st.caption("Market Prob")
+            with h_mdl:
+                st.caption("Model Prob")
+
+            for _, row in top4.iterrows():
                 rl  = _range_label(row.get("range_low"), row.get("range_high"), unit)
                 mkt = row.get("market_price")
                 mdl = row.get("model_prob")
@@ -357,22 +500,16 @@ def _render_event_card(city: str, date_str: str, grp: pd.DataFrame) -> None:
                 with c_lbl:
                     st.markdown(f"**{rl}**")
                 with c_mkt:
-                    st.markdown(f"Market Probability: {_fmt_pct(mkt)}")
+                    st.markdown(_fmt_pct(mkt))
                 with c_mdl:
-                    if not _is_missing(mdl) and not _is_missing(mkt):
-                        color = "green" if float(mdl) > float(mkt) else "red"
-                        # Green = model thinks YES is underpriced (edge to buy YES)
-                        # Red   = model thinks YES is overpriced (edge to buy NO)
-                        st.markdown(f":{color}[Model Probability: {_fmt_pct(mdl)}]")
-                    else:
-                        st.markdown("Model Probability: —")
+                    st.markdown(_fmt_pct(mdl))
 
         st.divider()
 
-        cf_sig, cf_btn = st.columns([2, 1])
+        cf_sig, cf_spacer, cf_btn = st.columns([2, 2, 1])
         with cf_sig:
             if n_signals:
-                st.markdown(f"✨ **{n_signals}** signal(s)")
+                st.markdown(f"**{n_signals}** signal(s)")
             else:
                 st.caption("No signals")
         with cf_btn:
@@ -402,10 +539,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("🌡 Highest-Temperature Arbitrage Dashboard")
+st.markdown("<h1 style='text-align: center;'>🌡 Polymarket Weather Bot</h1>", unsafe_allow_html=True)
 
 last_scan = load_scan_timestamp()
-st.caption(f"Last scan: {last_scan}  |  DB: {DB_PATH}  |  Auto-refresh: 60s")
 
 events_df    = load_events()
 outcomes_df  = load_outcomes(signals_only=False)
@@ -414,10 +550,22 @@ positions_df = load_positions()
 
 n_events   = len(events_df)   if not events_df.empty   else 0
 n_outcomes = len(outcomes_df) if not outcomes_df.empty else 0
-n_signals  = len(signals_df)  if not signals_df.empty  else 0
-n_cities   = outcomes_df["city"].nunique() if not outcomes_df.empty else 0
+# Signal count based on active strategy
+from config import ACTIVE_STRATEGY as _top_strategy
+if _top_strategy == "top_bin_value" and not outcomes_df.empty and "model_prob" in outcomes_df.columns:
+    import os
+    from strategies.top_bin_value import tbv_qualifies_as_signal as _tbv_q
 
-st.divider()
+    def _tbv_check_row(r):
+        _mp_v = float(r.get("model_prob") or 0) if not _is_missing(r.get("model_prob")) else 0
+        _yp_v = float(r.get("yes_price") or r.get("market_price") or 0) if not _is_missing(r.get("yes_price") or r.get("market_price")) else 0
+        _sc_v = float(r.get("forecast_sigma_c")) if not _is_missing(r.get("forecast_sigma_c")) else None
+        return _tbv_q(_mp_v, _yp_v, city=r.get("city"), forecast_sigma_c=_sc_v)
+
+    n_signals = sum(_tbv_check_row(r) for _, r in outcomes_df.iterrows())
+else:
+    n_signals = len(signals_df) if not signals_df.empty else 0
+n_cities   = outcomes_df["city"].nunique() if not outcomes_df.empty else 0
 
 # Partition positions into paper vs live (needed by all tabs)
 if not positions_df.empty:
@@ -527,26 +675,6 @@ with _tab_contract:
 
     _show_refresh_messages()
 
-    m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
-    m1.metric("Events Tracked", n_events)
-    m2.metric("Outcome Ranges", n_outcomes)
-    m3.metric("Trade Signals",  n_signals)
-    m4.metric("Number of Cities", n_cities)
-    m5.metric("Open Paper Trades", len(_paper_open))
-    _paper_capital = _paper_open["size_usdc"].sum() if not _paper_open.empty and "size_usdc" in _paper_open.columns else 0
-    m6.metric("Paper Capital Deployed", f"${_paper_capital:,.2f}")
-    m7.metric("Open Live Trades", len(_live_open))
-    _live_capital = _live_open["size_usdc"].sum() if not _live_open.empty and "size_usdc" in _live_open.columns else 0
-    m8.metric("Capital Deployed", f"${_live_capital:,.2f}")
-
-    _, _refresh_col = st.columns([6, 1])
-    with _refresh_col:
-        if st.button("🔄 Refresh Data", key="refresh_contract",
-                     help="Refresh the deployed capital and contract metrics from the database"):
-            _do_light_refresh()
-
-    st.divider()
-
     if outcomes_df.empty:
         st.info("No data yet. Run the bot or wait for the next scan.")
     else:
@@ -561,68 +689,34 @@ with _tab_contract:
             _sigma_max = _sigma_min + 1.0
 
         # ── Filter panel ─────────────────────────────────────────────────────
-        with st.expander("Filters", expanded=True):
-            r1c1, r1c2, r1c3, r1c4 = st.columns([3, 1, 2, 1])
+        r1c1, r1c2, r1c3 = st.columns([3, 2, 1])
+        sel_sides = ["YES", "NO"]
 
-            with r1c1:
-                sel_cities = st.multiselect(
-                    "City", _all_cities, default=_all_cities, key="f_cities",
-                )
+        with r1c1:
+            sel_cities = st.multiselect(
+                "City", _all_cities, default=_all_cities, key="f_cities",
+            )
 
-            _contracts_mode_current = st.session_state.get("f_contracts", "All Contracts")
-            signals_only_preview = (_contracts_mode_current == "Signals Only")
+        with r1c2:
+            sel_dates = st.multiselect(
+                "Date", _all_dates, default=_all_dates, key="f_dates",
+            )
 
-            with r1c2:
-                if signals_only_preview:
-                    sel_sides = st.multiselect(
-                        "Side", ["YES", "NO"], default=["YES", "NO"], key="f_side",
-                    )
-                else:
-                    st.multiselect(
-                        "Side", ["YES", "NO"], default=["YES", "NO"],
-                        key="f_side_disabled", disabled=True,
-                        help="Switch to 'Signals Only' to filter by side.",
-                    )
-                    sel_sides = ["YES", "NO"]
+        with r1c3:
+            view_mode = st.radio(
+                "View", ["Overview", "List View"], index=0,
+                key="f_view", horizontal=True,
+            )
+            contracts_mode = st.radio(
+                "Contracts", ["All Contracts", "Signals Only"], index=0,
+                key="f_contracts", horizontal=True,
+            )
+            signals_only = (contracts_mode == "Signals Only")
+            geo_mode = st.radio(
+                "Geography", ["Global", "US Only"], index=0,
+                key="f_geo", horizontal=True,
+            )
 
-            with r1c3:
-                sel_dates = st.multiselect(
-                    "Date", _all_dates, default=_all_dates, key="f_dates",
-                )
-
-            with r1c4:
-                view_mode = st.radio(
-                    "View", ["Overview", "List View"], index=0,
-                    key="f_view", horizontal=True,
-                )
-                contracts_mode = st.radio(
-                    "Contracts", ["All Contracts", "Signals Only"], index=0,
-                    key="f_contracts", horizontal=True,
-                )
-                signals_only = (contracts_mode == "Signals Only")
-                geo_mode = st.radio(
-                    "Geography", ["Global", "US Only"], index=0,
-                    key="f_geo", horizontal=True,
-                )
-
-            r3c1, r3c2, r3c3 = st.columns(3)
-            with r3c1:
-                min_ev = st.slider(
-                    "Min EV ($/dollar)", min_value=0.0, max_value=0.50,
-                    value=0.0, step=0.01, format="%.2f", key="f_ev",
-                )
-            with r3c2:
-                min_liq = st.slider(
-                    "Min Liquidity ($)", min_value=0, max_value=10_000,
-                    value=0, step=100, key="f_liq",
-                )
-            with r3c3:
-                sigma_range = st.slider(
-                    "Uncertainty σ range",
-                    min_value=_sigma_min, max_value=_sigma_max,
-                    value=(_sigma_min, _sigma_max),
-                    step=0.1, format="%.1f", key="f_sigma",
-                )
 
         # ── Apply filters ────────────────────────────────────────────────────
         _base = outcomes_df.copy()
@@ -632,26 +726,27 @@ with _tab_contract:
         if sel_dates:
             _base = _base[_base["date"].isin(sel_dates)]
 
-        _base = _base[_base["liquidity_usd"].fillna(0) >= min_liq]
-        _base = _base[
-            _base["forecast_sigma_c"].fillna(_sigma_min).between(sigma_range[0], sigma_range[1])
-        ]
-
         if geo_mode == "US Only" and "is_us" in _base.columns:
             _base = _base[_base["is_us"] == True]
 
+        # Signals-only filter: use active strategy's criteria
         if signals_only:
-            _base = _base[_base["is_signal"] == 1]
-            _base = _base[_base["recommended_side"].isin(sel_sides)]
-            if min_ev > 0:
-                _base = _base[_base["ev"].fillna(0) >= min_ev]
+            if _top_strategy == "top_bin_value":
+                _keep = _base.apply(lambda r: _tbv_check_row(r), axis=1)
+                _base = _base[_keep]
+            else:
+                _base = _base[_base["is_signal"] == 1]
+                _base = _base[_base["recommended_side"].isin(sel_sides)]
 
         if _base.empty:
             st.info("No outcomes match the current filters.")
         else:
             # ── Status line ──────────────────────────────────────────────────
             n_filtered_events  = _base.groupby(["city", "date"]).ngroups
-            n_filtered_signals = int(_base["is_signal"].sum())
+            if _top_strategy == "top_bin_value":
+                n_filtered_signals = sum(_tbv_check_row(r) for _, r in _base.iterrows())
+            else:
+                n_filtered_signals = int(_base["is_signal"].sum())
             st.caption(
                 f"{n_filtered_events} event(s)  ·  {len(_base)} outcome(s)  ·  "
                 f"{n_filtered_signals} signal(s) match current filters"
@@ -679,6 +774,20 @@ with _tab_contract:
                     ["city", "date", "_sort_low"], ascending=[True, True, True], na_position="first"
                 ).drop(columns=["_sort_low"])
 
+                # Load open positions for status display
+                _list_positions: dict[str, dict] = {}
+                try:
+                    _lp_conn = sqlite3.connect(DB_PATH)
+                    _lp_conn.row_factory = sqlite3.Row
+                    for _lp in _lp_conn.execute(
+                        "SELECT contract_id, side, size_usdc FROM positions "
+                        "WHERE status='open' AND fill_status='filled'"
+                    ).fetchall():
+                        _list_positions[_lp["contract_id"]] = dict(_lp)
+                    _lp_conn.close()
+                except Exception:
+                    pass
+
                 display_rows = []
                 for _, row in _list_df.iterrows():
                     unit    = row.get("unit", "celsius")
@@ -688,31 +797,54 @@ with _tab_contract:
                         None if _is_missing(sigma_c)
                         else (float(sigma_c) * 9 / 5 if ev_unit == "fahrenheit" else float(sigma_c))
                     )
-                    sym = "°F" if ev_unit == "fahrenheit" else "°C"
+                    sym = "F" if ev_unit == "fahrenheit" else "C"
+
+                    # Status: same logic as the popup — held > signal > empty
+                    _cid = row.get("contract_id")
+                    _held = _list_positions.get(_cid) if _cid else None
+                    if _held:
+                        _status = f"HELD {_held['side']} ${float(_held['size_usdc']):.0f}"
+                    else:
+                        _mdl_p = float(row.get("model_prob")) if not _is_missing(row.get("model_prob")) else 0
+                        _mkt_p_lv = float(row.get("yes_price") or row.get("market_price") or 0) if not _is_missing(row.get("yes_price") or row.get("market_price")) else 0
+                        if _top_strategy == "top_bin_value":
+                            if _tbv_check_row(row):
+                                _status = _signal_badge("YES")
+                            else:
+                                _status = "--"
+                        elif row.get("is_signal"):
+                            _sig_s = row.get("recommended_side", "")
+                            from config import ALLOWED_SIDES as _lv_allowed
+                            if (_lv_allowed == "yes" and _sig_s == "NO") or \
+                               (_lv_allowed == "no" and _sig_s == "YES"):
+                                _status = "--"
+                            else:
+                                _status = _signal_badge(_sig_s)
+                        else:
+                            _status = "--"
+
                     display_rows.append({
                         "City":            row.get("city", ""),
                         "Date":            row.get("date", ""),
                         "Days Out":        int(row.get("days_ahead", 0)),
                         "Range":           _range_label(row.get("range_low"), row.get("range_high"), unit),
-                        "Side":            row.get("recommended_side", "—") if row.get("is_signal") else "—",
                         "Yes Market Prob": _fmt_pct(row.get("yes_price") or row.get("market_price")),
                         "No Market Prob":  _fmt_pct(row.get("no_price")),
                         "Yes Model Prob":  _fmt_pct(row.get("model_prob")),
                         "No Model Prob":   _fmt_pct((1.0 - float(row["model_prob"])) if not _is_missing(row.get("model_prob")) else None),
                         "Edge":            _fmt_ev(row.get("edge")),
                         "EV ($/dollar)":   _fmt_ev(row.get("ev")),
-                        "Kelly $":         f"${row.get('kelly_size', 0):.2f}" if row.get("is_signal") else "—",
                         "Liquidity":       f"${row.get('liquidity_usd', 0):,.0f}",
                         "Fcst Avg":        _fmt_temp(row.get("forecast_mu_display"), ev_unit),
-                        "Uncertainty":     f"{sigma_disp:.1f}{sym}" if sigma_disp is not None else "—",
-                        "Signal":          _signal_badge(row.get("recommended_side")) if row.get("is_signal") else "—",
-                        "Norm Warn":       "⚠️" if row.get("normalization_warning") else "",
+                        "Uncertainty":     f"{sigma_disp:.1f}{sym}" if sigma_disp is not None else "--",
+                        "Status":          _status,
                     })
 
                 display_df = pd.DataFrame(display_rows)
                 st.dataframe(
-                    display_df.style.map(_highlight_side, subset=["Side"]),
+                    display_df,
                     width="stretch",
+                    hide_index=True,
                     height=min(80 + len(display_df) * 36, 600),
                 )
 
@@ -760,7 +892,19 @@ with _tab_contract:
                     labels   = [_range_label(r.range_low, r.range_high, unit) for _, r in grp.iterrows()]
                     mkt_vals = [v if not _is_missing(v) else 0.0 for v in grp["market_price"].tolist()]
                     mdl_vals = [v if not _is_missing(v) else 0.0 for v in grp["model_prob"].tolist()]
-                    n_sig    = int(grp["is_signal"].sum())
+                    if _top_strategy == "top_bin_value" and "model_prob" in grp.columns:
+                        from strategies.top_bin_value import tbv_qualifies_as_signal as _tbv_ch
+                        _ch_city = grp["city"].iloc[0] if "city" in grp.columns else None
+                        n_sig = sum(
+                            _tbv_ch(
+                                float(r.get("model_prob") or 0) if not _is_missing(r.get("model_prob")) else 0,
+                                float(r.get("yes_price") or r.get("market_price") or 0) if not _is_missing(r.get("yes_price") or r.get("market_price")) else 0,
+                                city=_ch_city,
+                                forecast_sigma_c=float(r.get("forecast_sigma_c")) if not _is_missing(r.get("forecast_sigma_c")) else None,
+                            ) for _, r in grp.iterrows()
+                        )
+                    else:
+                        n_sig = int(grp["is_signal"].sum())
 
                     with st.expander(
                         f"**{city}** — {date_str}  ({days_out}d out)  "
@@ -876,6 +1020,24 @@ with _tab_contract:
 # ===========================================================================
 
 def _build_open_rows(df):
+    # Load current model probabilities from latest scan
+    _current_model_probs: dict[str, float] = {}
+    try:
+        _cmp_conn = sqlite3.connect(DB_PATH)
+        _cmp_ts = _cmp_conn.execute(
+            "SELECT MAX(scan_timestamp) FROM temp_outcomes"
+        ).fetchone()[0]
+        if _cmp_ts:
+            for _r in _cmp_conn.execute(
+                "SELECT contract_id, model_prob FROM temp_outcomes "
+                "WHERE scan_timestamp = ? AND model_prob IS NOT NULL",
+                (_cmp_ts,),
+            ).fetchall():
+                _current_model_probs[_r[0]] = float(_r[1])
+        _cmp_conn.close()
+    except Exception:
+        pass
+
     rows = []
     for _, p in df.iterrows():
         entry  = p.get("entry_price")
@@ -886,24 +1048,31 @@ def _build_open_rows(df):
         _range = _range_label(p.get("range_low"), p.get("range_high"), _unit) if (
             not _is_missing(p.get("range_low")) or not _is_missing(p.get("range_high"))
         ) else (p.get("question") or "")[:30]
+
+        _cid = p.get("contract_id")
+        _curr_model = _current_model_probs.get(_cid)
+        _curr_market = float(curr) if curr else None
+
         rows.append({
-            "City":           p.get("city", ""),
-            "Date":           p.get("date", ""),
-            "Local Time":     p.get("local_time") or "—",
-            "Question":       p.get("question") or "",
-            "Side":           p.get("side", ""),
-            "Fill":           p.get("fill_status", "filled"),
-            "Range":          _range,
-            "Size ($)":       f"${p.get('size_usdc', 0):.2f}",
-            "Shares":         f"{shares:.2f}" if shares else "—",
-            "Entered":        _fmt_entered(p.get("entry_time")),
-            "Entry Price":    f"{entry:.4f}" if entry else "—",
-            "Current Price":  f"{curr:.4f}" if curr else "—",
-            "Unrealized P&L": f"${unreal:+.4f}" if unreal is not None else "—",
-            "Model Prob":     _fmt_pct(p.get("model_prob")),
-            "Market Prob":    _fmt_pct(p.get("market_prob")),
-            "EV":             _fmt_ev(p.get("ev")),
-            "Uncertainty":    f"{p['forecast_sigma_c']:.2f}°C" if not _is_missing(p.get("forecast_sigma_c")) else "—",
+            "City":              p.get("city", ""),
+            "Date":              _fmt_date_mmddyyyy(p.get("date")),
+            "Local Time":        _fmt_local_time(p.get("local_time")),
+            "Question":          p.get("question") or "",
+            "Side":              p.get("side", ""),
+            "Fill":              p.get("fill_status", "filled"),
+            "Range":             _range,
+            "Size ($)":          f"${p.get('size_usdc', 0):.2f}",
+            "Shares":            f"{shares:.2f}" if shares else "",
+            "Entered":           _fmt_entered(p.get("entry_time")),
+            "Entry Price":       f"{entry:.4f}" if entry else "",
+            "Current Price":     f"{curr:.4f}" if curr else "",
+            "SL Price":          f"{float(p.get('stop_loss_price')):.4f}" if not _is_missing(p.get("stop_loss_price")) else "",
+            "Unrealized P&L":    f"${unreal:+.4f}" if unreal is not None else "",
+            "Entry Model Prob":  _fmt_pct(p.get("model_prob")),
+            "Curr Model Prob":   _fmt_pct(_curr_model),
+            "Entry Market Prob": _fmt_pct(p.get("market_prob")),
+            "Curr Market Prob":  _fmt_pct(_curr_market),
+            "Entry Uncertainty":  f"{p['forecast_sigma_c']:.2f}C" if not _is_missing(p.get("forecast_sigma_c")) else "",
         })
     return rows
 
@@ -917,17 +1086,19 @@ def _build_closed_rows(df):
         ) else (p.get("question") or "")[:30]
         rows.append({
             "City":         p.get("city", ""),
-            "Date":         p.get("date", ""),
-            "Question":     (p.get("question") or "")[:40],
+            "Date":         _fmt_date_mmddyyyy(p.get("date")),
+            "Question":     p.get("question") or "",
             "Side":         p.get("side", ""),
             "Range":        _range,
             "Size ($)":     f"${p.get('size_usdc', 0):.2f}",
+            "Realized P&L": f"${p.get('pnl', 0):+.4f}" if p.get("pnl") is not None else "",
             "Entry":        f"{p.get('entry_price', 0):.4f}",
-            "Exit":         f"{p.get('exit_price', 0):.4f}" if p.get("exit_price") is not None else "—",
-            "Realized P&L": f"${p.get('pnl', 0):+.4f}" if p.get("pnl") is not None else "—",
+            "SL Price":     f"{float(p.get('stop_loss_price')):.4f}" if not _is_missing(p.get("stop_loss_price")) else "",
+            "Exit":         f"{p.get('exit_price', 0):.4f}" if p.get("exit_price") is not None else "",
             "Entered":      _fmt_entered(p.get("entry_time")),
             "Closed":       _fmt_entered(p.get("exit_time")),
-            "Uncertainty":  f"{p['forecast_sigma_c']:.2f}°C" if not _is_missing(p.get("forecast_sigma_c")) else "—",
+            "Entry Uncertainty":  f"{p['forecast_sigma_c']:.2f}C" if not _is_missing(p.get("forecast_sigma_c")) else "",
+            "Exit Reason":  p.get("exit_reason") or "",
         })
     return rows
 
@@ -1167,6 +1338,92 @@ _SIGMA_BUCKET_ORDER = [
 ]
 
 
+def _render_pnl_by_date(df: pd.DataFrame) -> None:
+    """Bar chart of realized + unrealized P&L grouped by contract date."""
+    if df.empty:
+        st.info("No trade data yet.")
+        return
+
+    import plotly.graph_objects as go
+
+    # Use 'date' (contract date) for grouping; fall back to exit_time date for closed
+    _df = df.copy()
+    if "date" not in _df.columns or _df["date"].isna().all():
+        st.info("No date data available for P&L breakdown.")
+        return
+
+    # Compute P&L per position: use pnl for closed, unrealized_pnl for open
+    def _get_pnl(row):
+        if row.get("status") == "closed" and pd.notna(row.get("pnl")):
+            return float(row["pnl"])
+        if pd.notna(row.get("unrealized_pnl")):
+            return float(row["unrealized_pnl"])
+        return 0.0
+
+    _df["_pnl"] = _df.apply(_get_pnl, axis=1)
+    _grouped = _df.groupby("date")["_pnl"].sum().sort_index()
+
+    if _grouped.empty:
+        st.info("No P&L data to display.")
+        return
+
+    _colors = ["#2ecc71" if v >= 0 else "#e74c3c" for v in _grouped.values]
+    _cumulative = _grouped.cumsum()
+
+    _col_bar, _col_line = st.columns(2)
+
+    with _col_bar:
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=_grouped.index,
+            y=_grouped.values,
+            marker_color=_colors,
+            text=[f"${v:+,.0f}" for v in _grouped.values],
+            textposition="outside",
+        ))
+        fig.update_layout(
+            title="Daily P&L",
+            xaxis_title="Contract Date",
+            yaxis_title="P&L ($)",
+            height=350,
+            margin=dict(t=40, b=40),
+        )
+        fig.add_hline(y=0, line_dash="solid", line_color="gray", opacity=0.5)
+        st.plotly_chart(fig, width="stretch")
+
+    with _col_line:
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(
+            x=_cumulative.index,
+            y=_cumulative.values,
+            mode="lines+markers",
+            name="Cumulative P&L",
+            line=dict(color="#3498db", width=3),
+            marker=dict(size=6),
+            text=[f"${v:+,.0f}" for v in _cumulative.values],
+            textposition="top center",
+        ))
+        fig2.update_layout(
+            title="Cumulative P&L",
+            xaxis_title="Contract Date",
+            yaxis_title="Cumulative P&L ($)",
+            height=350,
+            margin=dict(t=40, b=40),
+        )
+        fig2.add_hline(y=0, line_dash="solid", line_color="gray", opacity=0.5)
+        st.plotly_chart(fig2, width="stretch")
+
+    # Summary line
+    _total = _grouped.sum()
+    _winning_dates = (_grouped > 0).sum()
+    _losing_dates = (_grouped < 0).sum()
+    st.caption(
+        f"Total: ${_total:+,.2f} | "
+        f"Winning dates: {_winning_dates} | "
+        f"Losing dates: {_losing_dates}"
+    )
+
+
 def _render_sigma_breakdown(df: pd.DataFrame) -> None:
     """
     Render a return-by-uncertainty-tier breakdown table and bar chart.
@@ -1251,6 +1508,12 @@ def _render_sigma_breakdown(df: pd.DataFrame) -> None:
 
 # (moved above tab blocks so it can be called from any tab)
 
+    st.divider()
+    _cc1, _cc2, _cc3 = st.columns([2, 1, 2])
+    with _cc2:
+        if st.button("Refresh Data", key="refresh_contract", type="primary"):
+            _do_light_refresh()
+
 
 # ===========================================================================
 # TAB 2 — Paper Trade Data
@@ -1259,41 +1522,56 @@ with _tab_paper:
 
     _show_refresh_messages()
 
+    _paper_capital = _paper_open["size_usdc"].sum() if not _paper_open.empty and "size_usdc" in _paper_open.columns else 0
+
+    # Compute P&L metrics across all paper positions (open + closed)
+    _paper_all_pnl = []
+    if not _paper_open.empty and "unrealized_pnl" in _paper_open.columns:
+        _paper_all_pnl.extend(_paper_open["unrealized_pnl"].dropna().tolist())
+    if not _paper_closed.empty and "pnl" in _paper_closed.columns:
+        _paper_all_pnl.extend(_paper_closed["pnl"].dropna().tolist())
+    _p_winning = sum(1 for p in _paper_all_pnl if float(p) > 0)
+    _p_losing = sum(1 for p in _paper_all_pnl if float(p) < 0)
+    _p_max_profit = max((float(p) for p in _paper_all_pnl), default=0)
+    _p_total_pnl = sum(float(p) for p in _paper_all_pnl)
+
+    _p_closed_count = len(_paper_closed) if not _paper_closed.empty else 0
+    _pm1, _pm2, _pm3, _pm4, _pm5, _pm6, _pm7 = st.columns(7)
+    _pm1.metric("Open Trades", len(_paper_open))
+    _pm2.metric("Closed Trades", _p_closed_count)
+    _pm3.metric("Capital Deployed", f"${_paper_capital:,.2f}")
+    _pm4.metric("Winning Trades", _p_winning)
+    _pm5.metric("Losing Trades", _p_losing)
+    _pm6.metric("Max Profit", f"${_p_max_profit:,.2f}")
+    _pm7.metric("Total P&L", f"${_p_total_pnl:+,.2f}")
+
     _paper_all = (
         positions_df[positions_df["is_paper"] == 1].copy()
         if not positions_df.empty and "is_paper" in positions_df.columns
         else pd.DataFrame()
     )
+    _paper_stats = _compute_trade_stats(_paper_all)
     st.dataframe(
-        _compute_trade_stats(_paper_all),
-        hide_index=True, width="stretch", height=540,
+        _paper_stats,
+        hide_index=True, width="stretch",
+        height=38 + len(_paper_stats) * 35,
     )
     st.divider()
 
-    st.subheader("Return by Forecast Uncertainty")
-    _render_sigma_breakdown(_paper_all)
+    st.subheader("Return by Date")
+    _render_pnl_by_date(_paper_all)
     st.divider()
 
     # ── Open Positions ────────────────────────────────────────────────────────
     st.subheader("Open Positions")
     if not _paper_open.empty:
         _df = pd.DataFrame(_build_open_rows(_paper_open))
+        _df = _df.sort_values(["City", "Date", "Range"], ascending=True, na_position="last")
         st.dataframe(
             _df.style.map(_highlight_side, subset=["Side"]).map(_color_pnl, subset=["Unrealized P&L"]),
-            width="stretch", height=min(80 + len(_df) * 36, 500),
+            width="stretch", hide_index=True, height=min(80 + len(_df) * 36, 500),
             column_config={"Question": st.column_config.TextColumn("Question", width="large")},
         )
-        _, _del_col = st.columns([6, 1])
-        with _del_col:
-            if st.button("🗑 Delete All", key="del_paper_open",
-                         help="Delete all open paper trade records from the database"):
-                import sqlite3 as _sl
-                _c = _sl.connect(DB_PATH)
-                _c.execute("DELETE FROM positions WHERE is_paper = 1 AND status = 'open'")
-                _c.commit()
-                _c.close()
-                st.cache_data.clear()
-                st.rerun()
     else:
         st.info("No open paper positions")
 
@@ -1303,22 +1581,12 @@ with _tab_paper:
     st.subheader("Closed Positions")
     if not _paper_closed.empty:
         _df = pd.DataFrame(_build_closed_rows(_paper_closed))
+        _df = _df.sort_values(["City", "Date", "Range"], ascending=True, na_position="last")
         st.dataframe(
             _df.style.map(_highlight_side, subset=["Side"]).map(_color_pnl, subset=["Realized P&L"]),
-            width="stretch", height=min(80 + len(_df) * 36, 400),
+            width="stretch", hide_index=True, height=min(80 + len(_df) * 36, 400),
             column_config={"Question": st.column_config.TextColumn("Question", width="large")},
         )
-        _, _del_col = st.columns([6, 1])
-        with _del_col:
-            if st.button("🗑 Delete All", key="del_paper_closed",
-                         help="Delete all closed paper trade records from the database"):
-                import sqlite3 as _sl
-                _c = _sl.connect(DB_PATH)
-                _c.execute("DELETE FROM positions WHERE is_paper = 1 AND status = 'closed'")
-                _c.commit()
-                _c.close()
-                st.cache_data.clear()
-                st.rerun()
     else:
         st.info("No closed paper positions yet")
 
@@ -1341,8 +1609,10 @@ with _tab_paper:
             st.dataframe(pd.DataFrame(_can_rows), width="stretch", hide_index=True)
 
     st.divider()
-    if st.button("🔄 Refresh Data", key="refresh_paper"):
-        _do_refresh("refresh_paper")
+    _pc1, _pc2, _pc3 = st.columns([2, 1, 2])
+    with _pc2:
+        if st.button("Refresh Data", key="refresh_paper", type="primary"):
+            _do_refresh("refresh_paper")
 
 
 # ===========================================================================
@@ -1352,28 +1622,53 @@ with _tab_live:
 
     _show_refresh_messages()
 
+    _live_capital = _live_open["size_usdc"].sum() if not _live_open.empty and "size_usdc" in _live_open.columns else 0
+
+    _live_all_pnl = []
+    if not _live_open.empty and "unrealized_pnl" in _live_open.columns:
+        _live_all_pnl.extend(_live_open["unrealized_pnl"].dropna().tolist())
+    if not _live_closed.empty and "pnl" in _live_closed.columns:
+        _live_all_pnl.extend(_live_closed["pnl"].dropna().tolist())
+    _l_winning = sum(1 for p in _live_all_pnl if float(p) > 0)
+    _l_losing = sum(1 for p in _live_all_pnl if float(p) < 0)
+    _l_max_profit = max((float(p) for p in _live_all_pnl), default=0)
+    _l_total_pnl = sum(float(p) for p in _live_all_pnl)
+
+    _l_closed_count = len(_live_closed) if not _live_closed.empty else 0
+    _lm1, _lm2, _lm3, _lm4, _lm5, _lm6, _lm7 = st.columns(7)
+    _lm1.metric("Open Trades", len(_live_open))
+    _lm2.metric("Closed Trades", _l_closed_count)
+    _lm3.metric("Capital Deployed", f"${_live_capital:,.2f}")
+    _lm4.metric("Winning Trades", _l_winning)
+    _lm5.metric("Losing Trades", _l_losing)
+    _lm6.metric("Max Profit", f"${_l_max_profit:,.2f}")
+    _lm7.metric("Total P&L", f"${_l_total_pnl:+,.2f}")
+
     _live_all = (
         positions_df[positions_df["is_paper"] == 0].copy()
         if not positions_df.empty and "is_paper" in positions_df.columns
         else pd.DataFrame()
     )
+    _live_stats = _compute_trade_stats(_live_all)
     st.dataframe(
-        _compute_trade_stats(_live_all),
-        hide_index=True, width="stretch", height=540,
+        _live_stats,
+        hide_index=True, width="stretch",
+        height=38 + len(_live_stats) * 35,
     )
     st.divider()
 
-    st.subheader("Return by Forecast Uncertainty")
-    _render_sigma_breakdown(_live_all)
+    st.subheader("Return by Date")
+    _render_pnl_by_date(_live_all)
     st.divider()
 
     # ── Open Positions ────────────────────────────────────────────────────────
     st.subheader("Open Positions")
     if not _live_open.empty:
         _df = pd.DataFrame(_build_open_rows(_live_open))
+        _df = _df.sort_values(["City", "Date", "Range"], ascending=True, na_position="last")
         st.dataframe(
             _df.style.map(_highlight_side, subset=["Side"]).map(_color_pnl, subset=["Unrealized P&L"]),
-            width="stretch", height=min(80 + len(_df) * 36, 500),
+            width="stretch", hide_index=True, height=min(80 + len(_df) * 36, 500),
             column_config={"Question": st.column_config.TextColumn("Question", width="large")},
         )
         pass
@@ -1386,9 +1681,10 @@ with _tab_live:
     st.subheader("Closed Positions")
     if not _live_closed.empty:
         _df = pd.DataFrame(_build_closed_rows(_live_closed))
+        _df = _df.sort_values(["City", "Date", "Range"], ascending=True, na_position="last")
         st.dataframe(
             _df.style.map(_highlight_side, subset=["Side"]).map(_color_pnl, subset=["Realized P&L"]),
-            width="stretch", height=min(80 + len(_df) * 36, 400),
+            width="stretch", hide_index=True, height=min(80 + len(_df) * 36, 400),
             column_config={"Question": st.column_config.TextColumn("Question", width="large")},
         )
     else:
@@ -1413,8 +1709,10 @@ with _tab_live:
             st.dataframe(pd.DataFrame(_can_rows), width="stretch", hide_index=True)
 
     st.divider()
-    if st.button("🔄 Refresh Data", key="refresh_live"):
-        _do_refresh("refresh_live")
+    _lc1, _lc2, _lc3 = st.columns([2, 1, 2])
+    with _lc2:
+        if st.button("Refresh Data", key="refresh_live", type="primary"):
+            _do_refresh("refresh_live")
 
 # ===========================================================================
 # TAB 4 — Forecast Accuracy
@@ -1423,6 +1721,87 @@ with _tab_accuracy:
 
     _show_refresh_messages()
 
+    # ---- City Accuracy Ranking Table ----
+    st.subheader("City Forecast Accuracy Ranking")
+    st.caption(
+        "Composite score (0-100) combining MAE, error stability, % within 1-2C, "
+        "and tail risk.  Higher = more accurate and tradeable.  Rebuilt daily."
+    )
+
+    @st.cache_data(ttl=300)
+    def _load_city_accuracy():
+        conn = sqlite3.connect(DB_PATH)
+        return pd.read_sql(
+            "SELECT * FROM city_forecast_accuracy ORDER BY accuracy_score DESC",
+            conn,
+        )
+
+    _acc_df = _load_city_accuracy()
+    if not _acc_df.empty:
+        # Get list of cities with active Polymarket contracts
+        @st.cache_data(ttl=300)
+        def _get_active_market_cities():
+            conn = sqlite3.connect(DB_PATH)
+            rows = conn.execute(
+                "SELECT DISTINCT city FROM forecast_runs "
+                "WHERE date >= DATE('now') AND city IS NOT NULL"
+            ).fetchall()
+            return {r[0].lower() for r in rows}
+
+        _active_cities = _get_active_market_cities()
+
+        # ---- Filter ----
+        _only_active = st.checkbox("Active markets only", value=True,
+                                   key="acc_active_only")
+
+        # Apply filter
+        _filtered = _acc_df.copy()
+        if _only_active:
+            _filtered = _filtered[_filtered["city"].str.lower().isin(_active_cities)]
+
+        st.caption(f"Showing {len(_filtered)} of {len(_acc_df)} cities")
+
+        # Format for display
+        _acc_cols = [
+            "city", "accuracy_score", "mae_c", "rmse_c", "bias_c",
+            "error_std_c", "max_error_c",
+            "pct_within_1c", "pct_within_2c",
+            "pct_underpredicted", "pct_overpredicted",
+        ]
+        _acc_names = [
+            "City", "Score", "MAE", "RMSE", "Bias",
+            "Error Std", "Max Error",
+            "< 1C", "< 2C",
+            "% Under", "% Over",
+        ]
+        if "avg_uncertainty_c" in _filtered.columns:
+            _acc_cols.append("avg_uncertainty_c")
+            _acc_names.append("Avg Uncertainty")
+        _display_acc = _filtered[_acc_cols].copy()
+        _display_acc.columns = _acc_names
+        for col in ["< 1C", "< 2C", "% Under", "% Over"]:
+            _display_acc[col] = (_display_acc[col] * 100).round(0).astype(int).astype(str) + "%"
+        _float_cols = ["Score", "MAE", "RMSE", "Bias", "Error Std", "Max Error"]
+        if "Avg Uncertainty" in _display_acc.columns:
+            _float_cols.append("Avg Uncertainty")
+        for col in _float_cols:
+            _display_acc[col] = _display_acc[col].apply(
+                lambda v: f"{v:.2f}" if pd.notna(v) else "--"
+            )
+
+        st.dataframe(
+            _display_acc,
+            hide_index=True, width="stretch",
+            height=min(80 + len(_display_acc) * 36, 500),
+        )
+    else:
+        _only_active = False
+        _active_cities = set()
+        st.info("No city accuracy data yet. Run the bot for at least one bias update cycle.")
+
+    st.divider()
+
+    # ---- Per-City Forecast vs Actual Chart ----
     st.subheader("Forecast vs Actual High Temperature")
     st.caption(
         "Compares the model's blended forecast (ECMWF + GFS) against the "
@@ -1437,24 +1816,35 @@ with _tab_accuracy:
         # Use historical_forecasts_previous_runs (model predictions at lead=3)
         # paired with historical_observed_daily (actual tmax).
         # Also include temp_events forecast_mu for recent dates.
+        # Use JOINs instead of correlated subqueries for performance.
+        # Pre-filter historical_forecasts to latest lead per (city, date, model)
+        # using a CTE, then join once.
         df = pd.read_sql("""
+            WITH ecmwf_latest AS (
+                SELECT city, date, forecast_tempmax_c,
+                       ROW_NUMBER() OVER (PARTITION BY city, date ORDER BY lead_days ASC) rn
+                FROM historical_forecasts_previous_runs
+                WHERE model = 'ecmwf_ifs025'
+                  AND date >= DATE('now', '-30 days')
+            ),
+            gfs_latest AS (
+                SELECT city, date, forecast_tempmax_c,
+                       ROW_NUMBER() OVER (PARTITION BY city, date ORDER BY lead_days ASC) rn
+                FROM historical_forecasts_previous_runs
+                WHERE model = 'gfs_global'
+                  AND date >= DATE('now', '-30 days')
+            )
             SELECT
                 h.city,
                 h.date,
                 h.tempmax_c AS actual_c,
-                -- ECMWF prediction
-                (SELECT f.forecast_tempmax_c
-                 FROM historical_forecasts_previous_runs f
-                 WHERE f.city = h.city AND f.date = h.date
-                   AND f.model = 'ecmwf_ifs025'
-                 ORDER BY f.lead_days ASC LIMIT 1) AS ecmwf_c,
-                -- GFS prediction
-                (SELECT f.forecast_tempmax_c
-                 FROM historical_forecasts_previous_runs f
-                 WHERE f.city = h.city AND f.date = h.date
-                   AND f.model = 'gfs_global'
-                 ORDER BY f.lead_days ASC LIMIT 1) AS gfs_c
+                e.forecast_tempmax_c AS ecmwf_c,
+                g.forecast_tempmax_c AS gfs_c
             FROM historical_observed_daily h
+            LEFT JOIN ecmwf_latest e
+              ON LOWER(e.city) = LOWER(h.city) AND e.date = h.date AND e.rn = 1
+            LEFT JOIN gfs_latest g
+              ON LOWER(g.city) = LOWER(h.city) AND g.date = h.date AND g.rn = 1
             WHERE h.tempmax_c IS NOT NULL
               AND h.date >= DATE('now', '-30 days')
             ORDER BY h.city, h.date
@@ -1469,105 +1859,379 @@ with _tab_accuracy:
         df["error_c"] = df["actual_c"] - df["blended_c"]
         return df
 
-    accuracy_df = _load_accuracy_data()
+    @st.cache_data(ttl=300)
+    def _load_future_forecast_data():
+        """Load forecast data for future dates (no actual temp yet).
 
-    if accuracy_df.empty:
-        st.info("No forecast vs actual data available yet.")
+        Uses temp_events.forecast_mu_c for the bias-corrected blended average,
+        and forecast_runs for the raw per-model values (ECMWF/GFS before bias).
+        """
+        conn = sqlite3.connect(DB_PATH)
+        df = pd.read_sql("""
+            SELECT
+                te.city,
+                te.date,
+                te.forecast_mu_c AS blended_c,
+                fr_e.forecast_mu_c AS ecmwf_c,
+                fr_g.forecast_mu_c AS gfs_c
+            FROM (
+                SELECT city, date, forecast_mu_c,
+                       ROW_NUMBER() OVER (PARTITION BY city, date ORDER BY scan_timestamp DESC) rn
+                FROM temp_events
+                WHERE date >= DATE('now')
+            ) te
+            LEFT JOIN (
+                SELECT city, date, forecast_mu_c,
+                       ROW_NUMBER() OVER (PARTITION BY city, date ORDER BY pulled_at DESC) rn
+                FROM forecast_runs WHERE source = 'ecmwf'
+            ) fr_e ON LOWER(fr_e.city) = LOWER(te.city) AND fr_e.date = te.date AND fr_e.rn = 1
+            LEFT JOIN (
+                SELECT city, date, forecast_mu_c,
+                       ROW_NUMBER() OVER (PARTITION BY city, date ORDER BY pulled_at DESC) rn
+                FROM forecast_runs WHERE source = 'gfs'
+            ) fr_g ON LOWER(fr_g.city) = LOWER(te.city) AND fr_g.date = te.date AND fr_g.rn = 1
+            WHERE te.rn = 1
+            ORDER BY te.city, te.date
+        """, conn)
+        if df.empty:
+            return df
+        # Fill blended from raw if temp_events didn't have it
+        mask_no_blend = df["blended_c"].isna()
+        mask_both = df["ecmwf_c"].notna() & df["gfs_c"].notna()
+        df.loc[mask_no_blend & mask_both, "blended_c"] = (
+            df.loc[mask_no_blend & mask_both, "ecmwf_c"] * 0.65 +
+            df.loc[mask_no_blend & mask_both, "gfs_c"] * 0.35
+        )
+        # Unbiased blend: always computed from raw ECMWF/GFS (no bias correction)
+        df["unbiased_blend_c"] = None
+        mask_ub = df["ecmwf_c"].notna() & df["gfs_c"].notna()
+        df.loc[mask_ub, "unbiased_blend_c"] = (
+            df.loc[mask_ub, "ecmwf_c"] * 0.65 +
+            df.loc[mask_ub, "gfs_c"] * 0.35
+        )
+        df.loc[~mask_ub & df["ecmwf_c"].notna(), "unbiased_blend_c"] = df.loc[~mask_ub & df["ecmwf_c"].notna(), "ecmwf_c"]
+        df.loc[~mask_ub & df["gfs_c"].notna(), "unbiased_blend_c"] = df.loc[~mask_ub & df["gfs_c"].notna(), "gfs_c"]
+        df["actual_c"] = None
+        df["error_c"] = None
+        return df
+
+    # Build city list from both data sources for the shared selector
+    @st.cache_data(ttl=300)
+    def _get_all_accuracy_cities():
+        conn = sqlite3.connect(DB_PATH)
+        c1 = pd.read_sql("SELECT DISTINCT city FROM historical_observed_daily WHERE tempmax_c IS NOT NULL", conn)
+        c2 = pd.read_sql("SELECT DISTINCT city FROM forecast_runs", conn)
+        all_c = pd.concat([c1, c2])["city"].str.title().dropna().unique().tolist()
+        return sorted(all_c)
+
+    _all_acc_cities = _get_all_accuracy_cities()
+    if not _all_acc_cities:
+        st.info("No forecast or observation data available yet.")
     else:
-        # City selector
-        all_cities = sorted(accuracy_df["city"].dropna().unique().tolist())
-        sel_city = st.selectbox("Select City", all_cities, key="accuracy_city")
-
-        city_df = accuracy_df[accuracy_df["city"] == sel_city].copy()
-        city_df = city_df.dropna(subset=["actual_c", "blended_c"])
-        city_df["date"] = pd.to_datetime(city_df["date"])
-        city_df = city_df.sort_values("date")
-
-        if city_df.empty:
-            st.warning(f"No paired forecast+actual data for {sel_city}")
+        # Filter city dropdown by active markets if the checkbox is checked
+        if _only_active:
+            _chart_cities = sorted([c for c in _all_acc_cities if c.lower() in _active_cities])
         else:
-            import plotly.graph_objects as go
+            _chart_cities = _all_acc_cities
+        sel_city = st.selectbox("Select City", _chart_cities, key="accuracy_city")
 
-            fig = go.Figure()
+        import plotly.graph_objects as go
+        from datetime import date as _date_cls
 
-            # Actual observed
-            fig.add_trace(go.Scatter(
-                x=city_df["date"], y=city_df["actual_c"],
+        future_df = _load_future_forecast_data()
+        if not future_df.empty:
+            future_df["city"] = future_df["city"].str.title()
+        _fut = future_df[future_df["city"] == sel_city].copy() if not future_df.empty else pd.DataFrame()
+
+        # ---- Chart 0: Unbiased Upcoming Forecast ----
+        st.markdown("#### Unbiased Upcoming Forecast")
+        st.caption("Raw ECMWF + GFS blend (65/35) without bias correction applied.")
+        if not _fut.empty:
+            _fut_ub = _fut.copy()
+            _fut_ub["date"] = pd.to_datetime(_fut_ub["date"])
+            _fut_ub = _fut_ub.sort_values("date")
+            fig_ub = go.Figure()
+            if _fut_ub["unbiased_blend_c"].notna().any():
+                fig_ub.add_trace(go.Scatter(
+                    x=_fut_ub["date"], y=_fut_ub["unbiased_blend_c"],
+                    mode="lines+markers", name="Unbiased Blend",
+                    line=dict(color="#9b59b6", width=3),
+                    marker=dict(size=6),
+                ))
+            if _fut_ub["ecmwf_c"].notna().any():
+                fig_ub.add_trace(go.Scatter(
+                    x=_fut_ub["date"], y=_fut_ub["ecmwf_c"],
+                    mode="lines+markers", name="ECMWF (raw)",
+                    line=dict(color="#e74c3c", width=2, dash="dot"),
+                    marker=dict(size=4),
+                ))
+            if _fut_ub["gfs_c"].notna().any():
+                fig_ub.add_trace(go.Scatter(
+                    x=_fut_ub["date"], y=_fut_ub["gfs_c"],
+                    mode="lines+markers", name="GFS (raw)",
+                    line=dict(color="#f39c12", width=2, dash="dot"),
+                    marker=dict(size=4),
+                ))
+            fig_ub.update_layout(
+                title=f"{sel_city} - Unbiased Forecast (no bias correction)",
+                xaxis_title="Date", yaxis_title="Temperature (C)",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                height=300, margin=dict(t=60, b=40),
+                hovermode="x unified",
+            )
+            st.plotly_chart(fig_ub, width="stretch")
+
+            # Show bias delta
+            if _fut_ub["blended_c"].notna().any() and _fut_ub["unbiased_blend_c"].notna().any():
+                _bias_delta = (_fut_ub["blended_c"] - _fut_ub["unbiased_blend_c"]).mean()
+                if pd.notna(_bias_delta):
+                    _dir = "warmer" if _bias_delta > 0 else "cooler"
+                    st.caption(
+                        f"Average bias correction for {sel_city}: "
+                        f"{_bias_delta:+.2f}C ({_dir} than raw models)"
+                    )
+        else:
+            st.info(f"No upcoming forecast data for {sel_city}")
+
+        st.divider()
+
+        # ---- Chart 1: Upcoming Forecast (bias-corrected) ----
+        st.markdown("#### Upcoming Forecast (Bias-Corrected)")
+
+        if not _fut.empty:
+            _fut["date"] = pd.to_datetime(_fut["date"])
+            _fut = _fut.sort_values("date")
+            fig_f = go.Figure()
+            fig_f.add_trace(go.Scatter(
+                x=_fut["date"], y=_fut["blended_c"],
+                mode="lines+markers", name="Blended Forecast",
+                line=dict(color="#3498db", width=3),
+                marker=dict(size=6),
+            ))
+            if _fut["ecmwf_c"].notna().any():
+                fig_f.add_trace(go.Scatter(
+                    x=_fut["date"], y=_fut["ecmwf_c"],
+                    mode="lines+markers", name="ECMWF",
+                    line=dict(color="#e74c3c", width=2, dash="dot"),
+                    marker=dict(size=4),
+                ))
+            if _fut["gfs_c"].notna().any():
+                fig_f.add_trace(go.Scatter(
+                    x=_fut["date"], y=_fut["gfs_c"],
+                    mode="lines+markers", name="GFS",
+                    line=dict(color="#f39c12", width=2, dash="dot"),
+                    marker=dict(size=4),
+                ))
+            fig_f.update_layout(
+                title=f"{sel_city} - Forecast for Upcoming Days",
+                xaxis_title="Date", yaxis_title="Temperature (C)",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                height=350, margin=dict(t=60, b=40),
+                hovermode="x unified",
+            )
+            st.plotly_chart(fig_f, width="stretch")
+        else:
+            st.info(f"No upcoming forecast data for {sel_city}")
+
+        # ---- Contract Prices + Open Positions per date ----
+        if not _fut.empty:
+            @st.cache_data(ttl=60)
+            def _load_contracts_for_city(city_name):
+                conn = sqlite3.connect(DB_PATH)
+                conn.row_factory = sqlite3.Row
+                # Latest outcomes per event for this city (using most recent
+                # scan per date, not a single global scan timestamp)
+                outcomes = conn.execute("""
+                    SELECT o.contract_id, o.range_low, o.range_high, o.unit,
+                           o.yes_price, o.no_price, o.model_prob,
+                           e.date, e.display_unit
+                    FROM temp_outcomes o
+                    JOIN temp_events e ON o.event_row_id = e.id
+                    WHERE LOWER(e.city) = LOWER(?)
+                      AND e.id IN (
+                          SELECT id FROM temp_events
+                          WHERE LOWER(city) = LOWER(?)
+                          GROUP BY date
+                          HAVING scan_timestamp = MAX(scan_timestamp)
+                      )
+                    ORDER BY e.date, o.range_low DESC
+                """, (city_name, city_name)).fetchall()
+                # Open positions for this city
+                positions = conn.execute("""
+                    SELECT contract_id, side, size_usdc, target_size_usdc,
+                           range_low, range_high, date, unit, unrealized_pnl
+                    FROM positions
+                    WHERE LOWER(city) = LOWER(?) AND status = 'open'
+                      AND fill_status = 'filled'
+                    ORDER BY date, range_low DESC
+                """, (city_name,)).fetchall()
+                # Group by date
+                by_date_o = {}
+                for r in outcomes:
+                    d = r["date"]
+                    by_date_o.setdefault(d, []).append(dict(r))
+                by_date_p = {}
+                for r in positions:
+                    d = r["date"]
+                    by_date_p.setdefault(d, []).append(dict(r))
+                return by_date_o, by_date_p
+
+            _contracts_by_date, _positions_by_date = _load_contracts_for_city(sel_city)
+
+            # Get the dates from the forecast chart
+            _forecast_dates = sorted(_fut["date"].dt.strftime("%Y-%m-%d").unique().tolist())
+
+            if _forecast_dates and (_contracts_by_date or _positions_by_date):
+                st.markdown("#### Contract Prices & Positions")
+                _date_cols = st.columns(len(_forecast_dates))
+                for _di, _fd in enumerate(_forecast_dates):
+                    with _date_cols[_di]:
+                        st.markdown(f"**{_fd}**")
+                        _outcomes = _contracts_by_date.get(_fd, [])
+                        _pos_list = _positions_by_date.get(_fd, [])
+                        _pos_by_cid = {p["contract_id"]: p for p in _pos_list}
+
+                        if _outcomes:
+                            _rows = []
+                            for _o in _outcomes:
+                                _u = _o.get("unit", "celsius")
+                                _sym = "F" if _u == "fahrenheit" else "C"
+                                _lo = _o.get("range_low")
+                                _hi = _o.get("range_high")
+                                if _lo is not None and _hi is not None and _lo == _hi:
+                                    _label = f"{int(_lo)}{_sym}"
+                                elif _lo is not None and _hi is not None:
+                                    _label = f"{int(_lo)}-{int(_hi)}{_sym}"
+                                elif _lo is not None:
+                                    _label = f">={int(_lo)}{_sym}"
+                                else:
+                                    _label = f"<={int(_hi)}{_sym}" if _hi else "?"
+
+                                _yp = float(_o.get("yes_price") or 0)
+                                _mp = float(_o.get("model_prob") or 0)
+
+                                _cid = _o.get("contract_id")
+                                _held = _pos_by_cid.get(_cid)
+                                if _held:
+                                    _sz = float(_held.get("size_usdc") or 0)
+                                    _pnl = float(_held.get("unrealized_pnl") or 0)
+                                    _pos_str = f"HELD {_held['side']}"
+                                    _pnl_val = _pnl
+                                else:
+                                    _pos_str = ""
+                                    _pnl_val = None
+
+                                _rows.append({
+                                    "Range": _label,
+                                    "Market Prob": f"{_yp*100:.0f}%",
+                                    "Model Prob": f"{_mp*100:.0f}%",
+                                    "Position": _pos_str,
+                                    "P&L": _pnl_val,
+                                })
+                            _contract_df = pd.DataFrame(_rows)
+
+                            def _color_pnl_cell(val):
+                                if val is None or pd.isna(val):
+                                    return ""
+                                if val > 0:
+                                    return "color: #2ecc71"
+                                elif val < 0:
+                                    return "color: #e74c3c"
+                                return ""
+
+                            st.dataframe(
+                                _contract_df.style.map(
+                                    _color_pnl_cell, subset=["P&L"]
+                                ).format({"P&L": lambda v: f"${v:+,.2f}" if pd.notna(v) and v is not None else ""}),
+                                hide_index=True, width="stretch",
+                                height=min(60 + len(_rows) * 35, 400),
+                            )
+                        else:
+                            st.caption("No contract data")
+
+        st.divider()
+
+        # ---- Chart 2: Historical Forecast vs Actual (slower query) ----
+        st.markdown("#### Historical Forecast vs Actual")
+        accuracy_df = _load_accuracy_data()
+        if not accuracy_df.empty:
+            accuracy_df["city"] = accuracy_df["city"].str.title()
+        _hist = accuracy_df[accuracy_df["city"] == sel_city].copy() if not accuracy_df.empty else pd.DataFrame()
+        _hist = _hist.dropna(subset=["actual_c", "blended_c"]) if not _hist.empty else _hist
+
+        if not _hist.empty:
+            _hist["date"] = pd.to_datetime(_hist["date"])
+            _hist = _hist.sort_values("date")
+
+            fig_h = go.Figure()
+            fig_h.add_trace(go.Scatter(
+                x=_hist["date"], y=_hist["actual_c"],
                 mode="lines+markers", name="Actual High",
                 line=dict(color="#2ecc71", width=3),
                 marker=dict(size=6),
             ))
-
-            # Blended forecast
-            fig.add_trace(go.Scatter(
-                x=city_df["date"], y=city_df["blended_c"],
+            fig_h.add_trace(go.Scatter(
+                x=_hist["date"], y=_hist["blended_c"],
                 mode="lines+markers", name="Blended Forecast",
                 line=dict(color="#3498db", width=2, dash="dash"),
                 marker=dict(size=5),
             ))
-
-            # ECMWF
-            if city_df["ecmwf_c"].notna().any():
-                fig.add_trace(go.Scatter(
-                    x=city_df["date"], y=city_df["ecmwf_c"],
+            if _hist["ecmwf_c"].notna().any():
+                fig_h.add_trace(go.Scatter(
+                    x=_hist["date"], y=_hist["ecmwf_c"],
                     mode="lines", name="ECMWF",
                     line=dict(color="#e74c3c", width=1, dash="dot"),
                     opacity=0.6,
                 ))
-
-            # GFS
-            if city_df["gfs_c"].notna().any():
-                fig.add_trace(go.Scatter(
-                    x=city_df["date"], y=city_df["gfs_c"],
+            if _hist["gfs_c"].notna().any():
+                fig_h.add_trace(go.Scatter(
+                    x=_hist["date"], y=_hist["gfs_c"],
                     mode="lines", name="GFS",
                     line=dict(color="#f39c12", width=1, dash="dot"),
                     opacity=0.6,
                 ))
-
-            fig.update_layout(
-                title=f"{sel_city} - Forecast vs Actual Daily High",
-                xaxis_title="Date",
-                yaxis_title="Temperature (C)",
+            fig_h.update_layout(
+                title=f"{sel_city} - Forecast vs Actual (Last 30 Days)",
+                xaxis_title="Date", yaxis_title="Temperature (C)",
                 legend=dict(orientation="h", yanchor="bottom", y=1.02),
-                height=450,
-                margin=dict(t=60, b=40),
+                height=400, margin=dict(t=60, b=40),
                 hovermode="x unified",
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig_h, width="stretch")
 
             # Summary stats
+            _errors = _hist["error_c"].dropna()
             sc1, sc2, sc3, sc4 = st.columns(4)
-            mae = city_df["error_c"].abs().mean()
-            rmse = (city_df["error_c"] ** 2).mean() ** 0.5
-            bias = city_df["error_c"].mean()
-            n_days = len(city_df)
             with sc1:
-                st.metric("MAE", f"{mae:.2f}C")
+                st.metric("MAE", f"{_errors.abs().mean():.2f}C")
             with sc2:
-                st.metric("RMSE", f"{rmse:.2f}C")
+                st.metric("RMSE", f"{(_errors ** 2).mean() ** 0.5:.2f}C")
             with sc3:
-                st.metric("Bias", f"{bias:+.2f}C",
+                st.metric("Bias", f"{_errors.mean():+.2f}C",
                           help="Positive = model too cold, Negative = model too warm")
             with sc4:
-                st.metric("Days", str(n_days))
+                st.metric("Days", str(len(_errors)))
 
-            # Error distribution
+            # Error bar chart
             st.divider()
             st.markdown("**Daily Forecast Error (Actual - Blended)**")
             fig2 = go.Figure()
+            _ev = _errors.tolist()
             fig2.add_trace(go.Bar(
-                x=city_df["date"], y=city_df["error_c"],
-                marker_color=["#2ecc71" if e >= 0 else "#e74c3c" for e in city_df["error_c"]],
+                x=_hist["date"], y=_ev,
+                marker_color=["#2ecc71" if e >= 0 else "#e74c3c" for e in _ev],
             ))
             fig2.update_layout(
-                xaxis_title="Date",
-                yaxis_title="Error (C)",
-                height=250,
-                margin=dict(t=20, b=40),
+                xaxis_title="Date", yaxis_title="Error (C)",
+                height=250, margin=dict(t=20, b=40),
             )
             fig2.add_hline(y=0, line_dash="solid", line_color="gray", opacity=0.5)
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, width="stretch")
+        else:
+            st.info(f"No historical forecast+actual data for {sel_city}")
 
     st.divider()
-    if st.button("Refresh Data", key="refresh_accuracy"):
-        _do_refresh("refresh_accuracy")
+    _ac1, _ac2, _ac3 = st.columns([2, 1, 2])
+    with _ac2:
+        if st.button("Refresh Data", key="refresh_accuracy", type="primary"):
+            _do_refresh("refresh_accuracy")

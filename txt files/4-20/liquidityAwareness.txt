@@ -1,0 +1,41 @@
+Liquidity-aware position sizing
+What changed and why
+Before this update, the bot computed a Kelly-sized position and entered the full amount regardless of how much liquidity the contract actually had. In paper mode this produced unrealistic results — the bot would log a $2,500 paper trade on a contract with only $600 of liquidity, which would never fill in reality because there simply aren't enough resting orders in the book to absorb that size. This meant paper P&L was inflated by trades that could never have happened on a real order book, making it impossible to evaluate whether the strategy would actually work with real capital.
+
+The fix introduces two behaviors. First, initial position size is capped at a configurable fraction of the displayed liquidity (default 40%). If the Kelly formula says $2,500 but the contract only has $800 of liquidity, the bot enters at $320 (40% of $800) instead of the full amount. The 40% cap (rather than 100%) accounts for the fact that taking all available liquidity would cause massive slippage — you'd eat through every price level in the book and your average fill price would be far worse than the displayed price. The full Kelly target ($2,500) is stored on the position as target_size_usdc so the bot knows the position is underfilled.
+
+Second, on every subsequent trading cycle, the bot checks all open positions where the current size is below the target. For each underfilled position, it looks at the current liquidity for that contract, checks that the model still favors the bin (model probability hasn't collapsed below 5%), and computes a top-up amount capped at 40% of the new available liquidity. It then adds to the position, updating the total size and share count. This continues cycle after cycle until either the target is reached or the thesis weakens.
+
+The practical effect is that position building happens gradually over multiple cycles as liquidity allows, rather than in a single unrealistic block. A position that would have been a fictional $2,500 entry now builds up realistically: $320 on cycle 1, another $400 on cycle 2 when more liquidity appears, another $600 on cycle 3, and so on. This makes paper trading results much more representative of what live trading would actually produce.
+
+Things to consider before running
+The bot will enter smaller initial positions than before, which means more positions will be "underfilled" at any given time. This is intentional and correct — it reflects reality. However, it means the bot needs multiple trading cycles (hours) to build full positions on low-liquidity contracts. If a contract resolves before the position is fully built, the realized P&L will be smaller than the Kelly-optimal amount. This is a real constraint of thin markets, not a bug.
+
+The top-up logic only adds to positions where the thesis is still intact. If the model's probability for a bin drops below 5% between cycles, the bot stops topping up even if the target hasn't been reached. This prevents throwing good money after bad when the forecast shifts against a position mid-build.
+
+The 40% liquidity take fraction is conservative. On very liquid contracts ($10,000+), the bot could safely take more without moving the price. On thin contracts ($500-1,000), even 40% may cause noticeable slippage in live trading. The fraction is configurable via .env if you want to adjust it based on experience.
+
+New variables in .env
+LIQUIDITY_AWARE_SIZING=true — master switch. When false, the bot sizes positions at full Kelly regardless of liquidity (original behavior). When true, positions are capped at the liquidity fraction and topped up over time.
+MAX_LIQUIDITY_TAKE_PCT=0.40 — maximum fraction of displayed liquidity to consume per order. At 0.40, a contract with $1,000 liquidity allows a maximum $400 entry per cycle. Lower values are more conservative (less slippage risk); higher values build positions faster but risk worse fill prices.
+New database column
+positions.target_size_usdc — stores the full Kelly-computed target size at entry time. When LIQUIDITY_AWARE_SIZING is enabled, the actual size_usdc may be less than this value (capped by liquidity). The difference between target_size_usdc and size_usdc tells you how underfilled the position is. When LIQUIDITY_AWARE_SIZING is disabled, target_size_usdc is NULL and size_usdc equals the full Kelly amount.
+Changes to existing files
+bot/config.py — added LIQUIDITY_AWARE_SIZING and MAX_LIQUIDITY_TAKE_PCT configuration variables with defaults.
+bot/db.py — added target_size_usdc column to positions table via ALTER. Added update_position_topup() function that increments an existing position's size and share count. Added get_underfilled_positions() query that returns open positions where size_usdc < target_size_usdc.
+bot/execution.py — execute_signal() now passes target_size_usdc from the signal dict through to insert_position() so the full Kelly target is stored at entry time.
+bot/main.py — the trading loop now caps signal["kelly_size"] at liquidity × MAX_LIQUIDITY_TAKE_PCT before execution and sets signal["target_size_usdc"] to the original uncapped amount. After new signals are processed, a _run_topups() pass checks all underfilled positions, computes top-up amounts based on current liquidity and remaining shortfall, verifies the thesis is still intact, and adds to positions that qualify. The top-up pass runs every trading cycle (hourly at :10).
+.env — added LIQUIDITY_AWARE_SIZING=true and MAX_LIQUIDITY_TAKE_PCT=0.40.
+What the logs show
+On initial entry when liquidity caps the size:
+
+
+Liquidity cap: Ankara 2026-04-21 $2500.00 -> $320.00 (liquidity=$800 x 40%)
+On subsequent cycles when the position gets topped up:
+
+
+[TOPUP] pos=45 Ankara 2026-04-21 +$400.00 ($320.00 -> $720.00 / $2500.00 target) liquidity=$1000
+When a top-up is skipped because the thesis weakened:
+
+
+[TOPUP] Skipping c91ae75e7940... — model_prob dropped to 0.031, thesis weakened

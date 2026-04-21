@@ -290,6 +290,16 @@ BRACKET_ENABLED: bool = _bool("BRACKET_ENABLED", True)
 BRACKET_MAX_BINS: int = int(os.getenv("BRACKET_MAX_BINS", "2"))
 BRACKET_MIN_ADJACENT_EDGE: float = _float("BRACKET_MIN_ADJACENT_EDGE", 0.04)
 
+# ---------------------------------------------------------------------------
+# Liquidity-aware sizing (Phase 3)
+# When enabled, position size is capped at a fraction of displayed liquidity.
+# Underfilled positions are topped up on subsequent trading cycles as more
+# liquidity becomes available.
+# ---------------------------------------------------------------------------
+
+LIQUIDITY_AWARE_SIZING: bool = _bool("LIQUIDITY_AWARE_SIZING", True)
+MAX_LIQUIDITY_TAKE_PCT: float = _float("MAX_LIQUIDITY_TAKE_PCT", 0.40)
+
 
 # Tail-probability flattening — applied AFTER per-event bin normalization:
 #     p' = p ** LIVE_ADJ_TAIL_FLATTEN_EXPONENT
@@ -297,4 +307,15 @@ BRACKET_MIN_ADJACENT_EDGE: float = _float("BRACKET_MIN_ADJACENT_EDGE", 0.04)
 # bin ranking while trimming overconfident spikes in the upper tail.  Only
 # applied when USE_LIVE_ADJUSTMENT_SIGMA_SHRINK is True (bundled with v2).
 # Exponent of 1.0 disables flattening.
+# ---------------------------------------------------------------------------
+# Forecast DB read (eliminates redundant API calls during trading scan)
+# When enabled, the trading scan reads ECMWF/GFS mu/sigma from forecast_runs
+# (populated by the forecast pull at :05) instead of re-calling the API.
+# Falls back to API if no fresh data exists in the DB.
+# ---------------------------------------------------------------------------
+
+FORECAST_DB_READ_ENABLED: bool = _bool("FORECAST_DB_READ_ENABLED", True)
+FORECAST_DB_MAX_AGE_HOURS: float = _float("FORECAST_DB_MAX_AGE_HOURS", 3.0)
+
+
 LIVE_ADJ_TAIL_FLATTEN_EXPONENT: float = _float("LIVE_ADJ_TAIL_FLATTEN_EXPONENT", 0.95)

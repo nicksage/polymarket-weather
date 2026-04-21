@@ -45,8 +45,10 @@ DEFAULT_LOOKBACK_DAYS = 14
 # Canonical Open-Meteo model ids recorded by the backfill.
 MODELS = ("ecmwf_ifs025", "gfs_global")
 
-# Fixed lead time for bias comparison.  Must match backfill_bias_data.py.
-LEAD_DAYS = 3
+# Fixed lead time for bias comparison.  Should match the trading horizon
+# (MAX_TRADE_DAYS).  Lead=1 means "how accurate was the model's forecast
+# issued 1 day before the target date" — matching D+1 trades.
+LEAD_DAYS = 1
 
 
 def _dedupe_cities() -> list[tuple[str, float, float]]:
@@ -122,11 +124,20 @@ def run_bias_update(
         if sleep_between > 0:
             time.sleep(sleep_between)
 
+    # Rebuild per-city forecast accuracy metrics after errors are updated
+    try:
+        from db import rebuild_city_forecast_accuracy
+        n_accuracy = rebuild_city_forecast_accuracy(window_days=30)
+        logger.info(f"[BIAS UPDATE] city_forecast_accuracy rebuilt for {n_accuracy} cities")
+    except Exception as e:
+        n_accuracy = 0
+        logger.warning(f"[BIAS UPDATE] city_forecast_accuracy rebuild failed: {e}")
+
     elapsed = time.time() - t0
     logger.info(
         f"[BIAS UPDATE] complete — cities={len(cities)} failed={totals['failed']} "
         f"obs={totals['obs_rows']} fcst={totals['fcst_rows']} err_rebuilt={totals['err_rows']} "
-        f"elapsed={elapsed:.1f}s"
+        f"accuracy_cities={n_accuracy} elapsed={elapsed:.1f}s"
     )
 
     return {
@@ -135,6 +146,7 @@ def run_bias_update(
         "obs_rows":  totals["obs_rows"],
         "fcst_rows": totals["fcst_rows"],
         "err_rows":  totals["err_rows"],
+        "accuracy_cities": n_accuracy,
         "elapsed_s": round(elapsed, 1),
     }
 

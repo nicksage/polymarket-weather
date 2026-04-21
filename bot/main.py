@@ -39,15 +39,18 @@ from loops import (
 )
 from position_eval import evaluate_open_positions
 
-# Ensure logs directory exists before FileHandler is created
-os.makedirs("logs", exist_ok=True)
+# Resolve logs directory to bot/logs/ regardless of where Python is launched from
+# (same pattern as DB_PATH — prevents duplicate logs/ folders at project root).
+_BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+_LOGS_DIR = os.path.join(_BOT_DIR, "logs")
+os.makedirs(_LOGS_DIR, exist_ok=True)
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("logs/bot.log"),
+        logging.FileHandler(os.path.join(_LOGS_DIR, "bot.log")),
     ],
 )
 logger = logging.getLogger("main")
@@ -59,6 +62,98 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 # Cache of the most recently discovered events, shared between discovery and
 # trading runs to avoid a redundant Gamma API call within the same hour.
 _cached_events: list[dict] | None = None
+
+
+# ---------------------------------------------------------------------------
+# Liquidity top-up helper
+# ---------------------------------------------------------------------------
+
+def _run_topups(all_events: list[dict], client) -> int:
+    """Top up underfilled positions if more liquidity is now available.
+
+    For each open position where size_usdc < target_size_usdc, check
+    the current liquidity for that contract.  If liquidity supports
+    adding more, compute the top-up amount (capped at MAX_LIQUIDITY_TAKE_PCT
+    of current liquidity and the remaining shortfall), and execute.
+
+    Only tops up if the model still favors the position (the bin is still
+    in the model's top bins for the event).  Does NOT top up positions
+    where the thesis has weakened.
+    """
+    from config import MAX_LIQUIDITY_TAKE_PCT, PAPER_TRADE
+    from db import get_underfilled_positions, update_position_topup, insert_position
+
+    underfilled = get_underfilled_positions()
+    if not underfilled:
+        return 0
+
+    # Build a lookup of current liquidity by contract_id from the latest
+    # event analysis (which was just computed this cycle).
+    liquidity_map: dict[str, float] = {}
+    model_prob_map: dict[str, float] = {}
+    for ev in all_events:
+        for o in ev.get("outcomes", []):
+            cid = o.get("contract_id")
+            if cid:
+                liquidity_map[cid] = float(o.get("liquidity_usd") or 0)
+                model_prob_map[cid] = float(o.get("model_prob") or 0)
+
+    topped_up = 0
+    for pos in underfilled:
+        pid = pos["id"]
+        cid = pos.get("contract_id", "")
+        current_size = float(pos.get("size_usdc") or 0)
+        target = float(pos.get("target_size_usdc") or 0)
+        remaining = target - current_size
+        entry_price = float(pos.get("entry_price") or 0)
+        city = pos.get("city", "")
+        date_str = pos.get("date", "")
+
+        if remaining <= 1.0 or entry_price <= 0:
+            continue
+
+        # Check thesis still intact: model_prob should still be meaningful
+        current_prob = model_prob_map.get(cid)
+        if current_prob is not None and current_prob < 0.05:
+            logger.debug(
+                f"[TOPUP] Skipping {cid[:12]} — model_prob dropped to "
+                f"{current_prob:.3f}, thesis weakened"
+            )
+            continue
+
+        # Check available liquidity
+        liquidity = liquidity_map.get(cid, 0)
+        max_take = liquidity * MAX_LIQUIDITY_TAKE_PCT
+        if max_take < 1.0:
+            continue
+
+        add_amount = min(remaining, max_take)
+        if add_amount < 1.0:
+            continue
+
+        add_shares = round(add_amount / entry_price, 4)
+
+        # Weighted average price (keep entry_price for simplicity in paper
+        # mode — in live mode we'd use the new fill price)
+        new_avg_price = entry_price
+
+        if PAPER_TRADE:
+            update_position_topup(pid, add_amount, add_shares, new_avg_price)
+            topped_up += 1
+            logger.info(
+                f"[TOPUP] pos={pid} {city} {date_str} "
+                f"+${add_amount:.2f} (${current_size:.2f} -> "
+                f"${current_size + add_amount:.2f} / "
+                f"${target:.2f} target) "
+                f"liquidity=${liquidity:.0f}"
+            )
+        else:
+            # Live mode: would place a CLOB order for add_amount
+            # For now, same as paper (TODO: implement live top-up orders)
+            update_position_topup(pid, add_amount, add_shares, new_avg_price)
+            topped_up += 1
+
+    return topped_up
 
 
 # ---------------------------------------------------------------------------
@@ -269,9 +364,26 @@ def trading_run():
         if already_held:
             logger.debug(
                 f"Skipping duplicate contract {signal.get('contract_id', '')[:12]} "
-                f"— already held"
+                f"-- already held"
             )
             continue
+
+        # Liquidity-aware sizing: cap the position at a fraction of
+        # displayed liquidity.  Store the full Kelly target on the
+        # position so underfilled positions can be topped up later.
+        from config import LIQUIDITY_AWARE_SIZING, MAX_LIQUIDITY_TAKE_PCT
+        original_kelly = signal.get("kelly_size", 0)
+        if LIQUIDITY_AWARE_SIZING:
+            liquidity = float(signal.get("liquidity_usd") or 0)
+            max_take = liquidity * MAX_LIQUIDITY_TAKE_PCT
+            if max_take > 0 and original_kelly > max_take:
+                logger.info(
+                    f"Liquidity cap: {signal.get('city')} {signal.get('date')} "
+                    f"${original_kelly:.2f} -> ${max_take:.2f} "
+                    f"(liquidity=${liquidity:.0f} x {MAX_LIQUIDITY_TAKE_PCT*100:.0f}%)"
+                )
+                signal["kelly_size"] = round(max_take, 2)
+            signal["target_size_usdc"] = original_kelly
 
         result = execute_signal(signal, client=client)
 
@@ -294,6 +406,16 @@ def trading_run():
         f"{unfunded} unfunded (capital exhausted), "
         f"{len(signals)} raw signals -> {len(eligible)} eligible"
     )
+
+    # --- Liquidity-aware top-ups for underfilled positions ---
+    from config import LIQUIDITY_AWARE_SIZING
+    if LIQUIDITY_AWARE_SIZING:
+        try:
+            topped_up = _run_topups(all_events, client)
+            if topped_up:
+                logger.info(f"[TOPUP] {topped_up} position(s) topped up")
+        except Exception as e:
+            logger.debug(f"Top-up pass failed (non-fatal): {e}")
 
     # --- Phase 3: Active position management (exit engine) ---
     try:
@@ -323,36 +445,49 @@ def main():
     # trade.  This catches model-name changes, API outages, and auth issues
     # before any capital is deployed.
     from weather import _get_ecmwf_ensemble_distribution, _get_gfs_ensemble_distribution
+    from db import get_latest_forecast_distribution
     from datetime import timedelta
-    _test_date = (datetime.now().date() + timedelta(days=1)).isoformat()
     _test_lat, _test_lon = 41.85, -87.65   # Chicago
-    logger.info(f"Startup health check: testing ECMWF + GFS for Chicago {_test_date}...")
-    _ecmwf_test = _get_ecmwf_ensemble_distribution(_test_lat, _test_lon, _test_date)
-    _gfs_test   = _get_gfs_ensemble_distribution(_test_lat, _test_lon, _test_date)
-    _health_ok = True
-    if _ecmwf_test is None:
-        logger.error(
-            "STARTUP HEALTH CHECK FAILED: ECMWF ensemble returned no data. "
-            "The model name may have changed on the Open-Meteo Ensemble API. "
-            "Check weather.py OPENMETEO_ENSEMBLE params. "
-            "Bot will NOT trade until this is resolved."
-        )
-        _health_ok = False
-    else:
-        logger.info(f"  ECMWF OK: n={_ecmwf_test['n']} members, mu={_ecmwf_test['mu_c']:.2f}")
-    if _gfs_test is None:
-        logger.error(
-            "STARTUP HEALTH CHECK FAILED: GFS ensemble returned no data. "
-            "Check weather.py GFS model params. "
-            "Bot will NOT trade until this is resolved."
-        )
-        _health_ok = False
-    else:
-        logger.info(f"  GFS OK: n={_gfs_test['n']} members, mu={_gfs_test['mu_c']:.2f}")
+
+    # Try tomorrow first, fall back to today (API may not have tomorrow's run yet)
+    _health_ok = False
+    for _offset in [1, 0]:
+        _test_date = (datetime.now().date() + timedelta(days=_offset)).isoformat()
+        logger.info(f"Startup health check: testing ECMWF + GFS for Chicago {_test_date}...")
+        _ecmwf_test = _get_ecmwf_ensemble_distribution(_test_lat, _test_lon, _test_date)
+        _gfs_test   = _get_gfs_ensemble_distribution(_test_lat, _test_lon, _test_date)
+        if _ecmwf_test and _gfs_test:
+            logger.info(f"  ECMWF OK: n={_ecmwf_test['n']} members, mu={_ecmwf_test['mu_c']:.2f}")
+            logger.info(f"  GFS OK: n={_gfs_test['n']} members, mu={_gfs_test['mu_c']:.2f}")
+            _health_ok = True
+            break
+        else:
+            _e = "OK" if _ecmwf_test else "MISSING"
+            _g = "OK" if _gfs_test else "MISSING"
+            logger.warning(f"  {_test_date}: ECMWF={_e} GFS={_g} -- trying fallback")
+
+    # If API is temporarily down, check if DB has recent forecast data
+    if not _health_ok:
+        _db_ecmwf = get_latest_forecast_distribution(_test_lat, _test_lon, _test_date, "ecmwf", max_age_hours=6.0)
+        _db_gfs   = get_latest_forecast_distribution(_test_lat, _test_lon, _test_date, "gfs", max_age_hours=6.0)
+        if _db_ecmwf and _db_gfs:
+            logger.warning(
+                "API returned no data but DB has recent forecasts -- "
+                "proceeding with cached data. The API may be temporarily down."
+            )
+            _health_ok = True
+        else:
+            logger.error(
+                "STARTUP HEALTH CHECK FAILED: Neither API nor DB returned "
+                "ensemble data. Check if the ECMWF/GFS model names have changed "
+                "on the Open-Meteo Ensemble API, or if the API is down. "
+                "Bot will NOT trade until this is resolved."
+            )
+
     if not _health_ok:
         logger.error("Exiting due to failed ensemble health check.")
         sys.exit(1)
-    logger.info("Ensemble health check passed — both ECMWF and GFS operational.")
+    logger.info("Ensemble health check passed.")
 
     # Run all loops immediately on startup so the bot is fully current before
     # the scheduler takes over.  Monitor runs last so any positions from the
@@ -360,11 +495,29 @@ def main():
     #
     # Bias update runs first — it ensures forecast_errors is fresh before the
     # trading scan reads per-model bias corrections.
+    # Skip bias update if it already ran today (avoids ~3 min delay on restart)
     try:
-        from bias_correction.bias_updater import run_bias_update
-        run_bias_update()
-    except Exception as e:
-        logger.warning(f"Startup bias update failed (non-fatal): {e}")
+        import sqlite3
+        _bias_conn = sqlite3.connect(DB_PATH)
+        _last_bias = _bias_conn.execute(
+            "SELECT MAX(recorded_at) FROM forecast_errors"
+        ).fetchone()[0]
+        _bias_conn.close()
+        _bias_ran_today = (
+            _last_bias is not None
+            and _last_bias[:10] == datetime.now().strftime("%Y-%m-%d")
+        )
+    except Exception:
+        _bias_ran_today = False
+
+    if _bias_ran_today:
+        logger.info("Bias update already ran today — skipping startup refresh")
+    else:
+        try:
+            from bias_correction.bias_updater import run_bias_update
+            run_bias_update()
+        except Exception as e:
+            logger.warning(f"Startup bias update failed (non-fatal): {e}")
 
     events = discovery_run()
     _cached_events_ref = events  # seed the module-level cache
@@ -373,22 +526,73 @@ def main():
     # Phase 3: run forecast pull + live observations BEFORE the first trading
     # cycle so the live adjustment layer has data (hourly forecast path +
     # VC observations + observed_max_so_far) when computing probabilities.
-    # Without this, same-day trades would use the raw blended mu/sigma with
-    # no floor truncation and no sigma shrinkage.
-    try:
-        logger.info("Startup: running forecast pull before first trade cycle...")
-        forecast_pull_run(events=events)
-    except Exception as e:
-        logger.warning(f"Startup forecast pull failed (non-fatal): {e}")
+    # Skip if they already ran recently (avoids redundant API calls on restart).
+    import sqlite3 as _sqlite3
+    _skip_conn = _sqlite3.connect(DB_PATH)
 
+    # Forecast pull: skip if any forecast_runs row was written in the last 2 hours
     try:
-        logger.info("Startup: running live observations before first trade cycle...")
-        live_observation_run(events=events)
-    except Exception as e:
-        logger.warning(f"Startup live observation run failed (non-fatal): {e}")
+        _last_pull = _skip_conn.execute(
+            "SELECT MAX(pulled_at) FROM forecast_runs"
+        ).fetchone()[0]
+        _pull_recent = False
+        if _last_pull:
+            from datetime import timezone as _tz2
+            _pull_age = (datetime.now(_tz2.utc) - datetime.fromisoformat(
+                _last_pull.replace("Z", "+00:00")
+            )).total_seconds() / 3600
+            _pull_recent = _pull_age < 2.0
+    except Exception:
+        _pull_recent = False
+
+    if _pull_recent:
+        logger.info("Forecast pull ran within last 2 hours -- skipping startup refresh")
+    else:
+        try:
+            logger.info("Startup: running forecast pull before first trade cycle...")
+            forecast_pull_run(events=events)
+        except Exception as e:
+            logger.warning(f"Startup forecast pull failed (non-fatal): {e}")
+
+    # Live observations: skip if any live_observations row was written in the last 20 min
+    try:
+        _last_obs = _skip_conn.execute(
+            "SELECT MAX(pulled_at_utc) FROM live_observations"
+        ).fetchone()[0]
+        _obs_recent = False
+        if _last_obs:
+            from datetime import timezone as _tz3
+            _obs_age = (datetime.now(_tz3.utc) - datetime.fromisoformat(
+                _last_obs.replace("Z", "+00:00")
+            )).total_seconds() / 60
+            _obs_recent = _obs_age < 20.0
+    except Exception:
+        _obs_recent = False
+
+    _skip_conn.close()
+
+    if _obs_recent:
+        logger.info("Live observations ran within last 20 min -- skipping startup refresh")
+    else:
+        try:
+            logger.info("Startup: running live observations before first trade cycle...")
+            live_observation_run(events=events)
+        except Exception as e:
+            logger.warning(f"Startup live observation run failed (non-fatal): {e}")
 
     trading_run()
     run_monitor_loop()
+
+    # Start real-time price streaming via WebSocket for stop-loss monitoring
+    try:
+        from price_ws import start_price_stream, load_open_position_tokens, wire_stop_loss_callback
+        from realtime_exits import on_price_update
+        wire_stop_loss_callback(on_price_update)
+        load_open_position_tokens()
+        start_price_stream()
+        logger.info("Real-time price stream started for stop-loss monitoring")
+    except Exception as e:
+        logger.warning(f"Real-time price stream failed to start (non-fatal): {e}")
 
     scheduler = BlockingScheduler(timezone="UTC")
 
@@ -402,10 +606,11 @@ def main():
         coalesce=True,
     )
 
-    # Trading: every hour at :10
+    # Trading: every hour at :15 (offset from forecast pull at :05 to ensure
+    # all cities have fresh DB data before the trading scan reads them)
     scheduler.add_job(
         trading_run,
-        trigger=CronTrigger(minute=10, timezone="UTC"),
+        trigger=CronTrigger(minute=15, timezone="UTC"),
         id="trading_run",
         name="Trading scan",
         misfire_grace_time=300,

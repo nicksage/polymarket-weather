@@ -189,14 +189,17 @@ def _classify_position(pos: dict) -> ExitAction:
                          urgency=0)
 
     # =====================================================================
-    # 2. DYING — model probability collapsed since entry
+    # 2. DYING — market price collapsed since entry
     # =====================================================================
-    if (current_prob < EXIT_DYING_PROB_THRESHOLD
-            and entry_prob > EXIT_DYING_ENTRY_MIN
-            and (entry_prob - current_prob) > 0.10):
+    _market_price = float(pos.get("current_price") or 0) if pos.get("current_price") is not None else None
+    _entry_market = float(pos.get("market_prob") or pos.get("entry_price") or 0)
+    if (_market_price is not None
+            and _market_price < EXIT_DYING_PROB_THRESHOLD
+            and _entry_market > EXIT_DYING_ENTRY_MIN
+            and (_entry_market - _market_price) > 0.10):
         return _make("DYING", "SELL",
-                     f"prob_collapse: entry={entry_prob:.3f} "
-                     f"current={current_prob:.3f}",
+                     f"market_collapse: entry_mkt={_entry_market:.3f} "
+                     f"current_mkt={_market_price:.3f}",
                      urgency=1)
 
     # =====================================================================
@@ -274,16 +277,18 @@ def _classify_position(pos: dict) -> ExitAction:
                          urgency=1)
 
     # =====================================================================
-    # 6. Hard stop-loss (circuit breaker)
+    # 6. Hard stop-loss (circuit breaker) — uses precomputed SL price
     # =====================================================================
     if EXIT_HARD_STOP_ENABLED:
-        entry_cost = entry_price * shares
-        unrealized = float(pos.get("unrealized_pnl") or 0)
-        if entry_cost > 0 and unrealized <= entry_cost * EXIT_HARD_STOP_PCT:
-            return _make("WEAKENED", "SELL",
-                         f"hard_stop: unrealized={unrealized:.2f} <= "
-                         f"{EXIT_HARD_STOP_PCT*100:.0f}% of cost={entry_cost:.2f}",
-                         urgency=0)
+        sl_price = pos.get("stop_loss_price")
+        _curr_price = float(pos.get("current_price") or 0) if pos.get("current_price") is not None else None
+        if sl_price is not None and _curr_price is not None and float(sl_price) > 0:
+            if _curr_price <= float(sl_price):
+                unrealized = float(pos.get("unrealized_pnl") or 0)
+                return _make("WEAKENED", "SELL",
+                             f"hard_stop: price={_curr_price:.4f} <= "
+                             f"SL={float(sl_price):.4f} (entry={entry_price:.4f})",
+                             urgency=0)
 
     # =====================================================================
     # 7. HEALTHY — thesis intact, hold

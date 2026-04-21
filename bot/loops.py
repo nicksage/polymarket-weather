@@ -674,24 +674,31 @@ def live_observation_run(events: list[dict] | None = None) -> dict:
 # ---------------------------------------------------------------------------
 
 def retention_run(older_than_days: int = 90) -> dict:
-    """Nightly retention: purge forecast_hourly + live_observations +
-    vc_forecast_diagnostics older than N days.  Summary tables are kept
-    indefinitely."""
+    """Nightly retention: purge old time-series and scan data.
+    forecast_hourly, live_observations, vc_forecast_diagnostics: 90 days.
+    temp_events + temp_outcomes (scan data): 30 days."""
     from db import (
         purge_forecast_hourly, purge_live_observations,
-        purge_vc_forecast_diagnostics,
+        purge_vc_forecast_diagnostics, purge_temp_scan_data,
     )
     logger.info("=== RETENTION RUN START ===")
     fh = purge_forecast_hourly(older_than_days)
     lo = purge_live_observations(older_than_days)
     vd = purge_vc_forecast_diagnostics(older_than_days)
-    logger.info(f"Retention: purged forecast_hourly={fh} live_observations={lo} "
-                f"vc_forecast_diagnostics={vd} (older than {older_than_days}d)")
+    sd = purge_temp_scan_data(older_than_days=30)
+    logger.info(
+        f"Retention: purged forecast_hourly={fh} live_observations={lo} "
+        f"vc_forecast_diagnostics={vd} "
+        f"temp_events={sd['events_deleted']} temp_outcomes={sd['outcomes_deleted']} "
+        f"(time-series: {older_than_days}d, scans: 30d)"
+    )
     logger.info("=== RETENTION RUN END ===")
     return {
         "forecast_hourly_deleted":         fh,
         "live_observations_deleted":       lo,
         "vc_forecast_diagnostics_deleted": vd,
+        "temp_events_deleted":             sd["events_deleted"],
+        "temp_outcomes_deleted":           sd["outcomes_deleted"],
     }
 
 
