@@ -1,0 +1,20 @@
+Volatility — Standard deviation of price changes between consecutive snapshots over the last 30 minutes (15 snapshots at 2-min intervals). If a bin's price went [0.35, 0.36, 0.34, 0.37, 0.33], the changes are [+0.01, -0.02, +0.03, -0.04]. The std of those changes is the volatility. Higher = more erratic price movement. Our data shows winning trades had lower pre-entry volatility (0.010) than losers (0.013).
+
+Trend — Simple price difference: last snapshot minus the snapshot from 30 minutes ago. If the bin was at $0.32 thirty minutes ago and is now at $0.38, trend = +$0.06. Positive means rising, negative means falling. Our data shows winners had positive pre-entry trends (+0.018) while losers were flat (0.000).
+
+Momentum — Percentage of the last 15 price changes that were positive. If 12 out of 15 changes were upward, momentum = 0.80. This captures consistency of direction, not just magnitude. A bin that went straight from 30c to 36c has high momentum. A bin that bounced between 30c and 36c erratically has low momentum even if the trend is the same.
+
+All three use the same underlying data (last 15 rows from bin_price_history for that contract). The difference:
+
+Volatility = how much is it jumping around? (stability)
+Trend = where is it going? (direction)
+Momentum = how consistently is it going there? (conviction)
+
+Determine Trailing profit pct based on volatility
+Time remaining in trade
+
+Is a bin getting stale? Has the probability for it not changed at all, but another bin has risen sharply in probability?
+
+Also, could do scaled values for trailing stops and stop losses.
+
+How strong of an indicator is direction/momentum? If path is maintainted, can probability be extrapolated.

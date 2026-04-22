@@ -25,7 +25,6 @@ TOMORROWIO_API_KEY: str = os.getenv("TOMORROWIO_API_KEY", "")
 INITIAL_BANKROLL: float = _float("BANKROLL_USDC", 1000.0)
 PAPER_TRADE: bool = _bool("PAPER_TRADE", True)
 KELLY_FRACTION: float = _float("KELLY_FRACTION", 0.25)
-EDGE_THRESHOLD: float = _float("EDGE_THRESHOLD", 0.07)
 
 # Risk Limits
 MAX_POSITION_PCT: float = _float("MAX_POSITION_PCT", 0.02)
@@ -54,6 +53,10 @@ BACKTEST_DB_PATH: str = os.getenv(
     "BACKTEST_DB_PATH", os.path.join(_BOT_DIR, "data", "backtest.db")
 )
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
+
+# Custom SUMMARY log level — sits between INFO (20) and WARNING (30).
+# Usage: logger.log(SUMMARY_LEVEL, "message")
+SUMMARY_LEVEL: int = 25
 
 # ---------------------------------------------------------------------------
 # Forecast horizon
@@ -128,10 +131,8 @@ TRADE_US_ONLY: bool = _bool("TRADE_US_ONLY", False)
 # Position controls
 # ---------------------------------------------------------------------------
 
-# MAX_BIN_BUYS: maximum number of temperature-range bins the bot may hold
-# simultaneously for the same city+date event.  Default 1 means the bot
-# takes at most one position per event.  Set to 0 to disable the check.
-MAX_BIN_BUYS: int = int(os.getenv("MAX_BIN_BUYS", "1"))
+MAX_YES_BINS: int = int(os.getenv("MAX_YES_BINS", "2"))
+MAX_NO_BINS: int = int(os.getenv("MAX_NO_BINS", "0"))
 
 # MAX_TRADE_DAYS: how many calendar days ahead the bot may enter trades.
 # 0 = only contracts resolving today (local time).
@@ -161,7 +162,7 @@ WALLET_ADDRESS: str = os.getenv("WALLET_ADDRESS", "")
 # ---------------------------------------------------------------------------
 # Which trading strategy to use.  Each strategy has its own signal generation,
 # ranking, and exit logic.  Available: "edge_disagreement", "top_bin_value".
-ACTIVE_STRATEGY: str = os.getenv("ACTIVE_STRATEGY", "edge_disagreement")
+ACTIVE_STRATEGY: str = os.getenv("ACTIVE_STRATEGY", "top_bin_value")
 
 # ---------------------------------------------------------------------------
 # Live adjustment layer (Phase 2b)
@@ -261,16 +262,11 @@ EXIT_EVAL_ENABLED: bool = _bool("EXIT_EVAL_ENABLED", True)
 # INVALIDATED — observed max exceeds bin's upper bound + buffer
 EXIT_DEAD_BUFFER_C: float = _float("EXIT_DEAD_BUFFER_C", 0.5)
 
-# DYING — current model_prob collapsed vs entry
+# DYING — market price dropped below threshold
 EXIT_DYING_PROB_THRESHOLD: float = _float("EXIT_DYING_PROB_THRESHOLD", 0.05)
-EXIT_DYING_ENTRY_MIN: float = _float("EXIT_DYING_ENTRY_MIN", 0.15)
 
 # WEAKENED — cumulative μ shift since entry exceeds N × entry_sigma
 EXIT_WEAKENED_SIGMA_SHIFT: float = _float("EXIT_WEAKENED_SIGMA_SHIFT", 1.0)
-EXIT_EDGE_REVERSED_ENABLED: bool = _bool("EXIT_EDGE_REVERSED_ENABLED", True)
-
-# THRIVING — EV-based hold vs sell comparison
-EXIT_EV_CAPTURE_RATIO: float = _float("EXIT_EV_CAPTURE_RATIO", 0.95)
 
 # Hard stop-loss (circuit breaker, configurable)
 EXIT_HARD_STOP_ENABLED: bool = _bool("EXIT_HARD_STOP_ENABLED", True)
@@ -281,14 +277,6 @@ EXIT_HARD_STOP_PCT: float = _float("EXIT_HARD_STOP_PCT", -0.70)
 # ---------------------------------------------------------------------------
 
 CONFIDENCE_AGREEMENT_THRESHOLD: float = _float("CONFIDENCE_AGREEMENT_THRESHOLD", 2.0)
-
-# ---------------------------------------------------------------------------
-# Bracket entry (Phase 3)
-# ---------------------------------------------------------------------------
-
-BRACKET_ENABLED: bool = _bool("BRACKET_ENABLED", True)
-BRACKET_MAX_BINS: int = int(os.getenv("BRACKET_MAX_BINS", "2"))
-BRACKET_MIN_ADJACENT_EDGE: float = _float("BRACKET_MIN_ADJACENT_EDGE", 0.04)
 
 # ---------------------------------------------------------------------------
 # Liquidity-aware sizing (Phase 3)

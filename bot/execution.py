@@ -21,13 +21,49 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType
 from py_clob_client.constants import POLYGON
 
-from config import PAPER_TRADE, EXIT_HARD_STOP_PCT
+from config import PAPER_TRADE, EXIT_HARD_STOP_PCT, ACTIVE_STRATEGY
 from db import insert_position, mark_outcome_executed, get_latest_snapshot_id_for_contract
 
 logger = logging.getLogger(__name__)
 
 CLOB_HOST = "https://clob.polymarket.com"
 CHAIN_ID  = POLYGON  # 137
+
+
+def _compute_pre_entry_metrics(contract_id: str) -> tuple[float | None, float | None, float | None]:
+    """Compute volatility, trend, and momentum from the last 30 min of price snapshots.
+
+    Returns (volatility, trend, momentum) or (None, None, None) if insufficient data.
+    - volatility: std of consecutive price changes
+    - trend: last price minus first price in window
+    - momentum: fraction of price changes that were positive (0.0-1.0)
+    """
+    try:
+        import sqlite3
+        from config import DB_PATH
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute("""
+            SELECT yes_price FROM bin_price_history
+            WHERE contract_id = ? AND yes_price IS NOT NULL
+            ORDER BY recorded_at DESC
+            LIMIT 15
+        """, (contract_id,)).fetchall()
+        conn.close()
+
+        if not rows or len(rows) < 5:
+            return None, None, None
+
+        prices = [float(r[0]) for r in reversed(rows)]
+        changes = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
+
+        import statistics
+        volatility = round(statistics.stdev(changes), 6) if len(changes) >= 2 else None
+        trend = round(prices[-1] - prices[0], 4)
+        momentum = round(sum(1 for c in changes if c > 0) / len(changes), 4)
+
+        return volatility, trend, momentum
+    except Exception:
+        return None, None, None
 
 
 def get_clob_client() -> ClobClient | None:
@@ -91,6 +127,9 @@ def execute_signal(signal: dict, client: ClobClient | None = None) -> dict:
     # comparison (thesis-shift detection).
     entry_snapshot_id = get_latest_snapshot_id_for_contract(contract_id)
 
+    # Compute pre-entry price metrics from recent snapshots
+    _pre_vol, _pre_trend, _pre_momentum = _compute_pre_entry_metrics(contract_id)
+
     # Common position metadata drawn from the signal
     position_kwargs = dict(
         contract_id     = contract_id,
@@ -120,6 +159,10 @@ def execute_signal(signal: dict, client: ClobClient | None = None) -> dict:
         entry_snapshot_id = entry_snapshot_id,
         target_size_usdc = signal.get("target_size_usdc"),
         stop_loss_price = round(entry_price * (1.0 + EXIT_HARD_STOP_PCT), 4) if entry_price > 0 else None,
+        strategy        = ACTIVE_STRATEGY,
+        pre_entry_volatility = _pre_vol,
+        pre_entry_trend      = _pre_trend,
+        pre_entry_momentum   = _pre_momentum,
     )
 
     # -------------------------------------------------------------------------

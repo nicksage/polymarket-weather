@@ -3,7 +3,7 @@ import logging
 from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from config import KELLY_FRACTION, MAX_POSITION_PCT, CONFIDENCE_AGREEMENT_THRESHOLD, EDGE_THRESHOLD
+from config import KELLY_FRACTION, MAX_POSITION_PCT, CONFIDENCE_AGREEMENT_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +170,7 @@ def rank_signals(signals: list[dict], bankroll: float) -> list[dict]:
     """Score and rank all signals by capital-efficiency-weighted priority.
 
     Composite score:
-        priority = ev_per_dollar * thesis_margin * confidence * time_efficiency * confirmation_bonus
+        priority = ev_per_dollar * confidence * time_efficiency * confirmation_bonus
 
     Sorts descending.  Attaches 'priority_score' and 'priority_components'
     to each signal dict for logging and snapshot storage.  Does NOT filter —
@@ -186,14 +186,6 @@ def rank_signals(signals: list[dict], bankroll: float) -> list[dict]:
         kelly_size = float(s.get("kelly_size") or 1.0)
         capital_required = max(kelly_size, 1.0)
         ev_per_dollar = abs(ev) / max(entry_price, 0.01)
-
-        # --- thesis_margin: edge strength above threshold ---
-        edge = abs(float(s.get("edge") or 0))
-        if EDGE_THRESHOLD > 0:
-            thesis_margin = (edge - EDGE_THRESHOLD) / EDGE_THRESHOLD + 1.0
-        else:
-            thesis_margin = 1.0 + edge
-        thesis_margin = max(thesis_margin, 0.1)
 
         # --- confidence: already computed upstream, passed through signal ---
         confidence = float(s.get("confidence_multiplier") or 1.0)
@@ -238,12 +230,11 @@ def rank_signals(signals: list[dict], bankroll: float) -> list[dict]:
                         confirmation = 1.2
 
         # --- composite score ---
-        score = ev_per_dollar * thesis_margin * confidence * time_efficiency * confirmation
+        score = ev_per_dollar * confidence * time_efficiency * confirmation
 
         s["priority_score"] = round(score, 6)
         s["priority_components"] = {
             "ev_per_dollar":    round(ev_per_dollar, 4),
-            "thesis_margin":    round(thesis_margin, 3),
             "confidence":       round(confidence, 3),
             "time_efficiency":  round(time_efficiency, 5),
             "hours_to_resolve": round(hours, 1),

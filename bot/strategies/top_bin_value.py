@@ -6,7 +6,7 @@ asks: "Which bins does the model think are most likely to win?  Can I buy
 them at a reasonable price?"
 
 Entry rules (v1):
-  - Consider the model's top N bins by model_prob (N = MAX_BIN_BUYS)
+  - Consider the model's top N bins by model_prob (N = MAX_YES_BINS)
   - Buy YES on bins the model thinks are likely (model_prob >= TBV_MIN_MODEL_PROB)
   - Buy NO on bins the model thinks are very unlikely (implicitly, when
     ALLOWED_SIDES includes "no")
@@ -41,11 +41,11 @@ from position_eval import ExitAction
 from config import (
     ALLOWED_SIDES,
     EXIT_DEAD_BUFFER_C,
-    EXIT_DYING_ENTRY_MIN,
     EXIT_DYING_PROB_THRESHOLD,
     EXIT_HARD_STOP_ENABLED,
     EXIT_HARD_STOP_PCT,
-    MAX_BIN_BUYS,
+    MAX_YES_BINS,
+    MAX_NO_BINS,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,9 +56,7 @@ import os
 TBV_MIN_MODEL_PROB  = float(os.getenv("TBV_MIN_MODEL_PROB", "0.10"))
 TBV_MIN_MARKET_PROB = float(os.getenv("TBV_MIN_MARKET_PROB", "0.05"))
 TBV_CONFIRM_PROB    = float(os.getenv("TBV_CONFIRM_PROB", "0.90"))
-TBV_KELLY_FRACTION  = float(os.getenv("TBV_KELLY_FRACTION", "0.25"))
-TBV_TOP_N_BINS      = int(os.getenv("TBV_TOP_N_BINS", str(MAX_BIN_BUYS)))
-TBV_MAX_UNCERTAINTY   = float(os.getenv("TBV_MAX_UNCERTAINTY", "999.0"))
+TBV_MAX_UNCERTAINTY = float(os.getenv("TBV_MAX_UNCERTAINTY", "999.0"))
 
 
 def tbv_qualifies_as_signal(
@@ -75,7 +73,6 @@ def tbv_qualifies_as_signal(
       - model_prob >= TBV_MIN_MODEL_PROB
       - market_prob >= TBV_MIN_MARKET_PROB
       - forecast_sigma_c <= TBV_MAX_UNCERTAINTY (event-level uncertainty)
-      - city error_std <= TBV_MAX_UNCERTAINTY (city-level historical)
 
     Called by both the strategy (signal generation) and the dashboard
     (display).  Adding a new filter here automatically applies everywhere.
@@ -90,26 +87,6 @@ def tbv_qualifies_as_signal(
             and TBV_MAX_UNCERTAINTY < 900
             and forecast_sigma_c > TBV_MAX_UNCERTAINTY):
         return False
-
-    # City-level historical error std check
-    if city and TBV_MAX_UNCERTAINTY < 900:
-        if _city_error_cache is not None:
-            err_std = _city_error_cache.get(city.lower())
-        else:
-            try:
-                import sqlite3
-                from config import DB_PATH
-                conn = sqlite3.connect(DB_PATH)
-                row = conn.execute(
-                    "SELECT error_std_c FROM city_forecast_accuracy "
-                    "WHERE LOWER(city) = LOWER(?)", (city,)
-                ).fetchone()
-                conn.close()
-                err_std = float(row[0]) if row else None
-            except Exception:
-                err_std = None
-        if err_std is not None and err_std > TBV_MAX_UNCERTAINTY:
-            return False
 
     return True
 
@@ -132,43 +109,16 @@ class TopBinValueStrategy(Strategy):
         from edge import _write_decision_snapshots
         import uuid
 
-        logger.info(f"[{self.name}] Starting signal generation...")
+        logger.debug(f"[{self.name}] Starting signal generation...")
         clear_forecast_cache()
         reset_tomorrowio_limit()
-
-        # Load city error std for filtering unreliable cities
-        _city_error_std: dict[str, float] = {}
-        try:
-            import sqlite3
-            from config import DB_PATH
-            _acc_conn = sqlite3.connect(DB_PATH)
-            for _r in _acc_conn.execute(
-                "SELECT city, error_std_c FROM city_forecast_accuracy "
-                "WHERE error_std_c IS NOT NULL"
-            ).fetchall():
-                _city_error_std[_r[0].lower()] = float(_r[1])
-            _acc_conn.close()
-        except Exception:
-            pass
 
         snapshot_group_id = str(uuid.uuid4())
         all_events_analyzed: list[dict] = []
         signals: list[dict] = []
         skipped = 0
-        skipped_error_std = 0
 
         for event in events:
-            # Skip cities with forecast error std above threshold
-            _city_name = (event.get("city") or "").lower()
-            _err_std = _city_error_std.get(_city_name)
-            if _err_std is not None and _err_std > TBV_MAX_UNCERTAINTY:
-                logger.debug(
-                    f"[{self.name}] Skipping {event.get('city')} — "
-                    f"error_std={_err_std:.2f} > {TBV_MAX_UNCERTAINTY}"
-                )
-                skipped_error_std += 1
-                skipped += 1
-                continue
             analysis = self.analyze_event_base(event, bankroll)
             if analysis is None:
                 skipped += 1
@@ -187,22 +137,40 @@ class TopBinValueStrategy(Strategy):
             except Exception as e:
                 logger.debug(f"Snapshot write failed: {e}")
 
+            # Record price snapshot for ALL bins (for backtesting any strategy)
+            try:
+                from db import insert_bin_price_snapshots_bulk
+                price_rows = []
+                for o in analysis.get("outcomes", []):
+                    price_rows.append({
+                        "event_id": analysis.get("event_id", ""),
+                        "contract_id": o.get("contract_id", ""),
+                        "city": analysis.get("city"),
+                        "date": analysis.get("date"),
+                        "yes_price": o.get("yes_price") or o.get("market_price"),
+                        "no_price": o.get("no_price"),
+                        "volume_usd": o.get("volume_usd"),
+                        "liquidity_usd": o.get("liquidity_usd"),
+                    })
+                if price_rows:
+                    insert_bin_price_snapshots_bulk(price_rows, scan_ts)
+            except Exception as e:
+                logger.debug(f"Price snapshot write failed: {e}")
+
             all_events_analyzed.append(analysis)
 
             # --- Strategy-specific signal selection ---
-            event_signals = self._select_signals(analysis, bankroll, scan_ts, _city_error_std)
+            event_signals = self._select_signals(analysis, bankroll, scan_ts)
             signals.extend(event_signals)
 
-        logger.info(
+        logger.debug(
             f"[{self.name}] Scan complete: {len(all_events_analyzed)} events, "
             f"{len(signals)} signals, {skipped} skipped"
-            + (f" ({skipped_error_std} high-error cities)" if skipped_error_std else "")
         )
         return all_events_analyzed, signals
 
     def _select_signals(
         self, analysis: dict, bankroll: float, scan_ts: str,
-        city_error_cache: dict | None = None,
     ) -> list[dict]:
         """Select the model's top bins as signals."""
         from sizing import calculate_kelly_size, compute_confidence_multiplier, compute_time_scale
@@ -249,28 +217,21 @@ class TopBinValueStrategy(Strategy):
 
         # Split into YES candidates (top bins by model_prob) and NO candidates
         # (remaining bins, sorted by NO probability = 1 - model_prob, descending).
-        # TBV_TOP_N_BINS caps YES positions per event.
-        # MAX_BIN_BUYS caps total (YES + NO) per event (enforced by risk layer,
-        # but we also respect it here to avoid generating excess signals).
+        # MAX_YES_BINS caps YES signals per event, MAX_NO_BINS caps NO signals.
         yes_candidates = []
         no_candidates = []
         for c in all_candidates:
             if (tbv_qualifies_as_signal(
                     c["model_prob"], c["market_price"],
-                    city=city,
-                    forecast_sigma_c=analysis.get("forecast_sigma_c"),
-                    _city_error_cache=city_error_cache)
-                    and len(yes_candidates) < TBV_TOP_N_BINS):
+                    forecast_sigma_c=analysis.get("forecast_sigma_c"))
+                    and len(yes_candidates) < MAX_YES_BINS):
                 yes_candidates.append(c)
             else:
                 no_candidates.append(c)
 
         # NO candidates: sort by NO probability (lowest model_prob = highest NO conviction)
         no_candidates.sort(key=lambda c: c["model_prob"])
-
-        # Cap NO candidates so total YES + NO <= MAX_BIN_BUYS
-        max_no = max(0, MAX_BIN_BUYS - len(yes_candidates))
-        no_candidates = no_candidates[:max_no]
+        no_candidates = no_candidates[:MAX_NO_BINS]
 
         selected = yes_candidates + no_candidates
 
@@ -385,7 +346,7 @@ class TopBinValueStrategy(Strategy):
             n_yes = sum(1 for s in signals if s.get("recommended_side") == "YES")
             n_no  = sum(1 for s in signals if s.get("recommended_side") == "NO")
             yes_probs = [round(c["model_prob"]*100, 1) for c in yes_candidates[:3]]
-            logger.info(
+            logger.debug(
                 f"[{self.name}] {city} {date_str}: "
                 f"{n_yes} YES + {n_no} NO signals "
                 f"(top YES probs: {yes_probs}%)"
@@ -661,16 +622,13 @@ class TopBinValueStrategy(Strategy):
                              f"market price >={TBV_CONFIRM_PROB*100:.0f}%",
                              urgency=1)
 
-        # ---- 3. DYING — based on market price collapse ----
+        # ---- 3. DYING — market price dropped below threshold ----
         _market_price = float(current_price) if current_price is not None else None
-        _entry_market = float(pos.get("market_prob") or pos.get("entry_price") or 0)
         if (_market_price is not None
-                and _market_price < EXIT_DYING_PROB_THRESHOLD
-                and _entry_market > EXIT_DYING_ENTRY_MIN
-                and (_entry_market - _market_price) > 0.10):
+                and _market_price < EXIT_DYING_PROB_THRESHOLD):
             return _make("DYING", "SELL",
-                         f"market_collapse: entry_mkt={_entry_market:.3f} "
-                         f"current_mkt={_market_price:.3f}",
+                         f"market_price={_market_price:.3f} < "
+                         f"threshold={EXIT_DYING_PROB_THRESHOLD}",
                          urgency=1)
 
         # ---- 4. HARD STOP — uses precomputed SL price ----

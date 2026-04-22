@@ -7,7 +7,7 @@ event contains multiple mutually-exclusive outcome ranges.  For each event we:
     2. Compute model_prob[i] = P(T_max in range_i) for every outcome bin
     3. Normalize so model probs sum to 1.0
     4. Compare each model_prob[i] to the market's yes_price[i]
-    5. Flag outcomes where |edge| > EDGE_THRESHOLD as signals
+    5. Flag outcomes where edge exists and market is not at extremes
 
 run_edge_scan() returns BOTH:
     - all_events:  full analysis for every discovered event (dashboard Tab 1)
@@ -24,7 +24,7 @@ Signal dict schema (one per outcome):
 import logging
 from datetime import datetime, date
 from config import (
-    EDGE_THRESHOLD, MIN_LIQUIDITY_USD, MAX_FORECAST_DAYS,
+    MIN_LIQUIDITY_USD, MAX_FORECAST_DAYS,
     NORM_WARNING_LOW, NORM_WARNING_HIGH,
     USE_LIVE_ADJUSTMENT, LIVE_ADJ_OBS_FLOOR,
     USE_LIVE_ADJUSTMENT_SIGMA_SHRINK, LIVE_ADJ_TAIL_FLATTEN_EXPONENT,
@@ -461,7 +461,7 @@ def analyze_temp_event(event: dict, bankroll: float) -> dict | None:
         # A market_price of exactly 0 or 1 means the market considers this bin
         # resolved/impossible — no valid odds exist and the bin is not tradeable.
         market_at_extreme = market_price <= 0.0 or market_price >= 1.0
-        is_signal = abs_edge >= EDGE_THRESHOLD and side is not None and not market_at_extreme
+        is_signal = side is not None and not market_at_extreme
 
         # Kelly sizing with sign-aware confidence multiplier (Phase 3).
         # Replaces the old binary norm_warning half-Kelly with a smooth
@@ -574,7 +574,7 @@ def analyze_temp_event(event: dict, bankroll: float) -> dict | None:
     # Log the adjustment alongside the existing event summary so shadow-mode
     # behavior is observable without a DB query.
     _comp = adj.get("components", {})
-    logger.info(
+    logger.debug(
         f"LiveAdj: {city} {date_str} | blended_mu={mu_c:.2f} adj_mu={adjusted_mu:.2f} "
         f"delta={adj.get('mu_adjustment_c'):+.2f} score={adj.get('live_adjustment_score'):.3f} "
         f"floor={adj.get('observed_max_so_far_c')} "
@@ -583,7 +583,7 @@ def analyze_temp_event(event: dict, bankroll: float) -> dict | None:
     )
 
     n_signals = sum(1 for o in enriched_outcomes if o["is_signal"])
-    logger.info(
+    logger.debug(
         f"Event: {city} {date_str} | mu={mu_c:.1f}°C sd={sigma_c:.1f}°C | "
         f"{n_outcomes} outcomes | {n_signals} signals | "
         f"overround={market_sum:.3f}"
@@ -714,13 +714,6 @@ def run_edge_scan(
             f"Check ECMWF/GFS connectivity and model names."
         )
 
-    # ----- Phase 3: 2-bin bracket promotion -----
-    from config import BRACKET_ENABLED, BRACKET_MAX_BINS, BRACKET_MIN_ADJACENT_EDGE
-    if BRACKET_ENABLED:
-        signals = _promote_bracket_bins(signals, all_events_analyzed, bankroll,
-                                        BRACKET_MIN_ADJACENT_EDGE, BRACKET_MAX_BINS,
-                                        scan_ts)
-
     logger.info(
         f"Edge scan complete: {len(all_events_analyzed)} events analyzed | "
         f"{len(signals)} signals | "
@@ -728,102 +721,3 @@ def run_edge_scan(
     )
 
     return all_events_analyzed, signals
-
-
-def _promote_bracket_bins(
-    signals: list[dict],
-    all_events: list[dict],
-    bankroll: float,
-    min_edge: float,
-    max_bins: int,
-    scan_ts: str,
-) -> list[dict]:
-    """Identify adjacent bins that qualify for bracket promotion and add them
-    as signals.  Bins must be contiguous to an existing signal bin (by
-    range_low/range_high adjacency) and have edge >= min_edge."""
-    from collections import defaultdict
-
-    # Group existing signals by event_id
-    signal_events: dict[str, set[str]] = defaultdict(set)
-    for s in signals:
-        signal_events[s.get("event_id", "")].add(s.get("contract_id", ""))
-
-    promoted = 0
-    new_signals: list[dict] = list(signals)
-
-    for analysis in all_events:
-        eid = analysis.get("event_id", "")
-        sig_cids = signal_events.get(eid, set())
-        if not sig_cids:
-            continue
-
-        # Count existing signal bins for this event — respect max_bins
-        n_existing = len(sig_cids)
-        if n_existing >= max_bins:
-            continue
-
-        outcomes = analysis.get("outcomes", [])
-        # Build ordered list with edge info
-        bins = []
-        for o in outcomes:
-            if o.get("range_low") is None or o.get("range_high") is None:
-                continue
-            bins.append(o)
-        # Sort by range_low
-        bins.sort(key=lambda o: (o.get("range_low") or 0))
-
-        # Find bins adjacent to signal bins that qualify
-        for i, b in enumerate(bins):
-            if b.get("contract_id") in sig_cids:
-                # Check neighbors
-                for neighbor_idx in (i - 1, i + 1):
-                    if neighbor_idx < 0 or neighbor_idx >= len(bins):
-                        continue
-                    nb = bins[neighbor_idx]
-                    if nb.get("contract_id") in sig_cids:
-                        continue
-                    nb_cid = nb.get("contract_id")
-                    if not nb_cid or nb_cid in sig_cids:
-                        continue
-                    nb_edge = nb.get("edge")
-                    if nb_edge is None:
-                        continue
-                    nb_side = nb.get("recommended_side")
-                    if nb_side is None:
-                        continue
-                    if abs(nb_edge) < min_edge:
-                        continue
-                    if n_existing >= max_bins:
-                        break
-
-                    # Promote: create signal dict with reduced sizing
-                    bracket_signal = {
-                        **nb,
-                        "city":        analysis.get("city"),
-                        "date":        analysis.get("date"),
-                        "lat":         analysis.get("lat"),
-                        "lon":         analysis.get("lon"),
-                        "event_id":    eid,
-                        "event_title": analysis.get("event_title"),
-                        "scan_timestamp": scan_ts,
-                        "contract_id":      nb.get("contract_id"),
-                        "recommended_side": nb_side,
-                        "kelly_size":       round(nb.get("kelly_size", 0) * 0.75, 2),
-                        "market_p":         nb.get("market_price"),
-                        "model_p":          nb.get("model_prob"),
-                        "is_bracket":       True,
-                        "metadata": {
-                            "date":     analysis.get("date"),
-                            "lat":      analysis.get("lat"),
-                            "lon":      analysis.get("lon"),
-                            "variable": "temp_high",
-                        },
-                    }
-                    new_signals.append(bracket_signal)
-                    sig_cids.add(nb.get("contract_id"))
-                    n_existing += 1
-                    promoted += 1
-
-    if promoted:
-        logger.info(f"Bracket promotion: {promoted} adjacent bins promoted to signals")
-    return new_signals

@@ -61,6 +61,44 @@ def clear_forecast_cache() -> None:
     logger.debug("Forecast distribution cache cleared")
 
 
+# Per-city sigma floor cache — loaded from city_forecast_accuracy on first
+# use, refreshed when clear_city_error_cache() is called (after bias update).
+_city_error_std_cache: dict[tuple[float, float], float] | None = None
+
+
+def clear_city_error_cache() -> None:
+    """Force reload of city error_std data on next lookup.
+    Call after bias update rebuilds city_forecast_accuracy."""
+    global _city_error_std_cache
+    _city_error_std_cache = None
+    logger.debug("City error_std cache cleared — will reload from DB")
+
+
+def _get_city_error_std(lat: float, lon: float) -> float | None:
+    """Look up the historical forecast error_std for the nearest city.
+    Returns the error_std_c value, or None if no data available."""
+    global _city_error_std_cache
+    if _city_error_std_cache is None:
+        _city_error_std_cache = {}
+        try:
+            import sqlite3
+            from config import DB_PATH
+            conn = sqlite3.connect(DB_PATH)
+            rows = conn.execute(
+                "SELECT lat, lon, error_std_c FROM city_forecast_accuracy "
+                "WHERE error_std_c IS NOT NULL"
+            ).fetchall()
+            conn.close()
+            for r in rows:
+                _city_error_std_cache[(round(r[0], 2), round(r[1], 2))] = float(r[2])
+            logger.debug(f"Loaded city error_std for {len(_city_error_std_cache)} cities")
+        except Exception:
+            pass
+
+    key = (round(lat, 2), round(lon, 2))
+    return _city_error_std_cache.get(key)
+
+
 # ---------------------------------------------------------------------------
 # Unit helpers
 # ---------------------------------------------------------------------------
@@ -164,7 +202,7 @@ def _get_ecmwf_ensemble_distribution(
             timeout=15,
         )
         resp.raise_for_status()
-        logger.info(
+        logger.debug(
             f"ECMWF ensemble API call for ({lat:.2f}, {lon:.2f}) on {date_str} was successful"
         )
         daily = resp.json().get("daily", {})
@@ -259,7 +297,7 @@ def _get_gfs_ensemble_distribution(
             timeout=15,
         )
         resp.raise_for_status()
-        logger.info(
+        logger.debug(
             f"GFS ensemble API call for ({lat:.2f}, {lon:.2f}) on {date_str} was successful"
         )
         daily = resp.json().get("daily", {})
@@ -366,7 +404,7 @@ def _fetch_era5_from_api(lat: float, lon: float, dates_needed: list[str]) -> dic
                 if v is not None and d in yr_set:
                     result[d] = float(v)
                     year_count += 1
-            logger.info(
+            logger.debug(
                 f"ERA5 Archive API call for ({lat:.2f}, {lon:.2f}) year {yr} "
                 f"was successful — {year_count} temperature values retrieved"
             )
@@ -499,152 +537,10 @@ def _get_era5_clim_distribution(
 
 
 # ---------------------------------------------------------------------------
-# Source 4: NWS / NOAA NBM  (US-only)
+# Source 4: NWS hourly forecast (US-only)
 # ---------------------------------------------------------------------------
 NWS_BASE    = "https://api.weather.gov"
-NWS_MDL_BASE = "https://www.weather.gov/mdl"
 NWS_HEADERS = {"User-Agent": "WeatherArbBot/1.0 (weather-arb@example.com)"}
-
-
-def _get_nws_observation_station(lat: float, lon: float) -> str | None:
-    """Return the nearest NWS/ASOS observation station ICAO identifier."""
-    try:
-        points = httpx.get(
-            f"{NWS_BASE}/points/{lat:.4f},{lon:.4f}",
-            headers=NWS_HEADERS, timeout=10
-        )
-        points.raise_for_status()
-        logger.info(f"NWS Points API call for ({lat:.4f}, {lon:.4f}) was successful")
-        obs_url = points.json().get("properties", {}).get("observationStations")
-        if not obs_url:
-            return None
-        stations = httpx.get(obs_url, headers=NWS_HEADERS, timeout=10)
-        stations.raise_for_status()
-        features = stations.json().get("features", [])
-        if features:
-            station_id = features[0]["properties"].get("stationIdentifier", "unknown")
-            logger.info(
-                f"NWS Observation Stations API call was successful — "
-                f"nearest station: {station_id}"
-            )
-            return station_id
-        return None
-    except Exception as e:
-        logger.debug(f"NWS station lookup failed: {e}")
-        return None
-
-
-def _get_noaa_nbm_distribution(lat: float, lon: float, date_str: str) -> dict | None:
-    """
-    Fetch NOAA NBM MaxT quantile forecast via the MDL NBM text product.
-
-    The MDL endpoint provides Q10/Q25/Q50/Q75/Q90 temperature quantiles for
-    the nearest ASOS/AWOS station.  From five quantiles we recover μ and σ
-    under the assumption of approximate normality:
-        μ ≈ Q50
-        σ ≈ (Q75 - Q25) / (2 * 0.6745)   [IQR ≈ 1.3490 * σ]
-
-    Returns {"mu_c", "sigma_c", "source": "noaa_nbm", "quantiles_f"} or None.
-    Only called for US coordinates.
-    """
-    if not _is_us_coordinate(lat, lon):
-        return None
-
-    icao = _get_nws_observation_station(lat, lon)
-    if not icao:
-        return None
-
-    raw_text = None
-    for cyc in ("12", "06", "00", "18"):
-        try:
-            resp = httpx.get(
-                f"{NWS_MDL_BASE}/nbm_text",
-                params={"ele": "MaxT", "cyc": cyc, "sta": icao,
-                        "type": "txt", "israw": "yes"},
-                timeout=12,
-            )
-            if resp.status_code == 200 and resp.text.strip():
-                raw_text = resp.text
-                logger.info(
-                    f"NOAA NBM text product API call for station {icao} "
-                    f"(cycle {cyc}) on {date_str} was successful"
-                )
-                break
-        except Exception:
-            continue
-
-    if not raw_text:
-        logger.debug(f"NOAA NBM text product unavailable for {icao}")
-        return None
-
-    # Guard: the MDL endpoint now returns HTML instead of raw text.
-    # If we got HTML back, the text product is broken — fall through
-    # to the NWS hourly fallback.
-    if "<html" in raw_text[:500].lower() or "<!doctype" in raw_text[:500].lower():
-        logger.warning(
-            f"NOAA NBM returned HTML instead of text for {icao} — "
-            f"endpoint may have changed. Falling back to NWS hourly."
-        )
-        return None
-
-    # Parse the target date's quantile row.
-    # The text product contains one column per valid time; we look for the
-    # row containing five temperature values that are plausible (°F range).
-    target = datetime.fromisoformat(date_str)
-    lines  = raw_text.splitlines()
-
-    # Identify the date header line(s) and find the column index for our date.
-    # MDL products typically have dates in the header as "TUE APR 10" etc.
-    col_idx = None
-    for line in lines:
-        months = ["jan", "feb", "mar", "apr", "may", "jun",
-                  "jul", "aug", "sep", "oct", "nov", "dec"]
-        if any(m in line.lower() for m in months):
-            # Look for the target month + day in this header line
-            target_str = target.strftime("%b %d").upper().replace(" 0", "  ")
-            if target_str in line.upper():
-                parts = line.split()
-                for i, p in enumerate(parts):
-                    if target.strftime("%d").lstrip("0") in p or target_str in " ".join(parts[max(0,i-1):i+2]).upper():
-                        col_idx = i
-                        break
-                break
-
-    # Extract a row with 5 numeric values in a plausible Fahrenheit range
-    quantile_row = None
-    for line in lines:
-        nums = re.findall(r"-?\d+", line)
-        if len(nums) == 5:
-            try:
-                vals = [int(n) for n in nums]
-                if all(-60 <= v <= 150 for v in vals) and vals == sorted(vals):
-                    quantile_row = vals
-                    break
-            except ValueError:
-                pass
-
-    if not quantile_row or len(quantile_row) < 5:
-        logger.debug(f"NBM: could not parse quantile row for {icao}")
-        return None
-
-    q10, q25, q50, q75, q90 = quantile_row
-    mu_f    = float(q50)
-    # IQR method: sigma ≈ IQR / 1.349
-    sigma_f = max((q75 - q25) / 1.349, 1.0)
-
-    mu_c    = _f_to_c(mu_f)
-    sigma_c = sigma_f * 5 / 9
-
-    logger.debug(
-        f"NOAA NBM [{icao}]: Q10={q10} Q25={q25} Q50={q50} Q75={q75} Q90={q90}°F "
-        f"-> mu={mu_c:.2f}°C sd={sigma_c:.2f}°C"
-    )
-    return {
-        "mu_c":       round(mu_c, 2),
-        "sigma_c":    round(sigma_c, 2),
-        "source":     "noaa_nbm",
-        "quantiles_f": {"q10": q10, "q25": q25, "q50": q50, "q75": q75, "q90": q90},
-    }
 
 
 def _get_nws_hourly_distribution(
@@ -666,7 +562,7 @@ def _get_nws_hourly_distribution(
             headers=NWS_HEADERS, timeout=10,
         )
         pts.raise_for_status()
-        logger.info(f"NWS Points API call for ({lat:.4f}, {lon:.4f}) was successful")
+        logger.debug(f"NWS Points API call for ({lat:.4f}, {lon:.4f}) was successful")
         props    = pts.json()["properties"]
         hourly_url = props.get("forecastHourly")
         if not hourly_url:
@@ -674,7 +570,7 @@ def _get_nws_hourly_distribution(
 
         hr = httpx.get(hourly_url, headers=NWS_HEADERS, timeout=12)
         hr.raise_for_status()
-        logger.info(
+        logger.debug(
             f"NWS hourly forecast API call for ({lat:.4f}, {lon:.4f}) "
             f"on {date_str} was successful"
         )
@@ -762,7 +658,7 @@ def _get_tomorrowio_point_estimate(
             return None
         temp_max = daily[0].get("values", {}).get("temperatureMax")
         if temp_max is not None:
-            logger.info(
+            logger.debug(
                 f"Tomorrow.io API call for ({lat:.2f}, {lon:.2f}) on {date_str} "
                 f"was successful — temperatureMax: {temp_max:.1f}°C"
             )
@@ -934,24 +830,15 @@ def get_temp_distribution_for_event(
     else:
         mu_c, sigma_c = mu_fcst, sigma_fcst
 
-    # US supplemental: NOAA NBM or NWS hourly
+    # US supplemental: NWS hourly forecast
     if _is_us_coordinate(lat, lon):
-        nbm = _get_noaa_nbm_distribution(lat, lon, date_str)
-        if nbm:
-            # Incorporate NBM with moderate weight (0.30) as an additional source
+        nws_hr = _get_nws_hourly_distribution(lat, lon, date_str)
+        if nws_hr:
             mu_c, sigma_c = _blend_gaussians(
-                mu_c,        sigma_c,        0.70,
-                nbm["mu_c"], nbm["sigma_c"], 0.30,
+                mu_c,              sigma_c,              0.80,
+                nws_hr["mu_c"],    nws_hr["sigma_c"],    0.20,
             )
-            sources.append("noaa_nbm")
-        else:
-            nws_hr = _get_nws_hourly_distribution(lat, lon, date_str)
-            if nws_hr:
-                mu_c, sigma_c = _blend_gaussians(
-                    mu_c,              sigma_c,              0.80,
-                    nws_hr["mu_c"],    nws_hr["sigma_c"],    0.20,
-                )
-                sources.append("nws_hourly")
+            sources.append("nws_hourly")
 
     # (Bias correction happens per-model BEFORE blending — see above.)
 
@@ -965,7 +852,18 @@ def get_temp_distribution_for_event(
                 f"Tomorrow.io={tio_temp:.1f}°C (delta={deviation:.1f}°C)"
             )
 
-    # Final sanity gate
+    # Per-city sigma floor: use the city's actual historical forecast error
+    # as a floor on sigma. This prevents overconfidence for cities where
+    # the ensemble spread underestimates true uncertainty.
+    city_error_std = _get_city_error_std(lat, lon)
+    if city_error_std is not None and sigma_c < city_error_std:
+        logger.debug(
+            f"Sigma floor: ({lat:.2f},{lon:.2f}) ensemble sigma={sigma_c:.2f} "
+            f"< city_error_std={city_error_std:.2f} — widening"
+        )
+        sigma_c = city_error_std
+
+    # Global sanity floor
     if sigma_c < MIN_FORECAST_SIGMA_C:
         sigma_c = MIN_FORECAST_SIGMA_C
     if sigma_c > MAX_FORECAST_SIGMA_C:
@@ -1001,7 +899,7 @@ def get_temp_distribution_for_event(
         "clim_kde":    clim_kde,    # KDE object (not serialisable — stays in memory only)
     }
 
-    logger.info(
+    logger.debug(
         f"Distribution ({lat:.2f},{lon:.2f}) {date_str} "
         f"mu={mu_c:.2f}°C sd={sigma_c:.2f}°C alpha={alpha:.2f} "
         f"sources={sources}"

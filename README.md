@@ -10,7 +10,7 @@ The bot discovers active temperature markets on Polymarket, builds a probability
 
 - **Dual-model ensemble forecasting** -- blends 51-member ECMWF and 31-member GFS ensembles with ERA5 climatological priors and per-model bias correction
 - **Live intraday adjustment** -- Visual Crossing observations update the forecast distribution every 20 minutes with dynamic sigma shrinkage and observed-max floor truncation
-- **Pluggable strategy framework** -- switch between `edge_disagreement` (trade model-vs-market disagreement) and `top_bin_value` (buy the model's highest-conviction bins) via a single config flag
+- **Pluggable strategy framework** -- `top_bin_value` strategy buys the model's highest-conviction bins; new strategies can be added via the framework
 - **Active exit engine** -- classifies open positions as INVALIDATED / DYING / TOP_BIN_CONFIRMED / WEAKENED / THRIVING and exits accordingly
 - **Signal priority ranking** -- when capital is limited, ranks signals by conviction, capital efficiency, confidence, and time efficiency
 - **Paper and live trading** -- full paper-trade simulation with identical logic to live CLOB execution
@@ -56,7 +56,6 @@ polymarket-weather/
         strategies/                 # Pluggable trading strategies
             __init__.py             # Strategy registry and factory
             base.py                 # Abstract Strategy base class
-            edge_disagreement.py    # Original edge-hunting strategy
             top_bin_value.py        # Conviction-based top-bin strategy
 
         bias_correction/            # Forecast bias correction pipeline
@@ -148,8 +147,7 @@ Key variables:
 | `VISUAL_CROSSING_API_KEY` | Visual Crossing API key | -- |
 | `PAPER_TRADE` | `true` for paper trading, `false` for live | `true` |
 | `BANKROLL_USDC` | Starting bankroll in USDC | `1000` |
-| `ACTIVE_STRATEGY` | `edge_disagreement` or `top_bin_value` | `edge_disagreement` |
-| `EDGE_THRESHOLD` | Minimum edge for edge_disagreement signals | `0.07` |
+| `ACTIVE_STRATEGY` | Trading strategy to use | `top_bin_value` |
 | `TBV_MIN_MODEL_PROB` | Minimum model probability for top_bin_value YES signals | `0.10` |
 | `MAX_BIN_BUYS` | Max total positions (YES + NO) per event | `4` |
 | `TBV_TOP_N_BINS` | Max YES positions per event (top_bin_value only) | `3` |
@@ -203,17 +201,11 @@ python scripts/vc_diagnostic_report.py --days 14
 python scripts/adjustment_backtest.py --days 90
 ```
 
-## Trading Strategies
+## Trading Strategy
 
-### edge_disagreement (original)
+### top_bin_value
 
-Scans every bin for model-vs-market disagreement exceeding `EDGE_THRESHOLD` (default 7%). Trades both YES and NO on any bin where the model's probability differs significantly from the market price. High signal volume, lower win rate, relies on the model being more accurate than the market across many small bets.
-
-### top_bin_value (conviction-based)
-
-Buys the model's highest-probability bins regardless of market disagreement. Focuses on bins the model genuinely thinks will win, rather than hunting for edge on tail bins. Lower signal volume, higher win rate per signal, relies on the model correctly identifying the most likely outcome.
-
-Switch between strategies by changing `ACTIVE_STRATEGY` in `.env` and restarting.
+Buys the model's highest-probability bins when they meet minimum model and market probability thresholds. Focuses on bins the model genuinely thinks will win. New strategies can be added to the `bot/strategies/` directory by implementing the `Strategy` base class.
 
 ## Database
 

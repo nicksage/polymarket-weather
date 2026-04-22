@@ -27,6 +27,7 @@ from typing import Iterable
 
 from config import (
     MAX_FORECAST_DAYS,
+    SUMMARY_LEVEL,
     VC_DIAG_BIN_WIDTH_C,
     VC_DIAG_DISAGREE_LARGE_C,
     VC_DIAG_FUTURE_DAY_HORIZON,
@@ -48,6 +49,11 @@ from db import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _phase_end():
+    """Log a blank line to visually separate phases in console output."""
+    logger.log(SUMMARY_LEVEL, "")
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +244,7 @@ def forecast_pull_run(events: list[dict] | None = None) -> dict:
         events: optional pre-fetched event list.  If None, pulls fresh from
                 Polymarket via search_temp_high_events().
     """
-    logger.info("=== FORECAST PULL RUN START ===")
+    logger.log(SUMMARY_LEVEL, "=== FORECAST PULL RUN ===")
     pulled_at = _utc_now_iso()
 
     if events is None:
@@ -315,11 +321,11 @@ def forecast_pull_run(events: list[dict] | None = None) -> dict:
         except Exception as e:
             logger.debug(f"event-state update failed for {event_id}: {e}")
 
-    logger.info(
-        f"Forecast pull: events={counts['events']} runs={counts['runs']} "
-        f"hourly_rows={counts['hourly_rows']}"
+    logger.log(SUMMARY_LEVEL,
+        f"Forecast pull complete: {counts['events']} events | "
+        f"{counts['runs']} model runs | {counts['hourly_rows']} hourly rows"
     )
-    logger.info("=== FORECAST PULL RUN END ===")
+    _phase_end()
     return counts
 
 
@@ -543,7 +549,7 @@ def live_observation_run(events: list[dict] | None = None) -> dict:
     Poll Visual Crossing for every active event, insert a live_observations
     row, and refresh temp_events current-state columns.
     """
-    logger.info("=== LIVE OBSERVATION RUN START ===")
+    logger.log(SUMMARY_LEVEL, "=== LIVE OBSERVATION RUN ===")
     pulled_at = _utc_now_iso()
 
     if events is None:
@@ -558,9 +564,16 @@ def live_observation_run(events: list[dict] | None = None) -> dict:
         return {"events": 0, "observations": 0, "errors": 1}
 
     counts = {"events": 0, "observations": 0, "errors": 0}
+    event_list = list(_event_iter(events))
+    total_events = len(event_list)
 
-    for ev in _event_iter(events):
+    for ev in event_list:
         counts["events"] += 1
+        if counts["events"] % 10 == 1 or counts["events"] == total_events:
+            logger.log(SUMMARY_LEVEL,
+                f"Visual Crossing updating... | "
+                f"{counts['events']} of {total_events} events"
+            )
         event_id = ev.get("event_id") or ""
         city     = ev.get("city")
         lat, lon = ev["lat"], ev["lon"]
@@ -650,7 +663,7 @@ def live_observation_run(events: list[dict] | None = None) -> dict:
                     if diag.get("flag_vc_disagreement_large"): tags.append("LARGE")
                     if diag.get("flag_vc_warns_hotter"): tags.append("hotter")
                     if diag.get("flag_vc_warns_colder"): tags.append("colder")
-                    logger.info(
+                    logger.debug(
                         f"VCDiag: {city} {date_str} | vc_day_max="
                         f"{diag['vc_projected_day_max_c']:.2f}°C "
                         f"blended_mu={diag.get('blended_mu_c')} "
@@ -661,11 +674,11 @@ def live_observation_run(events: list[dict] | None = None) -> dict:
         except Exception as e:
             logger.debug(f"VC diagnostic write failed for {event_id}: {e}")
 
-    logger.info(
-        f"Live observations: events={counts['events']} "
-        f"observations={counts['observations']} errors={counts['errors']}"
+    logger.log(SUMMARY_LEVEL,
+        f"Live observations complete: {counts['events']} events | "
+        f"{counts['observations']} updated | {counts['errors']} errors"
     )
-    logger.info("=== LIVE OBSERVATION RUN END ===")
+    _phase_end()
     return counts
 
 
@@ -681,18 +694,17 @@ def retention_run(older_than_days: int = 90) -> dict:
         purge_forecast_hourly, purge_live_observations,
         purge_vc_forecast_diagnostics, purge_temp_scan_data,
     )
-    logger.info("=== RETENTION RUN START ===")
+    logger.log(SUMMARY_LEVEL, "=== RETENTION RUN ===")
     fh = purge_forecast_hourly(older_than_days)
     lo = purge_live_observations(older_than_days)
     vd = purge_vc_forecast_diagnostics(older_than_days)
     sd = purge_temp_scan_data(older_than_days=30)
-    logger.info(
-        f"Retention: purged forecast_hourly={fh} live_observations={lo} "
-        f"vc_forecast_diagnostics={vd} "
-        f"temp_events={sd['events_deleted']} temp_outcomes={sd['outcomes_deleted']} "
-        f"(time-series: {older_than_days}d, scans: 30d)"
+    total_purged = fh + lo + vd + sd["events_deleted"] + sd["outcomes_deleted"]
+    logger.log(SUMMARY_LEVEL,
+        f"Retention complete: {total_purged} rows purged "
+        f"(>{older_than_days}d time-series, >30d scans)"
     )
-    logger.info("=== RETENTION RUN END ===")
+    _phase_end()
     return {
         "forecast_hourly_deleted":         fh,
         "live_observations_deleted":       lo,
@@ -714,7 +726,7 @@ def vc_future_diagnostic_run(events: list[dict] | None = None) -> dict:
         logger.debug("VC future-day diagnostic disabled (horizon=0)")
         return {"events": 0, "diagnostics": 0, "skipped": 0, "errors": 0}
 
-    logger.info("=== VC FUTURE-DAY DIAGNOSTIC RUN START ===")
+    logger.log(SUMMARY_LEVEL, "=== VC FUTURE-DAY DIAGNOSTIC RUN ===")
     pulled_at = _utc_now_iso()
 
     if events is None:
@@ -764,7 +776,7 @@ def vc_future_diagnostic_run(events: list[dict] | None = None) -> dict:
                 insert_vc_forecast_diagnostic(diag)
                 counts["diagnostics"] += 1
                 if diag.get("flag_vc_disagreement_large"):
-                    logger.info(
+                    logger.debug(
                         f"VCDiag[D+{da}]: {city} {d} | "
                         f"vc_day_max={diag['vc_projected_day_max_c']:.2f}°C "
                         f"blended_mu={diag.get('blended_mu_c')} "
@@ -773,10 +785,9 @@ def vc_future_diagnostic_run(events: list[dict] | None = None) -> dict:
         except Exception as e:
             logger.debug(f"future_day diag insert failed for {event_id}: {e}")
 
-    logger.info(
-        f"VC future-day diagnostics: events={counts['events']} "
-        f"diagnostics={counts['diagnostics']} "
-        f"skipped={counts['skipped']} errors={counts['errors']}"
+    logger.log(SUMMARY_LEVEL,
+        f"VC diagnostics complete: {counts['events']} events | "
+        f"{counts['diagnostics']} diagnostics | {counts['errors']} errors"
     )
-    logger.info("=== VC FUTURE-DAY DIAGNOSTIC RUN END ===")
+    _phase_end()
     return counts

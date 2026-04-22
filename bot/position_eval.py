@@ -26,10 +26,7 @@ from datetime import datetime, timezone
 from config import (
     EXIT_EVAL_ENABLED,
     EXIT_DEAD_BUFFER_C,
-    EXIT_DYING_ENTRY_MIN,
     EXIT_DYING_PROB_THRESHOLD,
-    EXIT_EDGE_REVERSED_ENABLED,
-    EXIT_EV_CAPTURE_RATIO,
     EXIT_HARD_STOP_ENABLED,
     EXIT_HARD_STOP_PCT,
     EXIT_WEAKENED_SIGMA_SHIFT,
@@ -189,17 +186,14 @@ def _classify_position(pos: dict) -> ExitAction:
                          urgency=0)
 
     # =====================================================================
-    # 2. DYING — market price collapsed since entry
+    # 2. DYING — market price dropped below threshold
     # =====================================================================
     _market_price = float(pos.get("current_price") or 0) if pos.get("current_price") is not None else None
-    _entry_market = float(pos.get("market_prob") or pos.get("entry_price") or 0)
     if (_market_price is not None
-            and _market_price < EXIT_DYING_PROB_THRESHOLD
-            and _entry_market > EXIT_DYING_ENTRY_MIN
-            and (_entry_market - _market_price) > 0.10):
+            and _market_price < EXIT_DYING_PROB_THRESHOLD):
         return _make("DYING", "SELL",
-                     f"market_collapse: entry_mkt={_entry_market:.3f} "
-                     f"current_mkt={_market_price:.3f}",
+                     f"market_price={_market_price:.3f} < "
+                     f"threshold={EXIT_DYING_PROB_THRESHOLD}",
                      urgency=1)
 
     # =====================================================================
@@ -247,37 +241,7 @@ def _classify_position(pos: dict) -> ExitAction:
                                  urgency=1)
 
     # =====================================================================
-    # 4. Edge reversed — model now disagrees with our side
-    # =====================================================================
-    if EXIT_EDGE_REVERSED_ENABLED and current_market_p is not None:
-        if side == "YES" and current_prob < float(current_market_p):
-            return _make("WEAKENED", "SELL",
-                         f"edge_reversed: model={current_prob:.3f} "
-                         f"< market={float(current_market_p):.3f}",
-                         urgency=1)
-        if side == "NO" and current_prob > float(current_market_p):
-            return _make("WEAKENED", "SELL",
-                         f"edge_reversed: model={current_prob:.3f} "
-                         f"> market={float(current_market_p):.3f} (NO side)",
-                         urgency=1)
-
-    # =====================================================================
-    # 5. THRIVING — EV-based hold vs sell
-    # =====================================================================
-    if executable_bid is not None and current_prob > 0:
-        if side == "YES":
-            hold_ev = current_prob * 1.0
-        else:
-            hold_ev = (1.0 - current_prob) * 1.0
-        if executable_bid >= hold_ev * EXIT_EV_CAPTURE_RATIO:
-            return _make("THRIVING", "SELL",
-                         f"take_profit: bid={executable_bid:.3f} >= "
-                         f"{EXIT_EV_CAPTURE_RATIO*100:.0f}% of "
-                         f"hold_ev={hold_ev:.3f}",
-                         urgency=1)
-
-    # =====================================================================
-    # 6. Hard stop-loss (circuit breaker) — uses precomputed SL price
+    # 4. Hard stop-loss (circuit breaker) — uses precomputed SL price
     # =====================================================================
     if EXIT_HARD_STOP_ENABLED:
         sl_price = pos.get("stop_loss_price")

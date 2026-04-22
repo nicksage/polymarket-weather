@@ -136,6 +136,7 @@ async def _ws_loop() -> None:
         if time.time() - _last_token_refresh > 60:
             try:
                 load_open_position_tokens()
+                load_all_event_tokens()
                 _last_token_refresh = time.time()
             except Exception:
                 pass
@@ -226,7 +227,13 @@ async def _ws_loop() -> None:
                     except json.JSONDecodeError:
                         continue
 
-                    _process_message(msg)
+                    # API may send a single dict or a list of dicts
+                    if isinstance(msg, list):
+                        for m in msg:
+                            if isinstance(m, dict):
+                                _process_message(m)
+                    elif isinstance(msg, dict):
+                        _process_message(msg)
 
         except Exception as e:
             if _ws_stop_event.is_set():
@@ -331,3 +338,93 @@ def load_open_position_tokens() -> None:
             logger.info(f"[WS] No token IDs found in {len(positions)} open positions")
     except Exception as e:
         logger.error(f"[WS] Failed to load position tokens: {e}", exc_info=True)
+
+
+# Token -> (event_id, contract_id, city, date) mapping for snapshot writes
+_token_metadata: dict[str, dict] = {}
+_token_meta_lock = threading.Lock()
+
+
+def load_all_event_tokens() -> None:
+    """Subscribe to ALL active event bin tokens for market-wide price capture."""
+    try:
+        import sqlite3
+        from config import DB_PATH
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT o.yes_token_id, o.no_token_id, o.contract_id,
+                   e.event_id, e.city, e.date
+            FROM temp_outcomes o
+            JOIN temp_events e ON o.event_row_id = e.id
+            INNER JOIN (
+                SELECT event_id, MAX(scan_timestamp) AS max_ts
+                FROM temp_events GROUP BY event_id
+            ) latest ON e.event_id = latest.event_id
+                    AND e.scan_timestamp = latest.max_ts
+            WHERE e.date >= date('now')
+              AND o.yes_token_id IS NOT NULL
+        """).fetchall()
+        conn.close()
+
+        token_ids = []
+        with _token_meta_lock:
+            for r in rows:
+                yes_tid = r["yes_token_id"]
+                if yes_tid:
+                    token_ids.append(yes_tid)
+                    _token_metadata[yes_tid] = {
+                        "event_id": r["event_id"],
+                        "contract_id": r["contract_id"],
+                        "city": r["city"],
+                        "date": r["date"],
+                    }
+        if token_ids:
+            add_tokens(token_ids)
+            logger.info(f"[WS] Subscribed to {len(token_ids)} tokens across all active events")
+    except Exception as e:
+        logger.debug(f"[WS] Failed to load all event tokens: {e}")
+
+
+def write_price_snapshots() -> int:
+    """Write current live prices to bin_price_history for backtesting.
+    Called periodically (every 5-10 min) by the scheduler."""
+    from db import insert_bin_price_snapshots_bulk
+    from datetime import datetime, timezone
+
+    with _price_lock:
+        prices = dict(_live_prices)
+
+    with _token_meta_lock:
+        meta = dict(_token_metadata)
+
+    if not prices:
+        return 0
+
+    now = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for token_id, price in prices.items():
+        m = meta.get(token_id)
+        if not m:
+            continue
+        rows.append({
+            "event_id": m["event_id"],
+            "contract_id": m["contract_id"],
+            "city": m.get("city"),
+            "date": m.get("date"),
+            "yes_price": price,
+            "no_price": round(1.0 - price, 4) if price is not None else None,
+            "volume_usd": None,
+            "liquidity_usd": None,
+        })
+
+    if not rows:
+        return 0
+
+    try:
+        inserted = insert_bin_price_snapshots_bulk(rows, now)
+        logger.debug(f"[WS] Wrote {inserted} price snapshots to bin_price_history")
+        return inserted
+    except Exception as e:
+        logger.debug(f"[WS] Price snapshot write failed: {e}")
+        return 0

@@ -95,7 +95,7 @@ def _get_vc(path_suffix: str, params: dict[str, Any], timeout: float = 60.0) -> 
     j = r.json()
     cost = j.get("queryCost")
     if cost is not None:
-        logger.info(f"VC call {path_suffix} succeeded (queryCost={cost})")
+        logger.debug(f"VC call {path_suffix} succeeded (queryCost={cost})")
     return j
 
 
@@ -334,7 +334,7 @@ def fetch_intraday(lat: float, lon: float) -> dict:
         "query_cost":               j.get("queryCost"),
         "raw_day":                  day,
     }
-    logger.info(
+    logger.debug(
         f"VC intraday ({lat:.3f},{lon:.3f}): "
         f"obs_hours={len(observed)} fcst_hours={len(forecast)} "
         f"obs_max={observed_max}°C fcst_max={forecast_max}°C "

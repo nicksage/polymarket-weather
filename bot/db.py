@@ -179,6 +179,11 @@ def init_db():
             # Phase 3: liquidity-aware sizing
             "ALTER TABLE positions ADD COLUMN target_size_usdc REAL",
             "ALTER TABLE positions ADD COLUMN stop_loss_price REAL",
+            "ALTER TABLE positions ADD COLUMN peak_price REAL",
+            "ALTER TABLE positions ADD COLUMN strategy TEXT",
+            "ALTER TABLE positions ADD COLUMN pre_entry_volatility REAL",
+            "ALTER TABLE positions ADD COLUMN pre_entry_trend REAL",
+            "ALTER TABLE positions ADD COLUMN pre_entry_momentum REAL",
             # --- Phase 2b: live adjustment layer ---
             "ALTER TABLE temp_events ADD COLUMN adjusted_mu_c REAL",
             "ALTER TABLE temp_events ADD COLUMN adjusted_sigma_c REAL",
@@ -504,6 +509,36 @@ def init_db():
                 n_calls           INTEGER DEFAULT 0,
                 updated_at        TEXT
             );
+
+            -- Price history: periodic snapshots of ALL bin prices for backtesting.
+            -- Populated by the trading scan for all bins, not just traded ones.
+            CREATE TABLE IF NOT EXISTS bin_price_history (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id          TEXT    NOT NULL,
+                contract_id       TEXT    NOT NULL,
+                city              TEXT,
+                date              TEXT,
+                yes_price         REAL,
+                no_price          REAL,
+                volume_usd        REAL,
+                liquidity_usd     REAL,
+                recorded_at       TEXT    NOT NULL
+            );
+
+            -- Event resolution: records which bin won each event.
+            -- Populated by the monitor when it detects a resolved market.
+            CREATE TABLE IF NOT EXISTS event_resolutions (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id          TEXT    UNIQUE NOT NULL,
+                city              TEXT,
+                date              TEXT,
+                winning_contract_id TEXT,
+                winning_range_low REAL,
+                winning_range_high REAL,
+                winning_yes_price REAL,
+                resolved_at       TEXT,
+                recorded_at       TEXT    NOT NULL
+            );
         """)
 
         # --- Phase 2 indexes on existing table (date-windowed scans) ---
@@ -512,6 +547,80 @@ def init_db():
                          "ON temp_events(date)")
         except Exception:
             pass
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_bin_price_history_event "
+                         "ON bin_price_history(event_id, contract_id, recorded_at)")
+        except Exception:
+            pass
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_event_resolutions_event "
+                         "ON event_resolutions(event_id)")
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Bin price history (for backtesting any strategy)
+# ---------------------------------------------------------------------------
+
+def insert_bin_price_snapshot(
+    event_id: str, contract_id: str, city: str, date: str,
+    yes_price: float, no_price: float,
+    volume_usd: float, liquidity_usd: float,
+    recorded_at: str,
+) -> int:
+    sql = """
+        INSERT INTO bin_price_history
+            (event_id, contract_id, city, date, yes_price, no_price,
+             volume_usd, liquidity_usd, recorded_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    with _get_conn() as conn:
+        cur = conn.execute(sql, (
+            event_id, contract_id, city, date,
+            yes_price, no_price, volume_usd, liquidity_usd, recorded_at,
+        ))
+        return cur.lastrowid
+
+
+def insert_bin_price_snapshots_bulk(rows: list[dict], recorded_at: str) -> int:
+    """Insert price snapshots for all bins in one batch."""
+    sql = """
+        INSERT INTO bin_price_history
+            (event_id, contract_id, city, date, yes_price, no_price,
+             volume_usd, liquidity_usd, recorded_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    with _get_conn() as conn:
+        conn.executemany(sql, [
+            (r["event_id"], r["contract_id"], r.get("city"), r.get("date"),
+             r.get("yes_price"), r.get("no_price"),
+             r.get("volume_usd"), r.get("liquidity_usd"), recorded_at)
+            for r in rows
+        ])
+        return len(rows)
+
+
+def insert_event_resolution(
+    event_id: str, city: str, date: str,
+    winning_contract_id: str, winning_range_low: float,
+    winning_range_high: float, winning_yes_price: float,
+    resolved_at: str, recorded_at: str,
+) -> int:
+    sql = """
+        INSERT OR IGNORE INTO event_resolutions
+            (event_id, city, date, winning_contract_id,
+             winning_range_low, winning_range_high, winning_yes_price,
+             resolved_at, recorded_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    with _get_conn() as conn:
+        cur = conn.execute(sql, (
+            event_id, city, date, winning_contract_id,
+            winning_range_low, winning_range_high, winning_yes_price,
+            resolved_at, recorded_at,
+        ))
+        return cur.lastrowid
 
 
 # ---------------------------------------------------------------------------
@@ -574,6 +683,10 @@ def insert_position(
     entry_snapshot_id: int = None,
     target_size_usdc: float = None,
     stop_loss_price: float = None,
+    strategy: str = None,
+    pre_entry_volatility: float = None,
+    pre_entry_trend: float = None,
+    pre_entry_momentum: float = None,
 ) -> int:
     sql = """
         INSERT INTO positions (
@@ -585,8 +698,9 @@ def insert_position(
             range_low, range_high, unit,
             yes_token_id, no_token_id, lat, lon,
             forecast_sigma_c, entry_snapshot_id, target_size_usdc,
-            stop_loss_price
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            stop_loss_price, peak_price, strategy,
+            pre_entry_volatility, pre_entry_trend, pre_entry_momentum
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     with _get_conn() as conn:
         cur = conn.execute(sql, (
@@ -602,6 +716,11 @@ def insert_position(
             entry_snapshot_id,
             target_size_usdc,
             stop_loss_price,
+            entry_price,  # peak_price initialised to entry_price
+            strategy,
+            pre_entry_volatility,
+            pre_entry_trend,
+            pre_entry_momentum,
         ))
         return cur.lastrowid
 
@@ -634,8 +753,16 @@ def get_open_positions_for_event(city: str, date: str) -> list[dict]:
         return [dict(r) for r in conn.execute(sql, (city, date)).fetchall()]
 
 
-def count_open_bins_for_event(city: str, date: str) -> int:
-    """Count distinct open positions for a city+date event (for MAX_BIN_BUYS check)."""
+def count_open_bins_for_event(city: str, date: str, side: str | None = None) -> int:
+    """Count distinct open positions for a city+date event, optionally filtered by side."""
+    if side:
+        sql = """
+            SELECT COUNT(*) FROM positions
+            WHERE city = ? AND date = ? AND status = 'open' AND side = ?
+        """
+        with _get_conn() as conn:
+            row = conn.execute(sql, (city, date, side)).fetchone()
+            return row[0] if row else 0
     sql = """
         SELECT COUNT(*) FROM positions
         WHERE city = ? AND date = ? AND status = 'open'

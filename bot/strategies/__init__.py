@@ -35,5 +35,5 @@ def get_active_strategy() -> Strategy:
 
 
 # Import strategy modules to trigger registration
-from strategies import edge_disagreement  # noqa: F401, E402
-from strategies import top_bin_value      # noqa: F401, E402
+from strategies import top_bin_value        # noqa: F401, E402
+from strategies import market_price_value   # noqa: F401, E402

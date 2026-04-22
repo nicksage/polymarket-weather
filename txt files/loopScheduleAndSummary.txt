@@ -1,0 +1,140 @@
+Bot schedule — every loop and when it fires
+
+Discovery loop
+When: Every 4 hours at :00 UTC (00:00, 04:00, 08:00, 12:00, 16:00, 20:00)
+What it does: Queries the Polymarket Gamma API for all active highest-temperature events. Parses city, date, lat/lon, bin structure, and market prices. Results are cached in memory (_cached_events) and reused by every other loop until the next discovery run. This is how the bot knows what markets exist and what bins are available to trade.
+
+Forecast pull loop
+When: Every 2 hours at :05 UTC (00:05, 02:05, 04:05, ... 22:05)
+What it does: For each active event within the forecast horizon, fetches fresh ECMWF and GFS ensemble distributions from Open-Meteo. Writes one forecast_runs row per source per event (capturing the raw mu/sigma at this pull time) and up to 72 forecast_hourly rows with the hourly temperature/humidity/cloud/wind/precip path. Computes forecast deltas vs the prior pull and updates temp_events current-state columns (forecast_delta_mu_c, forecast_agreement_c, latest_forecast_ts). This is what keeps the model's forecast fresh between trading cycles.
+
+VC future-day diagnostic loop
+When: Every 2 hours at :07 UTC (00:07, 02:07, ... 22:07)
+What it does: For each active event that is 1+ days out, calls Visual Crossing to get VC's projected daily high and hourly forecast path. Computes disagreement metrics (VC vs our blended mu, in degrees C and bins-apart) and warning flags. Writes one vc_forecast_diagnostics row per event tagged kind='future_day'. Runs 2 minutes after the forecast pull so disagreement metrics use fresh blended mu context. Shadow-only — does not influence trades.
+
+Trading loop
+When: Every hour at :15 UTC
+What it does: The main decision cycle. Uses the active strategy (top_bin_value) to analyze all discovered events:
+  1. Signal generation: For each event, computes the blended temperature distribution (ECMWF+GFS ensembles, ERA5 climatological prior, NWS hourly for US cities), applies live adjustment (mu residual + sigma shrinkage + observed-max floor), and calculates model probabilities per bin.
+  2. Entry criteria (tbv_qualifies_as_signal): model_prob >= TBV_MIN_MODEL_PROB, market_prob >= TBV_MIN_MARKET_PROB, forecast_sigma_c <= TBV_MAX_UNCERTAINTY. Top bins by model probability are selected as YES signals (capped at MAX_YES_BINS per event).
+  3. Risk filtering: Pre-checks (allowed side, expiry, liquidity, drawdown, US-only, live data) filter out untradeable signals. Survivors are ranked by the strategy's composite score (conviction, price discount, confidence, time efficiency, city accuracy).
+  4. Execution: Ranked signals go through portfolio-level checks (MAX_YES_BINS/MAX_NO_BINS, total exposure, event exposure, city-day exposure) in priority order. Passing signals are sized via fractional Kelly with confidence multiplier and liquidity-aware capping, then executed (paper-logged or CLOB order placed).
+  5. Top-ups: Underfilled positions (liquidity-capped on prior cycles) are topped up if more liquidity is now available and the thesis is still intact.
+  6. Exit engine: Evaluates all open positions and classifies each as:
+     - INVALIDATED: observed temp exceeded bin's upper bound + buffer
+     - TOP_BIN_CONFIRMED: another bin's market price hit >= TBV_CONFIRM_PROB, exit other YES positions
+     - DYING: market price dropped below EXIT_DYING_PROB_THRESHOLD
+     - HARD_STOP: current price <= precomputed stop-loss price (entry * (1 + EXIT_HARD_STOP_PCT))
+     - HEALTHY: hold
+     Positions classified for exit are sold immediately.
+
+WebSocket stop-loss monitoring
+When: Continuous (background thread, started immediately on bot startup)
+What it does: Maintains a persistent WebSocket connection to the Polymarket CLOB market channel. Receives real-time price updates for all open position token IDs. On every price tick, checks the price against the position's precomputed stop_loss_price. If breached, executes an immediate exit without waiting for the hourly trading loop. Token subscriptions refresh from the DB every 60 seconds. Auto-reconnects with exponential backoff on connection failures.
+
+Live observation loop
+When: Every 20 minutes at :00, :20, :40 UTC
+What it does: For each active event, calls Visual Crossing fetch_intraday() to get the current temperature, humidity, cloud cover, wind, precip, conditions, and the observed hourly path for today. Writes one live_observations row per event. Also writes one vc_forecast_diagnostics row tagged kind='same_day' with VC's projected daily high and disagreement metrics. Updates temp_events current-state columns: current_temp_c, observed_max_so_far_c, expected_temp_now_c, actual_minus_expected_c, timezone, latest_observation_ts. This is the 20-minute heartbeat that feeds the live adjustment layer and the exit engine's INVALIDATED classification.
+
+Monitor loop
+When: Every hour at :30 UTC
+What it does: Three responsibilities:
+  1. Cancel pending orders: Cancels any unfilled CLOB orders that haven't been matched since the trading scan placed them.
+  2. Settle resolved markets: Checks every open position against the Gamma API to detect resolved markets. When a market closes and a winner is determined, computes realized P&L and marks the position closed.
+  3. Update unrealized P&L: For all still-open positions, fetches current market price (from WebSocket cache first, then Gamma API as fallback). Updates current_price, unrealized_pnl, and tracks max favorable/adverse excursion (MFE/MAE). Uses a shared status cache between settle and P&L update steps to avoid duplicate API calls.
+
+Retention loop
+When: Daily at 04:30 UTC
+What it does: Purges forecast_hourly, live_observations, and vc_forecast_diagnostics rows older than 90 days. Purges temp_events and temp_outcomes scan data older than 30 days. Summary tables (forecast_runs, decision_snapshots, positions) are kept indefinitely. Runs before the bias update so the DB is clean before heavy writes.
+
+Bias update loop
+When: Daily at 05:00 UTC
+What it does: Fetches the last 14 days of Visual Crossing station observations and Open-Meteo Previous Runs ECMWF/GFS forecasts for every active city. Rebuilds forecast_errors (the per-model, per-city bias correction table) by comparing what each model forecasted against what actually happened. Also rebuilds city_forecast_accuracy with per-city MAE, RMSE, error_std, and accuracy scores. This is what feeds the per-model bias correction applied to ECMWF and GFS forecasts before blending.
+
+Startup sequence (on boot, before scheduler takes over)
+  1. DB init
+  2. Ensemble health check (ECMWF + GFS connectivity test against Chicago)
+  3. WebSocket price stream + stop-loss monitoring (starts immediately so existing positions are protected)
+  4. Bias update (skipped if already ran today)
+  5. Discovery (finds active Polymarket events)
+  6. Forecast pull (skipped if ran within last 2 hours)
+  7. Live observations (skipped if ran within last 20 minutes)
+  8. Trading scan + exit engine
+  9. Monitor (cancel/settle/P&L update)
+  10. Scheduler takes over
+
+Visual timeline of a typical hour (top_bin_value strategy)
+
+:00  Live observation (20-min)  +  Discovery (if 4h boundary)
+:05  Forecast pull (if 2h boundary)
+:07  VC future-day diagnostic (if 2h boundary)
+:15  Trading scan + exit engine
+:20  Live observation (20-min)
+:30  Monitor (cancel/resolve/P&L)
+:40  Live observation (20-min)
+     WebSocket stop-loss monitoring runs continuously in the background
+     Price snapshots every 5 minutes (all bins, for backtesting)
+
+Visual timeline of a typical hour (market_price_value strategy)
+
+:00  Discovery (if 4h boundary)
+:05  (no forecast pull)
+:15  Trading scan + exit engine
+:30  Monitor (cancel/resolve/P&L)
+     WebSocket trailing stop + take profit monitoring runs continuously
+     Price snapshots every 5 minutes (all bins, for backtesting)
+     No weather data collection loops run (no forecast pull, live obs, VC diag, or bias update)
+
+
+================================================================================
+MARKET PRICE VALUE STRATEGY (market_price_value)
+================================================================================
+
+Overview: Pure market-price strategy. No weather model, no ensemble forecasts, no weather API calls. Entries are based solely on the Polymarket market price for each bin. The strategy buys the highest-priced bins within a configurable price range.
+
+Entry criteria:
+  - Buy bins where MPV_MIN_PRICE <= yes_price <= MPV_MAX_PRICE
+  - Select top N bins by price (N = MAX_YES_BINS)
+  - Flat dollar sizing per bin (MPV_BET_SIZE)
+  - No model probability or weather data involved
+
+Exit criteria (evaluated in this order):
+  1. TAKE_PROFIT: sell when market price reaches MPV_TAKE_PROFIT (e.g., 0.90)
+  2. TOP_BIN_CONFIRMED: when any bin in the event hits MPV_CONFIRM_PRICE (e.g., 0.75), exit all other bins for that event
+  3. TRAILING_STOP: once price rises MPV_TRAIL_ACTIVATION above entry, a trailing stop activates at MPV_TRAIL_PCT below the peak price. The peak is tracked per-position via WebSocket in real-time.
+  4. DYING: market price drops below EXIT_DYING_PROB_THRESHOLD
+  5. HARD_STOP: fixed stop at entry * (1 - MPV_HARD_STOP_PCT) as fallback before the trailing stop activates
+
+WebSocket real-time monitoring:
+  The realtime_exits.py module handles all three real-time exit types for MPV:
+  - Take profit fires instantly when price crosses the threshold
+  - Trailing stop tracks peak_price on every tick and fires when price drops below peak * (1 - trail%)
+  - Hard stop fires as fallback for positions that never rose enough to activate the trail
+
+  For top_bin_value strategy, the WebSocket only monitors hard stops (original behavior preserved).
+
+Configuration variables (in .env):
+  MPV_MIN_PRICE=0.25           Minimum YES price to enter
+  MPV_MAX_PRICE=0.50           Maximum YES price to enter
+  MPV_BET_SIZE=500             Flat dollar amount per bin
+  MPV_TAKE_PROFIT=0.90         Exit when price reaches this level
+  MPV_TRAIL_PCT=0.12           Trailing stop percentage from peak
+  MPV_TRAIL_ACTIVATION=0.05    Price must rise this much above entry before trail activates
+  MPV_HARD_STOP_PCT=0.30       Fixed stop-loss from entry (fallback)
+  MPV_CONFIRM_PRICE=0.75       Exit other bins when one bin hits this price
+
+Loops that are DISABLED when this strategy is active:
+  - Forecast pull (ECMWF + GFS ensemble data)
+  - Live observation (Visual Crossing intraday weather)
+  - VC future-day diagnostic
+  - Bias update (forecast error correction)
+
+Loops that STILL RUN:
+  - Discovery (finds active Polymarket events)
+  - Trading scan (generates signals from market prices, executes trades)
+  - Monitor (P&L updates, resolution detection, event resolution recording)
+  - WebSocket (real-time price stream, trailing stop, take profit)
+  - Price snapshots (every 5 min, all bins, for backtesting)
+  - Retention (database cleanup)
+
+To activate: Set ACTIVE_STRATEGY=market_price_value in .env

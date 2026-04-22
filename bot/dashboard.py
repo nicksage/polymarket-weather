@@ -8,8 +8,7 @@ Two tabs:
         edge, and EV.  Includes a distribution chart (model vs. market) per event.
 
     Tab 2 — Trade Signals
-        Only the outcome ranges where the model identifies sufficient edge
-        (|model_prob - market_price| >= EDGE_THRESHOLD) to justify a trade.
+        Only the outcome ranges that qualify as signals under the active strategy.
         Filterable by city, EV, date range.
 
 Run with:
@@ -25,7 +24,7 @@ import streamlit as st
 from datetime import datetime
 from streamlit_autorefresh import st_autorefresh
 
-from config import DB_PATH, EDGE_THRESHOLD
+from config import DB_PATH
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -68,17 +67,22 @@ st_autorefresh(interval=_REFRESH_INTERVAL_MS, limit=None, key="global_autorefres
 
 @st.cache_data(ttl=60)
 def load_events() -> pd.DataFrame:
-    """Load all temp_events rows from the latest scan."""
+    """Load the most recent scan row for each event (city+date)."""
     try:
         conn = sqlite3.connect(DB_PATH)
-        ts_row = conn.execute("SELECT MAX(scan_timestamp) FROM temp_events").fetchone()
-        if not ts_row or not ts_row[0]:
-            conn.close()
-            return pd.DataFrame()
-        ts = ts_row[0]
         df = pd.read_sql(
-            "SELECT * FROM temp_events WHERE scan_timestamp = ? ORDER BY city, date",
-            conn, params=(ts,)
+            """
+            SELECT e.* FROM temp_events e
+            INNER JOIN (
+                SELECT event_id, MAX(scan_timestamp) AS max_ts
+                FROM temp_events
+                GROUP BY event_id
+            ) latest ON e.event_id = latest.event_id
+                    AND e.scan_timestamp = latest.max_ts
+            WHERE e.date >= date('now')
+            ORDER BY e.city, e.date
+            """,
+            conn,
         )
         conn.close()
         return df
@@ -88,14 +92,9 @@ def load_events() -> pd.DataFrame:
 
 @st.cache_data(ttl=60)
 def load_outcomes(signals_only: bool = False) -> pd.DataFrame:
-    """Load all temp_outcomes rows from the latest scan, joined with event context."""
+    """Load the most recent outcomes for each event, joined with event context."""
     try:
         conn = sqlite3.connect(DB_PATH)
-        ts_row = conn.execute("SELECT MAX(scan_timestamp) FROM temp_events").fetchone()
-        if not ts_row or not ts_row[0]:
-            conn.close()
-            return pd.DataFrame()
-        ts = ts_row[0]
         where = "AND o.is_signal = 1" if signals_only else ""
         df = pd.read_sql(
             f"""
@@ -119,11 +118,17 @@ def load_outcomes(signals_only: bool = False) -> pd.DataFrame:
                 e.lon
             FROM temp_outcomes o
             JOIN temp_events e ON o.event_row_id = e.id
-            WHERE o.scan_timestamp = ?
+            INNER JOIN (
+                SELECT event_id, MAX(scan_timestamp) AS max_ts
+                FROM temp_events
+                GROUP BY event_id
+            ) latest ON e.event_id = latest.event_id
+                    AND e.scan_timestamp = latest.max_ts
+            WHERE e.date >= date('now')
             {where}
             ORDER BY o.ev DESC
             """,
-            conn, params=(ts,)
+            conn,
         )
         conn.close()
         _US_LAT = (15.0, 72.0)
@@ -443,7 +448,8 @@ def _render_event_card(city: str, date_str: str, grp: pd.DataFrame) -> None:
     """Render a single event summary card for the Market Overview grid."""
     unit     = grp["unit"].iloc[0] if not grp.empty else "celsius"
     ev_unit  = grp["display_unit"].iloc[0] if "display_unit" in grp.columns else unit
-    days_out = int(grp["days_ahead"].iloc[0]) if "days_ahead" in grp.columns else 0
+    _da_raw = grp["days_ahead"].iloc[0] if "days_ahead" in grp.columns else 0
+    days_out = int(_da_raw) if _da_raw is not None and not (isinstance(_da_raw, float) and _da_raw != _da_raw) else 0
     title_val = grp["event_title"].iloc[0] if "event_title" in grp.columns else None
     title    = (
         title_val if not _is_missing(title_val)
@@ -826,7 +832,7 @@ with _tab_contract:
                     display_rows.append({
                         "City":            row.get("city", ""),
                         "Date":            row.get("date", ""),
-                        "Days Out":        int(row.get("days_ahead", 0)),
+                        "Days Out":        int(row.get("days_ahead") or 0) if not _is_missing(row.get("days_ahead")) else 0,
                         "Range":           _range_label(row.get("range_low"), row.get("range_high"), unit),
                         "Yes Market Prob": _fmt_pct(row.get("yes_price") or row.get("market_price")),
                         "No Market Prob":  _fmt_pct(row.get("no_price")),
@@ -881,7 +887,8 @@ with _tab_contract:
                     sigma_c   = grp["forecast_sigma_c"].iloc[0]    if "forecast_sigma_c"    in grp.columns else None
                     clim_mu   = grp["clim_mu_c"].iloc[0]           if "clim_mu_c"           in grp.columns else None
                     overround = grp["market_overround"].iloc[0]    if "market_overround"    in grp.columns else None
-                    days_out  = int(grp["days_ahead"].iloc[0])     if "days_ahead"          in grp.columns else 0
+                    _da2 = grp["days_ahead"].iloc[0] if "days_ahead" in grp.columns else 0
+                    days_out  = int(_da2) if _da2 is not None and not (isinstance(_da2, float) and _da2 != _da2) else 0
 
                     def _chart_sort(r):
                         lo = None if _is_missing(r.range_low)  else float(r.range_low)
@@ -1038,6 +1045,21 @@ def _build_open_rows(df):
     except Exception:
         pass
 
+    # Load latest volume data by contract_id
+    _volumes: dict[str, float] = {}
+    try:
+        _vol_conn = sqlite3.connect(DB_PATH)
+        for _r in _vol_conn.execute("""
+            SELECT contract_id, volume_usd FROM temp_outcomes
+            WHERE volume_usd IS NOT NULL
+            ORDER BY scan_timestamp DESC
+        """).fetchall():
+            if _r[0] not in _volumes:
+                _volumes[_r[0]] = float(_r[1])
+        _vol_conn.close()
+    except Exception:
+        pass
+
     rows = []
     for _, p in df.iterrows():
         entry  = p.get("entry_price")
@@ -1052,27 +1074,26 @@ def _build_open_rows(df):
         _cid = p.get("contract_id")
         _curr_model = _current_model_probs.get(_cid)
         _curr_market = float(curr) if curr else None
+        _vol = _volumes.get(_cid)
 
         rows.append({
+            "Strategy":          p.get("strategy") or "top_bin_value",
             "City":              p.get("city", ""),
             "Date":              _fmt_date_mmddyyyy(p.get("date")),
             "Local Time":        _fmt_local_time(p.get("local_time")),
-            "Question":          p.get("question") or "",
             "Side":              p.get("side", ""),
-            "Fill":              p.get("fill_status", "filled"),
             "Range":             _range,
             "Size ($)":          f"${p.get('size_usdc', 0):.2f}",
             "Shares":            f"{shares:.2f}" if shares else "",
             "Entered":           _fmt_entered(p.get("entry_time")),
             "Entry Price":       f"{entry:.4f}" if entry else "",
             "Current Price":     f"{curr:.4f}" if curr else "",
+            "Peak Price":        f"{float(p.get('peak_price')):.4f}" if not _is_missing(p.get("peak_price")) else "",
             "SL Price":          f"{float(p.get('stop_loss_price')):.4f}" if not _is_missing(p.get("stop_loss_price")) else "",
             "Unrealized P&L":    f"${unreal:+.4f}" if unreal is not None else "",
-            "Entry Model Prob":  _fmt_pct(p.get("model_prob")),
-            "Curr Model Prob":   _fmt_pct(_curr_model),
             "Entry Market Prob": _fmt_pct(p.get("market_prob")),
             "Curr Market Prob":  _fmt_pct(_curr_market),
-            "Entry Uncertainty":  f"{p['forecast_sigma_c']:.2f}C" if not _is_missing(p.get("forecast_sigma_c")) else "",
+            "Volume":            f"${_vol:,.0f}" if _vol else "",
         })
     return rows
 
@@ -1085,19 +1106,17 @@ def _build_closed_rows(df):
             not _is_missing(p.get("range_low")) or not _is_missing(p.get("range_high"))
         ) else (p.get("question") or "")[:30]
         rows.append({
+            "Strategy":     p.get("strategy") or "top_bin_value",
             "City":         p.get("city", ""),
             "Date":         _fmt_date_mmddyyyy(p.get("date")),
-            "Question":     p.get("question") or "",
             "Side":         p.get("side", ""),
             "Range":        _range,
             "Size ($)":     f"${p.get('size_usdc', 0):.2f}",
             "Realized P&L": f"${p.get('pnl', 0):+.4f}" if p.get("pnl") is not None else "",
             "Entry":        f"{p.get('entry_price', 0):.4f}",
-            "SL Price":     f"{float(p.get('stop_loss_price')):.4f}" if not _is_missing(p.get("stop_loss_price")) else "",
             "Exit":         f"{p.get('exit_price', 0):.4f}" if p.get("exit_price") is not None else "",
             "Entered":      _fmt_entered(p.get("entry_time")),
             "Closed":       _fmt_entered(p.get("exit_time")),
-            "Entry Uncertainty":  f"{p['forecast_sigma_c']:.2f}C" if not _is_missing(p.get("forecast_sigma_c")) else "",
             "Exit Reason":  p.get("exit_reason") or "",
         })
     return rows
@@ -1522,9 +1541,31 @@ with _tab_paper:
 
     _show_refresh_messages()
 
+    # Strategy filter (applied to ALL content in this tab)
+    _paper_all_raw = (
+        positions_df[positions_df["is_paper"] == 1].copy()
+        if not positions_df.empty and "is_paper" in positions_df.columns
+        else pd.DataFrame()
+    )
+    _strat_options = ["All"]
+    if not _paper_all_raw.empty and "strategy" in _paper_all_raw.columns:
+        _strat_options += sorted(_paper_all_raw["strategy"].dropna().unique().tolist())
+    _sel_strategy = st.selectbox("Strategy", _strat_options, key="paper_strategy_filter")
+
+    if _sel_strategy != "All" and not _paper_all_raw.empty and "strategy" in _paper_all_raw.columns:
+        _paper_all = _paper_all_raw[_paper_all_raw["strategy"] == _sel_strategy].copy()
+    else:
+        _paper_all = _paper_all_raw
+
+    _paper_open = _paper_all[_paper_all["status"] == "open"].copy() if not _paper_all.empty else pd.DataFrame()
+    if not _paper_open.empty and "fill_status" in _paper_open.columns:
+        _paper_open = _paper_open[_paper_open["fill_status"] != "cancelled"]
+    _paper_closed = _paper_all[_paper_all["status"] == "closed"].copy() if not _paper_all.empty else pd.DataFrame()
+    if not _paper_closed.empty and "fill_status" in _paper_closed.columns:
+        _paper_closed = _paper_closed[_paper_closed["fill_status"] != "cancelled"]
+
     _paper_capital = _paper_open["size_usdc"].sum() if not _paper_open.empty and "size_usdc" in _paper_open.columns else 0
 
-    # Compute P&L metrics across all paper positions (open + closed)
     _paper_all_pnl = []
     if not _paper_open.empty and "unrealized_pnl" in _paper_open.columns:
         _paper_all_pnl.extend(_paper_open["unrealized_pnl"].dropna().tolist())
@@ -1545,11 +1586,6 @@ with _tab_paper:
     _pm6.metric("Max Profit", f"${_p_max_profit:,.2f}")
     _pm7.metric("Total P&L", f"${_p_total_pnl:+,.2f}")
 
-    _paper_all = (
-        positions_df[positions_df["is_paper"] == 1].copy()
-        if not positions_df.empty and "is_paper" in positions_df.columns
-        else pd.DataFrame()
-    )
     _paper_stats = _compute_trade_stats(_paper_all)
     st.dataframe(
         _paper_stats,
@@ -1622,6 +1658,29 @@ with _tab_live:
 
     _show_refresh_messages()
 
+    # Strategy filter (applied to ALL content in this tab)
+    _live_all_raw = (
+        positions_df[positions_df["is_paper"] == 0].copy()
+        if not positions_df.empty and "is_paper" in positions_df.columns
+        else pd.DataFrame()
+    )
+    _live_strat_options = ["All"]
+    if not _live_all_raw.empty and "strategy" in _live_all_raw.columns:
+        _live_strat_options += sorted(_live_all_raw["strategy"].dropna().unique().tolist())
+    _sel_live_strategy = st.selectbox("Strategy", _live_strat_options, key="live_strategy_filter")
+
+    if _sel_live_strategy != "All" and not _live_all_raw.empty and "strategy" in _live_all_raw.columns:
+        _live_all = _live_all_raw[_live_all_raw["strategy"] == _sel_live_strategy].copy()
+    else:
+        _live_all = _live_all_raw
+
+    _live_open = _live_all[_live_all["status"] == "open"].copy() if not _live_all.empty else pd.DataFrame()
+    if not _live_open.empty and "fill_status" in _live_open.columns:
+        _live_open = _live_open[_live_open["fill_status"] != "cancelled"]
+    _live_closed = _live_all[_live_all["status"] == "closed"].copy() if not _live_all.empty else pd.DataFrame()
+    if not _live_closed.empty and "fill_status" in _live_closed.columns:
+        _live_closed = _live_closed[_live_closed["fill_status"] != "cancelled"]
+
     _live_capital = _live_open["size_usdc"].sum() if not _live_open.empty and "size_usdc" in _live_open.columns else 0
 
     _live_all_pnl = []
@@ -1644,11 +1703,6 @@ with _tab_live:
     _lm6.metric("Max Profit", f"${_l_max_profit:,.2f}")
     _lm7.metric("Total P&L", f"${_l_total_pnl:+,.2f}")
 
-    _live_all = (
-        positions_df[positions_df["is_paper"] == 0].copy()
-        if not positions_df.empty and "is_paper" in positions_df.columns
-        else pd.DataFrame()
-    )
     _live_stats = _compute_trade_stats(_live_all)
     st.dataframe(
         _live_stats,

@@ -30,7 +30,7 @@ try:
 except Exception:
     _tf = None
 
-from config import PAPER_TRADE, WALLET_ADDRESS, MIN_LIQUIDITY_USD
+from config import PAPER_TRADE, WALLET_ADDRESS, MIN_LIQUIDITY_USD, SUMMARY_LEVEL
 from db import (
     get_open_positions,
     get_pending_positions,
@@ -48,7 +48,83 @@ from execution import cancel_order, get_clob_client
 
 logger = logging.getLogger(__name__)
 
+
+def _phase_end():
+    logger.log(SUMMARY_LEVEL, "")
+
+
 DATA_API_BASE = "https://data-api.polymarket.com"
+
+
+def _scan_event_resolutions() -> int:
+    """Check past events for resolved winners using latest price data.
+    Records winners in event_resolutions for backtesting any strategy."""
+    from db import insert_event_resolution
+    import sqlite3 as _sq
+    from config import DB_PATH
+
+    try:
+        conn = _sq.connect(DB_PATH)
+        conn.row_factory = _sq.Row
+
+        # Find past events with a bin at 90%+ (likely resolved)
+        # that don't yet have a resolution record
+        past_events = conn.execute("""
+            SELECT DISTINCT ds.event_id, e.city, e.date
+            FROM decision_snapshots ds
+            JOIN temp_events e ON ds.event_id = e.event_id
+            WHERE e.date < date('now')
+              AND ds.market_price >= 0.90
+              AND ds.event_id NOT IN (SELECT event_id FROM event_resolutions)
+            GROUP BY ds.event_id
+            ORDER BY e.date DESC
+            LIMIT 50
+        """).fetchall()
+
+        found = 0
+        for ev in past_events:
+            eid, city, date_str = ev["event_id"], ev["city"], ev["date"]
+
+            # Check if any bin hit 90%+ in the latest snapshot (=winner)
+            winner = conn.execute("""
+                SELECT ds.contract_id, MAX(ds.market_price) as peak
+                FROM decision_snapshots ds
+                WHERE ds.event_id = ? AND ds.market_price >= 0.90
+                GROUP BY ds.contract_id
+                ORDER BY peak DESC
+                LIMIT 1
+            """, (eid,)).fetchone()
+
+            if not winner:
+                continue
+
+            # Get range info for the winning bin
+            range_info = conn.execute("""
+                SELECT range_low, range_high FROM temp_outcomes
+                WHERE contract_id = ?
+                ORDER BY scan_timestamp DESC LIMIT 1
+            """, (winner["contract_id"],)).fetchone()
+
+            rl = float(range_info["range_low"]) if range_info and range_info["range_low"] else None
+            rh = float(range_info["range_high"]) if range_info and range_info["range_high"] else None
+
+            now = _now()
+            insert_event_resolution(
+                event_id=eid, city=city, date=date_str,
+                winning_contract_id=winner["contract_id"],
+                winning_range_low=rl, winning_range_high=rh,
+                winning_yes_price=float(winner["peak"]),
+                resolved_at=date_str + "T23:59:59", recorded_at=now,
+            )
+            found += 1
+
+        conn.close()
+        if found:
+            logger.info(f"[MONITOR] Recorded {found} event resolution(s) for backtesting")
+        return found
+    except Exception as e:
+        logger.debug(f"Event resolution scan failed: {e}")
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -145,16 +221,14 @@ def _cancel_pending_orders(client) -> int:
 # Step 2 — Detect resolved markets, close positions, record P&L
 # ---------------------------------------------------------------------------
 
-def _settle_resolved_positions(data_api_index: dict) -> int:
+def _settle_resolved_positions(data_api_index: dict,
+                               status_cache: dict | None = None) -> int:
     """
     Check every open filled position against the Gamma API.  If the market
     has resolved, compute P&L and mark the position closed.
 
-    For live positions, cross-check with the Data API:
-      - If the on-chain position still shows size > 0, the payout hasn't been
-        redeemed yet — we still record the resolution P&L from Gamma outcome.
-      - If the on-chain position shows cashPnl, use that as the authoritative
-        realized P&L figure.
+    status_cache: shared dict of {contract_id: status_dict} to avoid
+    duplicate API calls when _update_unrealized_pnl runs right after.
 
     Returns count of positions closed.
     """
@@ -176,7 +250,12 @@ def _settle_resolved_positions(data_api_index: dict) -> int:
         date        = pos.get("date", "")
 
         gamma_market_id = pos.get("gamma_market_id")
-        status = get_market_status(contract_id, gamma_market_id=gamma_market_id)
+        if status_cache is not None and contract_id in status_cache:
+            status = status_cache[contract_id]
+        else:
+            status = get_market_status(contract_id, gamma_market_id=gamma_market_id)
+            if status_cache is not None and status is not None:
+                status_cache[contract_id] = status
         if status is None:
             logger.debug(f"[MONITOR] Could not fetch status for {contract_id[:12]}")
             continue
@@ -215,6 +294,22 @@ def _settle_resolved_positions(data_api_index: dict) -> int:
         update_position_outcome(pos_id, exit_price, now, pnl, "closed")
         closed_count += 1
 
+        # Record which bin won this event (for backtesting)
+        if our_side_won and side == "YES":
+            try:
+                from db import insert_event_resolution
+                insert_event_resolution(
+                    event_id=pos.get("event_id", ""),
+                    city=city, date=date,
+                    winning_contract_id=contract_id,
+                    winning_range_low=pos.get("range_low"),
+                    winning_range_high=pos.get("range_high"),
+                    winning_yes_price=status.get("yes_price"),
+                    resolved_at=now, recorded_at=now,
+                )
+            except Exception:
+                pass
+
         result_label = "WON" if our_side_won else "LOST"
         logger.info(
             f"[MONITOR] Position {pos_id} CLOSED — {result_label} | "
@@ -230,10 +325,14 @@ def _settle_resolved_positions(data_api_index: dict) -> int:
 # Step 3 — Update unrealized P&L for still-open positions
 # ---------------------------------------------------------------------------
 
-def _update_unrealized_pnl(data_api_index: dict) -> int:
+def _update_unrealized_pnl(data_api_index: dict,
+                           status_cache: dict | None = None) -> int:
     """
     For every open filled position, refresh current_price, unrealized_pnl,
     and local_time (current local time at the contract's city).
+
+    status_cache: shared dict of {contract_id: status_dict} populated by
+    _settle_resolved_positions — avoids duplicate Gamma API calls.
 
     Live positions: Data API current_value/size gives current price per share;
                     Gamma API used as fallback.
@@ -287,8 +386,13 @@ def _update_unrealized_pnl(data_api_index: dict) -> int:
 
         # --- Fallback: Gamma API (also primary for paper trades) ---
         if current_price is None:
-            gamma_market_id = pos.get("gamma_market_id")
-            status = get_market_status(contract_id, gamma_market_id=gamma_market_id)
+            if status_cache is not None and contract_id in status_cache:
+                status = status_cache[contract_id]
+            else:
+                gamma_market_id = pos.get("gamma_market_id")
+                status = get_market_status(contract_id, gamma_market_id=gamma_market_id)
+                if status_cache is not None and status is not None:
+                    status_cache[contract_id] = status
             if status and not status.get("closed"):
                 current_price = status.get("yes_price") if side == "YES" else status.get("no_price")
 
@@ -315,7 +419,7 @@ def run_monitor_loop() -> dict:
 
     Returns a summary dict for logging.
     """
-    logger.info("=== MONITOR RUN START ===")
+    logger.log(SUMMARY_LEVEL, "=== MONITOR RUN ===")
 
     # Step 0a — Backfill lat/lon for any positions missing coordinates.
     # Uses the static CITY_COORDS table; safe to call every run (no-op if all filled).
@@ -358,17 +462,31 @@ def run_monitor_loop() -> dict:
     elif not PAPER_TRADE and WALLET_ADDRESS:
         logger.warning("Data API index empty — P&L enrichment will use Gamma API only")
 
+    # Shared cache so _settle and _update_pnl don't duplicate Gamma API calls
+    _status_cache: dict[str, dict] = {}
+
     cancelled = _cancel_pending_orders(client)
-    closed    = _settle_resolved_positions(data_api_index)
-    updated   = _update_unrealized_pnl(data_api_index)
+    closed    = _settle_resolved_positions(data_api_index, _status_cache)
+
+    n_open = len([p for p in get_open_positions() if p.get("fill_status") == "filled"])
+    if n_open > 0:
+        logger.log(SUMMARY_LEVEL,
+            f"Updating P&L for {n_open} positions "
+            f"({len(_status_cache)} cached from settle phase)..."
+        )
+    updated   = _update_unrealized_pnl(data_api_index, _status_cache)
+
+    # Scan for resolved events we didn't trade (for backtesting data)
+    resolutions_found = _scan_event_resolutions()
 
     summary = {
         "cancelled": cancelled,
         "closed":    closed,
         "updated":   updated,
+        "resolutions": resolutions_found,
     }
-    logger.info(
-        f"[MONITOR] cancelled={cancelled} resolved={closed} pnl_updated={updated}"
+    logger.log(SUMMARY_LEVEL,
+        f"Monitor complete: {cancelled} cancelled | {closed} resolved | {updated} P&L updated"
     )
-    logger.info("=== MONITOR RUN END ===")
+    _phase_end()
     return summary

@@ -1,0 +1,114 @@
+Backtesting Engine Overview
+Written: 2026-04-21
+
+PURPOSE
+
+The backtesting engine was built to answer a fundamental question: given the price action data we observe on Polymarket temperature markets, what combination of entry price, number 
+of bins, trailing stop, take profit, and exit rules would have produced the most profitable results? Rather than guessing at thresholds or relying solely on the weather model's 
+probability estimates, the engine replays actual historical price movements and simulates any trading strategy against real market data.
+
+The motivation came from analyzing 153 closed paper trades and discovering that the weather model's probability estimates were systematically overconfident — when the model said 
+30% probability, the bin only won 8% of the time. Meanwhile, the market's prices were better calibrated. The analysis also revealed that 51% of losing trades were once profitable 
+before reversing, and that a simple 12% trailing stop (instead of the fixed -30% hard stop) would have turned a -$14,000 loss into a +$13,000 gain on the same set of trades. These
+ findings led to the idea of a market-price-driven strategy that doesn't rely on weather model probabilities at all, and the backtesting engine is the tool that will determine the 
+ optimal parameters for that strategy.
+
+
+DATA COLLECTION
+
+Three new database tables were created to support backtesting:
+
+1. bin_price_history — This is the primary price data table. It stores periodic snapshots of the YES price, NO price, volume, and liquidity for every bin in every active event. 
+Each row includes the event_id, contract_id, city, date, and a recorded_at timestamp. This table is populated from two sources. First, the trading scan (which runs hourly at :15 
+UTC) writes one row per bin for every event it analyzes — this captures all bins, not just the ones selected for trading. Second, and more importantly, the WebSocket price stream 
+now subscribes to ALL active event tokens (not just held positions) and a scheduled job writes the current live prices from the WebSocket cache to this table every 5 minutes. This
+ gives roughly 288 price snapshots per bin per day, which is granular enough to simulate trailing stops and take-profit exits with reasonable accuracy.
+
+2. event_resolutions — This records which bin won each event after the market resolves. Each row contains the event_id, city, date, the winning contract_id, the winning bin's range
+ (range_low and range_high), and timestamps. This table is populated by two mechanisms. When the monitor loop detects that a position has resolved (a market closed and a winner was 
+ determined), it records the winning bin if the position was on the winning side. Additionally, a new function called _scan_event_resolutions runs at the end of every monitor cycle 
+ and checks all past events (events whose date has passed) for any bin that reached 90%+ in the decision_snapshots — this captures resolutions for events the bot didn't trade, which 
+ is critical because the backtesting engine needs to know the winner for every event, not just the ones where we had a position.
+
+3. The existing decision_snapshots table (37,444 rows already) also serves as a price history source. It captures the market_price for every bin at every hourly trading evaluation. 
+The backtesting engine will use bin_price_history when available (higher frequency) and fall back to decision_snapshots for older data.
+
+WHAT IS CAPTURED
+
+For every active event on Polymarket, the following data points are now captured every 5 minutes via the WebSocket price snapshot job: the YES price (market probability) for each 
+bin, the NO price (1 - YES price), and the contract_id linking it to a specific temperature range. The hourly trading scan additionally captures volume and liquidity data. Combined, 
+this means that for an event that exists for 48 hours before resolution, each bin will have approximately 576 price data points (48 hours x 12 snapshots per hour). This is sufficient
+ to simulate entry at any price level, trailing stops at any percentage, take-profit exits at any threshold, and cross-bin exit rules with high fidelity.
+
+The WebSocket subscription was expanded from "only tokens for held positions" to "all tokens for all active events." The _ws_loop already refreshed subscriptions every 60 seconds — 
+it now calls load_all_event_tokens() alongside load_open_position_tokens() during each refresh. A metadata mapping (_token_metadata) links each token_id back to its event_id, 
+contract_id, city, and date so that price updates can be written to bin_price_history with full context.
+
+CONSIDERATIONS BEFORE RUNNING
+
+The backtesting engine requires resolved events with price history to produce meaningful results. As of 2026-04-21, most of the resolved events in the database (42 events from 4/16 
+and 4/20) were already at 100% price when data collection began — their price paths start near $1.00, making them useless for simulating entry strategies. The engine will report "no 
+trades" for these events because no bin falls within the entry price range (e.g., 25-45 cents). You should wait at least 2-3 days after these changes are deployed before running the
+ backtester, so that new events can be captured from discovery through resolution with complete 5-minute price paths. After one week of data collection, you should have 50-100+ 
+ resolved events with full price histories, which is enough for statistically meaningful parameter optimization.
+
+The engine uses chronological price paths — it walks through each snapshot in time order, simulating what would have happened if you entered at the first snapshot where the price 
+met your criteria. It does not look ahead or use future information. However, it does not account for execution slippage, spread costs, or liquidity impact. Real trades may fill at 
+slightly worse prices than the snapshot values. For positions sized at $500 on bins with $500+ liquidity, this impact should be small (1-3 cents typically).
+
+The 5-minute snapshot interval means the engine cannot simulate sub-5-minute price movements. A trailing stop that would have triggered between snapshots will instead trigger at 
+the next snapshot. This could slightly overstate or understate the actual exit price. For a more precise simulation, the interval could be reduced to 1-2 minutes, but this would 
+significantly increase database size (roughly 500-1000 rows per event per day).
+
+
+NEW FILES
+
+bot/scripts/strategy_backtest.py — The backtesting engine itself. This is a standalone script that reads from the database, simulates trades, and prints results. It does not modify 
+any data or affect live trading. It accepts command-line arguments for individual parameter testing (--min-price, --max-price, --bins, --trail) or the --sweep flag for exhaustive
+ parameter search. It defines a StrategyParams dataclass with all configurable parameters: min_price, max_price, max_bins, trail_pct, trail_activation, take_profit, cross_bin_exit,
+  hard_stop_pct, bet_size, and use_ratchet. The SimTrade dataclass captures the full lifecycle of each simulated trade including entry/exit prices, times, reasons, P&L, and peak
+   price.
+
+bot/scripts/trade_analysis.py — Created earlier in this session, this script analyzes actual closed trades (not simulated) to assess model calibration, feature importance, and 
+threshold sensitivity. It includes a calibration analysis (reliability diagram), feature breakdown by bucket, logistic regression for feature importance, threshold simulation grid,
+ closing line value analysis, and MFE/MAE analysis. Run with: python scripts/trade_analysis.py
+
+
+NEW VARIABLES AND CONFIGURATION
+
+No new .env variables were added for the data collection — it runs automatically as part of the existing infrastructure. The price snapshot job is hardcoded to run every 5 minutes 
+via the scheduler (CronTrigger with minute="*/5"). If you want to change the frequency, modify the CronTrigger in main.py where the price_snapshot job is defined.
+
+The backtesting engine's parameters are all defined in the StrategyParams dataclass within strategy_backtest.py and are passed via command-line arguments or the sweep function. They
+ are not .env variables because they are research parameters, not production configuration. When you identify the optimal parameters through backtesting, those values will be
+  implemented as .env variables in the new market_price_value strategy.
+
+
+THE --SWEEP FUNCTION
+
+Running python scripts/strategy_backtest.py --sweep performs an exhaustive parameter search across 432 combinations. It tests the following dimensions independently first (to show 
+the effect of each parameter in isolation), then tests all combinations together:
+
+1. Entry price threshold — Tests minimum entry prices from 15% to 40% in 5% increments, holding other parameters constant at 1 bin and 12% trailing stop. This shows which price
+range produces the best results.
+
+2. Number of bins — Tests 1, 2, and 3 bins per event at a fixed 30% entry threshold. This shows whether buying multiple bins (hedging) improves or hurts results.
+
+3. Trailing stop percentage — Tests stops from 5% to 25%, showing the tradeoff between capturing gains (tight stop) and avoiding whipsaws (loose stop).
+
+4. Ratcheting vs flat trail — Compares a fixed 12% trail against an adaptive trail that tightens as price rises (15% below 50c, 12% at 50-65c, 8% at 65-80c, 5% above 80c).
+
+5. Take profit levels — Tests selling at 50%, 60%, 70%, 80%, 90%, or holding to resolution. This determines whether locking in gains early beats waiting for the full $1.00 payout.
+
+6. Cross-bin exit thresholds — For 2-bin portfolios, tests exiting the weaker bin when the stronger bin reaches 60%, 70%, 75%, 80%, 90%, or never. This determines when to cut a 
+likely loser based on a sibling bin's strength.
+
+7. Hard stop levels — Tests the fixed stop-loss fallback (before the trailing stop activates) at various levels from 15% to no stop at all.
+
+After the individual tests, the sweep runs all 432 combinations (4 entry prices x 2 bin counts x 3 trail percentages x 3 take-profit levels x 2 cross-bin options x 3 hard-stop 
+levels) and ranks the top 10 by total P&L. It prints the winning combination with full details including exit reason breakdown, showing exactly how many trades exited via trailing 
+stop vs take profit vs resolution vs hard stop.
+
+The output is designed to be self-explanatory: each row shows the parameter combination, number of trades, win count, win rate, average P&L per trade, total P&L, and maximum 
+drawdown. Combinations marked with "<<<" in the individual tests indicate positive average P&L. The exhaustive search at the end identifies the globally optimal combination that may
+ not be obvious from the individual parameter tests.

@@ -20,7 +20,8 @@ from config import (
     TRADE_US_ONLY,
     US_LAT,
     US_LON,
-    MAX_BIN_BUYS,
+    MAX_YES_BINS,
+    MAX_NO_BINS,
     ALLOWED_SIDES,
     MAX_TRADE_DAYS,
     PAPER_TRADE,
@@ -266,19 +267,27 @@ def check_event_side_consistency(
     return RiskCheck(True)
 
 
-def check_bin_limit(city: str, date: str) -> RiskCheck:
+def check_bin_limit(city: str, date: str, side: str = "YES") -> RiskCheck:
     """
-    Block trade if the bot already holds MAX_BIN_BUYS open positions
-    for the same city+date event.  MAX_BIN_BUYS=0 disables the check.
+    Block trade if the bot already holds the max number of open positions
+    for this side on the same city+date event.
+    MAX_YES_BINS / MAX_NO_BINS = 0 disables the check for that side.
     """
-    if MAX_BIN_BUYS <= 0:
+    if side == "YES":
+        cap = MAX_YES_BINS
+        label = "MAX_YES_BINS"
+    else:
+        cap = MAX_NO_BINS
+        label = "MAX_NO_BINS"
+
+    if cap <= 0:
         return RiskCheck(True)
-    current = count_open_bins_for_event(city, date)
-    if current >= MAX_BIN_BUYS:
+    current = count_open_bins_for_event(city, date, side=side)
+    if current >= cap:
         return RiskCheck(
             False,
-            f"MAX_BIN_BUYS={MAX_BIN_BUYS} reached for {city} {date} "
-            f"({current} open position(s))",
+            f"{label}={cap} reached for {city} {date} "
+            f"({current} open {side} position(s))",
         )
     return RiskCheck(True)
 
@@ -419,7 +428,8 @@ def run_portfolio_checks(signal: dict, bankroll: float) -> tuple[bool, list[str]
     failures: list[str] = []
 
     checks = [
-        check_bin_limit(signal.get("city", ""), signal.get("date", "")),
+        check_bin_limit(signal.get("city", ""), signal.get("date", ""),
+                        signal.get("recommended_side", "YES")),
         check_total_exposure(signal.get("kelly_size", 0), bankroll),
         check_event_exposure(
             signal.get("event_id", ""), signal.get("kelly_size", 0), bankroll),
