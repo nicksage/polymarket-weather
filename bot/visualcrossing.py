@@ -29,13 +29,83 @@ Design notes
 * All temperatures are returned in Celsius (unitGroup=metric).
 """
 
+import calendar
+import json
 import os
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+# ---------------------------------------------------------------------------
+# Disk cache for raw VC monthly responses.
+#
+# Once a (lat, lon, year, month) range is fetched once, we persist the full
+# JSON response to bot/data/vc_cache/{lat}_{lon}/{YYYY}-{MM}.json.  Future
+# fetches with the same range read from disk — costing zero queryCost.
+#
+# Only month-aligned (lat, lon, start, end) calls are cached; ad-hoc ranges
+# fall through to the network as before.  Cache is opt-in via the new
+# `use_cache=True` kwarg on fetch_history_with_hours().
+# ---------------------------------------------------------------------------
+_BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+_VC_CACHE_DIR = Path(_BOT_DIR) / "data" / "vc_cache"
+
+
+def _is_month_aligned(start_date: date, end_date: date) -> bool:
+    """True iff (start, end) covers exactly one full calendar month."""
+    if start_date.day != 1:
+        return False
+    last_day = calendar.monthrange(start_date.year, start_date.month)[1]
+    return end_date == date(start_date.year, start_date.month, last_day)
+
+
+def _cache_path_for_month(lat: float, lon: float, start_date: date) -> Path:
+    """Cache file for a (lat, lon, year, month).  Caller must verify
+    month-aligned first via _is_month_aligned()."""
+    loc_dir = _VC_CACHE_DIR / f"{round(lat, 3)}_{round(lon, 3)}"
+    return loc_dir / f"{start_date.year}-{start_date.month:02d}.json"
+
+
+def _read_vc_cache(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError) as e:
+        logger.warning(f"VC cache read failed for {path}: {e}; will re-fetch")
+        return None
+
+
+def _write_vc_cache(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+    except OSError as e:
+        logger.warning(f"VC cache write failed for {path}: {e}")
+
+
+def vc_cache_stats() -> dict:
+    """Quick report on the on-disk cache: per-location file count and total size."""
+    if not _VC_CACHE_DIR.exists():
+        return {"locations": 0, "files": 0, "size_mb": 0.0}
+    n_files = 0
+    n_bytes = 0
+    n_locs = 0
+    for loc_dir in _VC_CACHE_DIR.iterdir():
+        if not loc_dir.is_dir():
+            continue
+        n_locs += 1
+        for f in loc_dir.iterdir():
+            if f.suffix == ".json":
+                n_files += 1
+                n_bytes += f.stat().st_size
+    return {"locations": n_locs, "files": n_files, "size_mb": round(n_bytes / 1e6, 2)}
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +236,170 @@ def fetch_daily_history(
 
 
 # ---------------------------------------------------------------------------
+# Integration 1b — Historical daily + hourly, rich feature set (ML backfill)
+# ---------------------------------------------------------------------------
+
+def fetch_history_with_hours(
+    lat: float,
+    lon: float,
+    start_date: date,
+    end_date: date,
+    use_cache: bool = True,
+) -> dict:
+    """
+    Pull VC historical data over [start_date, end_date] with both day-level
+    summaries AND hour-level observations.  Used by the ML training data
+    backfill — returns the full rich feature set (temp, humidity, dew,
+    pressure, cloud, wind, solar, snow, precip, etc.) at hourly granularity.
+
+    When use_cache=True (default) and the call is month-aligned, raw VC
+    responses are persisted to bot/data/vc_cache/{lat}_{lon}/{YYYY}-{MM}.json
+    on first fetch and read from disk on subsequent calls — costing zero
+    queryCost.  Pass use_cache=False to force a network fetch (e.g. to
+    refresh stale data).  Non-month-aligned calls always go to the network.
+
+    Returns a dict:
+        {
+          "resolved_address": str,
+          "timezone":         str,      -- IANA tz of the location
+          "latitude":         float,
+          "longitude":        float,
+          "query_cost":       int,
+          "days": [
+              {
+                "date":       "YYYY-MM-DD",   -- local date
+                "tempmax_c":  float | None,
+                "tempmin_c":  float | None,
+                "temp_c":     float | None,
+                "source":     str,
+                "hours": [
+                   { datetime, datetime_epoch, temp_c, feelslike_c,
+                     humidity, dew_c, pressure_hpa, cloudcover,
+                     visibility_km, windspeed_kph, windgust_kph,
+                     winddir_deg, precip_mm, precip_prob, preciptype,
+                     snow_cm, snowdepth_cm, solarradiation_wm2,
+                     solarenergy_mj, uvindex, conditions, source,
+                     observed_at_utc            -- derived from datetime_epoch
+                   }, ...
+                ]
+              }, ...
+          ]
+        }
+
+    Cost: ~24 queryCost per day returned (one per hour) plus 1 per day.
+    For a full year that's ≈ 9,125 records per call — well within VC's
+    per-call response budget.  Caller should still chunk by month/year for
+    safety.
+    """
+    if end_date < start_date:
+        raise ValueError(f"end_date {end_date} < start_date {start_date}")
+
+    # ---- Cache lookup ----
+    cache_path = None
+    if use_cache and _is_month_aligned(start_date, end_date):
+        cache_path = _cache_path_for_month(lat, lon, start_date)
+        cached = _read_vc_cache(cache_path)
+        if cached is not None:
+            # Force query_cost to 0 on cache hits so daily-usage counters
+            # don't double-count the original fetch.  Original cost is
+            # preserved under "query_cost_original" for diagnostics.
+            cached_result = dict(cached)
+            cached_result["query_cost_original"] = cached_result.get("query_cost")
+            cached_result["query_cost"] = 0
+            cached_result["from_cache"] = True
+            logger.debug(
+                f"VC cache HIT  ({lat:.3f},{lon:.3f}) {start_date}..{end_date} "
+                f"[orig_cost={cached_result.get('query_cost_original')}]"
+            )
+            return cached_result
+
+    path = f"/{lat},{lon}/{start_date.isoformat()}/{end_date.isoformat()}"
+    j = _get_vc(path, {
+        "unitGroup": "metric",
+        "include":   "days,hours,obs",
+        "elements":  (
+            "datetime,datetimeEpoch,temp,tempmax,tempmin,feelslike,"
+            "humidity,dew,pressure,cloudcover,visibility,"
+            "windspeed,windgust,winddir,"
+            "precip,precipprob,preciptype,snow,snowdepth,"
+            "solarradiation,solarenergy,uvindex,"
+            "conditions,source,stations"
+        ),
+    })
+
+    out_days: list[dict] = []
+    for d in (j.get("days") or []):
+        hrs: list[dict] = []
+        for h in (d.get("hours") or []):
+            epoch = h.get("datetimeEpoch")
+            observed_at_utc = None
+            if epoch is not None:
+                try:
+                    observed_at_utc = datetime.fromtimestamp(
+                        int(epoch), tz=timezone.utc
+                    ).isoformat()
+                except (ValueError, OSError, TypeError):
+                    observed_at_utc = None
+            hrs.append({
+                "datetime":             h.get("datetime"),
+                "datetime_epoch":       epoch,
+                "observed_at_utc":      observed_at_utc,
+                "temp_c":               h.get("temp"),
+                "feelslike_c":          h.get("feelslike"),
+                "humidity":             h.get("humidity"),
+                "dew_c":                h.get("dew"),
+                "pressure_hpa":         h.get("pressure"),
+                "cloudcover":           h.get("cloudcover"),
+                "visibility_km":        h.get("visibility"),
+                "windspeed_kph":        h.get("windspeed"),
+                "windgust_kph":         h.get("windgust"),
+                "winddir_deg":          h.get("winddir"),
+                "precip_mm":            h.get("precip"),
+                "precip_prob":          h.get("precipprob"),
+                "preciptype":           h.get("preciptype"),
+                "snow_cm":              h.get("snow"),
+                "snowdepth_cm":         h.get("snowdepth"),
+                "solarradiation_wm2":   h.get("solarradiation"),
+                "solarenergy_mj":       h.get("solarenergy"),
+                "uvindex":              h.get("uvindex"),
+                "conditions":           h.get("conditions"),
+                "source":               h.get("source"),
+            })
+        out_days.append({
+            "date":      d.get("datetime"),
+            "tempmax_c": d.get("tempmax"),
+            "tempmin_c": d.get("tempmin"),
+            "temp_c":    d.get("temp"),
+            "source":    d.get("source"),
+            "hours":     hrs,
+        })
+
+    result = {
+        "resolved_address": j.get("resolvedAddress"),
+        "timezone":         j.get("timezone"),
+        "latitude":         j.get("latitude"),
+        "longitude":        j.get("longitude"),
+        "query_cost":       j.get("queryCost"),
+        "days":             out_days,
+        "from_cache":       False,
+    }
+
+    # ---- Cache write (only if month-aligned) ----
+    if cache_path is not None:
+        _write_vc_cache(cache_path, result)
+        logger.debug(
+            f"VC cache MISS — wrote {cache_path.name} "
+            f"({len(out_days)} days, queryCost={result['query_cost']})"
+        )
+
+    logger.info(
+        f"VC history_with_hours ({lat:.3f},{lon:.3f}) {start_date}..{end_date}: "
+        f"{len(out_days)} days (queryCost={result['query_cost']})"
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Integration 2 — Intraday observed + forecast snapshot
 # ---------------------------------------------------------------------------
 
@@ -181,9 +415,12 @@ def fetch_future_day(lat: float, lon: float, target_date: date) -> dict:
         "unitGroup": "metric",
         "include":   "hours,days",
         "elements":  (
-            "datetime,datetimeEpoch,temp,tempmax,tempmin,"
-            "humidity,cloudcover,windspeed,precip,precipprob,conditions,"
-            "source,stations"
+            "datetime,datetimeEpoch,temp,tempmax,tempmin,feelslike,"
+            "humidity,dew,pressure,cloudcover,visibility,"
+            "windspeed,windgust,winddir,"
+            "precip,precipprob,preciptype,snow,snowdepth,"
+            "solarradiation,solarenergy,uvindex,"
+            "conditions,source,stations"
         ),
     })
     days = j.get("days") or []
@@ -194,17 +431,29 @@ def fetch_future_day(lat: float, lon: float, target_date: date) -> dict:
 
     def _norm(h: dict) -> dict:
         return {
-            "datetime":       h.get("datetime"),
-            "datetime_epoch": h.get("datetimeEpoch"),
-            "temp_c":         h.get("temp"),
-            "humidity":       h.get("humidity"),
-            "cloudcover":     h.get("cloudcover"),
-            "windspeed_kph":  h.get("windspeed"),
-            "precip_mm":      h.get("precip"),
-            "precip_prob":    h.get("precipprob"),
-            "conditions":     h.get("conditions"),
-            "source":         h.get("source"),
-            "stations":       list(h.get("stations") or []),
+            "datetime":             h.get("datetime"),
+            "datetime_epoch":       h.get("datetimeEpoch"),
+            "temp_c":               h.get("temp"),
+            "feelslike_c":          h.get("feelslike"),
+            "humidity":             h.get("humidity"),
+            "dew_c":                h.get("dew"),
+            "pressure_hpa":         h.get("pressure"),
+            "cloudcover":           h.get("cloudcover"),
+            "visibility_km":        h.get("visibility"),
+            "windspeed_kph":        h.get("windspeed"),
+            "windgust_kph":         h.get("windgust"),
+            "winddir_deg":          h.get("winddir"),
+            "precip_mm":            h.get("precip"),
+            "precip_prob":          h.get("precipprob"),
+            "preciptype":           h.get("preciptype"),
+            "snow_cm":              h.get("snow"),
+            "snowdepth_cm":         h.get("snowdepth"),
+            "solarradiation_wm2":   h.get("solarradiation"),
+            "solarenergy_mj":       h.get("solarenergy"),
+            "uvindex":              h.get("uvindex"),
+            "conditions":           h.get("conditions"),
+            "source":               h.get("source"),
+            "stations":             list(h.get("stations") or []),
         }
 
     forecast = [_norm(h) for h in hours if h.get("source") == "fcst"]
@@ -269,9 +518,12 @@ def fetch_intraday(lat: float, lon: float) -> dict:
         "unitGroup": "metric",
         "include":   "hours,current,days",
         "elements":  (
-            "datetime,datetimeEpoch,temp,tempmax,tempmin,"
-            "humidity,cloudcover,windspeed,precip,precipprob,conditions,"
-            "source,stations"
+            "datetime,datetimeEpoch,temp,tempmax,tempmin,feelslike,"
+            "humidity,dew,pressure,cloudcover,visibility,"
+            "windspeed,windgust,winddir,"
+            "precip,precipprob,preciptype,snow,snowdepth,"
+            "solarradiation,solarenergy,uvindex,"
+            "conditions,source,stations"
         ),
     })
 
@@ -283,17 +535,29 @@ def fetch_intraday(lat: float, lon: float) -> dict:
 
     def _norm_hour(h: dict) -> dict:
         return {
-            "datetime":       h.get("datetime"),
-            "datetime_epoch": h.get("datetimeEpoch"),
-            "temp_c":         h.get("temp"),
-            "humidity":       h.get("humidity"),
-            "cloudcover":     h.get("cloudcover"),
-            "windspeed_kph":  h.get("windspeed"),
-            "precip_mm":      h.get("precip"),
-            "precip_prob":    h.get("precipprob"),
-            "conditions":     h.get("conditions"),
-            "source":         h.get("source"),
-            "stations":       list(h.get("stations") or []),
+            "datetime":             h.get("datetime"),
+            "datetime_epoch":       h.get("datetimeEpoch"),
+            "temp_c":               h.get("temp"),
+            "feelslike_c":          h.get("feelslike"),
+            "humidity":             h.get("humidity"),
+            "dew_c":                h.get("dew"),
+            "pressure_hpa":         h.get("pressure"),
+            "cloudcover":           h.get("cloudcover"),
+            "visibility_km":        h.get("visibility"),
+            "windspeed_kph":        h.get("windspeed"),
+            "windgust_kph":         h.get("windgust"),
+            "winddir_deg":          h.get("winddir"),
+            "precip_mm":            h.get("precip"),
+            "precip_prob":          h.get("precipprob"),
+            "preciptype":           h.get("preciptype"),
+            "snow_cm":              h.get("snow"),
+            "snowdepth_cm":         h.get("snowdepth"),
+            "solarradiation_wm2":   h.get("solarradiation"),
+            "solarenergy_mj":       h.get("solarenergy"),
+            "uvindex":              h.get("uvindex"),
+            "conditions":           h.get("conditions"),
+            "source":               h.get("source"),
+            "stations":             list(h.get("stations") or []),
         }
 
     observed  = [_norm_hour(h) for h in hours if h.get("source") == "obs"]
@@ -315,10 +579,22 @@ def fetch_intraday(lat: float, lon: float) -> dict:
         "resolved_address":         j.get("resolvedAddress"),
         "timezone":                 j.get("timezone"),
         "current_temp_c":           current.get("temp"),
+        "current_feelslike_c":      current.get("feelslike"),
         "current_humidity":         current.get("humidity"),
+        "current_dew_c":            current.get("dew"),
+        "current_pressure_hpa":     current.get("pressure"),
         "current_cloudcover":       current.get("cloudcover"),
+        "current_visibility_km":    current.get("visibility"),
         "current_windspeed_kph":    current.get("windspeed"),
+        "current_windgust_kph":     current.get("windgust"),
+        "current_winddir_deg":      current.get("winddir"),
         "current_precip_mm":        current.get("precip"),
+        "current_preciptype":       current.get("preciptype"),
+        "current_snow_cm":          current.get("snow"),
+        "current_snowdepth_cm":     current.get("snowdepth"),
+        "current_solarradiation_wm2": current.get("solarradiation"),
+        "current_solarenergy_mj":   current.get("solarenergy"),
+        "current_uvindex":          current.get("uvindex"),
         "current_conditions":       current.get("conditions"),
         "current_vc_source":        current.get("source"),
         "current_time":             current.get("datetime"),

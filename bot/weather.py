@@ -672,7 +672,8 @@ def _get_tomorrowio_point_estimate(
 # ---------------------------------------------------------------------------
 
 def get_temp_distribution_for_event(
-    lat: float, lon: float, date_str: str
+    lat: float, lon: float, date_str: str,
+    city: str | None = None, event_id: str | None = None,
 ) -> dict | None:
     """
     Estimate the probability distribution N(μ_c, σ_c) for the daily maximum
@@ -852,6 +853,38 @@ def get_temp_distribution_for_event(
                 f"Tomorrow.io={tio_temp:.1f}°C (delta={deviation:.1f}°C)"
             )
 
+    # ----- ML distribution model (Framing C, Phase 5) ---------------------
+    # Always invoke if we have city+event_id+model (shadow mode by default).
+    # The (mu_ml, sigma_ml) is logged on the result regardless of whether it
+    # contributes to the blended μ/σ — controlled by ML_BLEND_ENABLED and
+    # ML_BLEND_WEIGHT_MAX in config.py.
+    ml_mu_c: float | None = None
+    ml_sigma_c: float | None = None
+    ml_model_version: str | None = None
+    ml_weight_used: float = 0.0
+    try:
+        from config import ML_BLEND_ENABLED, ML_BLEND_WEIGHT_MAX
+        from ml.inference import get_ml_distribution
+        target_date = date.fromisoformat(date_str)
+        ml = get_ml_distribution(
+            city=city, lat=lat, lon=lon,
+            target_date=target_date, event_id=event_id,
+        )
+        if ml is not None:
+            ml_mu_c          = ml["mu_c"]
+            ml_sigma_c       = ml["sigma_c"]
+            ml_model_version = ml["model_version"]
+            if ML_BLEND_ENABLED and ML_BLEND_WEIGHT_MAX > 0.0:
+                w = float(ML_BLEND_WEIGHT_MAX)
+                mu_c, sigma_c = _blend_gaussians(
+                    mu_c,    sigma_c,    1.0 - w,
+                    ml_mu_c, ml_sigma_c, w,
+                )
+                sources.append(f"ml({w:.2f})")
+                ml_weight_used = w
+    except Exception as e:
+        logger.debug(f"ml.inference path failed for ({lat:.2f},{lon:.2f}) {date_str}: {e}")
+
     # Per-city sigma floor: use the city's actual historical forecast error
     # as a floor on sigma. This prevents overconfidence for cities where
     # the ensemble spread underestimates true uncertainty.
@@ -897,6 +930,13 @@ def get_temp_distribution_for_event(
         "gfs_bias_c":   round(gfs_bias_c, 3),
         "gfs_bias_n":   gfs_bias_n,
         "clim_kde":    clim_kde,    # KDE object (not serialisable — stays in memory only)
+        # ML distribution shadow log (Phase 5).  These reflect the ML
+        # source's standalone prediction; ml_weight_used > 0 only when the
+        # blend actually consumed the ML source.
+        "ml_mu_c":          (round(ml_mu_c, 3) if ml_mu_c is not None else None),
+        "ml_sigma_c":       (round(ml_sigma_c, 3) if ml_sigma_c is not None else None),
+        "ml_model_version": ml_model_version,
+        "ml_weight_used":   round(ml_weight_used, 3),
     }
 
     logger.debug(

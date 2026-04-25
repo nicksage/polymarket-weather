@@ -218,6 +218,11 @@ def _write_decision_snapshots(
             "flag_vc_disagreement_large":   latest_vc_diag.get("flag_vc_disagreement_large", 0),
             "flag_vc_warns_hotter":         latest_vc_diag.get("flag_vc_warns_hotter", 0),
             "flag_vc_warns_colder":         latest_vc_diag.get("flag_vc_warns_colder", 0),
+            # Phase 5 — ML distribution shadow log
+            "ml_mu_c":          analysis.get("ml_mu_c"),
+            "ml_sigma_c":       analysis.get("ml_sigma_c"),
+            "ml_model_version": analysis.get("ml_model_version"),
+            "ml_weight_used":   analysis.get("ml_weight_used"),
         }
         try:
             insert_decision_snapshot(snap)
@@ -269,8 +274,14 @@ def analyze_temp_event(event: dict, bankroll: float) -> dict | None:
         logger.info(f"Skipping {city} {date_str}: {days_ahead}d > MAX_FORECAST_DAYS={MAX_FORECAST_DAYS}")
         return None
 
-    # Fetch temperature distribution
-    dist = get_temp_distribution_for_event(lat, lon, date_str)
+    # Fetch temperature distribution (passes city + event_id so the ML
+    # inference hook in weather.py can locate the per-city model and the
+    # latest live observation for context).
+    dist = get_temp_distribution_for_event(
+        lat, lon, date_str,
+        city=event.get("city"),
+        event_id=event.get("event_id"),
+    )
     if dist is None:
         logger.warning(f"No distribution for {city} {date_str}")
         return None
@@ -278,6 +289,12 @@ def analyze_temp_event(event: dict, bankroll: float) -> dict | None:
     mu_c     = dist["mu_c"]
     sigma_c  = dist["sigma_c"]
     clim_kde = dist.get("clim_kde")   # KDE object or None
+    # ML shadow-log fields (always populated when an ML model is loaded for
+    # this city, even when ML_BLEND_WEIGHT_MAX=0 — see weather.py).
+    ml_mu_c          = dist.get("ml_mu_c")
+    ml_sigma_c       = dist.get("ml_sigma_c")
+    ml_model_version = dist.get("ml_model_version")
+    ml_weight_used   = dist.get("ml_weight_used") or 0.0
 
     # --- Live adjustment layer (Phase 2b) ---------------------------------
     # Looks up live_observations + latest forecast_hourly for this event.
@@ -549,6 +566,11 @@ def analyze_temp_event(event: dict, bankroll: float) -> dict | None:
         **event,
         "forecast_mu_c":       mu_c,
         "forecast_sigma_c":    sigma_c,
+        # ML shadow-log (Phase 5) — propagated to decision_snapshots
+        "ml_mu_c":             ml_mu_c,
+        "ml_sigma_c":          ml_sigma_c,
+        "ml_model_version":    ml_model_version,
+        "ml_weight_used":      ml_weight_used,
         "clim_mu_c":           dist.get("clim_mu_c", mu_c),
         "clim_sigma_c":        dist.get("clim_sigma_c", sigma_c),
         "forecast_mu_display": round(mu_display, 1),

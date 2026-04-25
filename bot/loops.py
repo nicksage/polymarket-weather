@@ -589,6 +589,12 @@ def live_observation_run(events: list[dict] | None = None) -> dict:
         bump_vc_usage(j.get("query_cost"))
 
         stations_json = json.dumps(j.get("current_stations") or [])
+        preciptype_raw = j.get("current_preciptype")
+        preciptype_str = (
+            json.dumps(preciptype_raw)
+            if isinstance(preciptype_raw, (list, tuple))
+            else preciptype_raw
+        )
         obs_id = insert_live_observation(
             event_id              = event_id,
             city                  = city,
@@ -608,6 +614,19 @@ def live_observation_run(events: list[dict] | None = None) -> dict:
             observed_max_so_far_c = j.get("observed_max_so_far_c"),
             stations              = stations_json,
             query_cost            = j.get("query_cost"),
+            # Phase ML-v1 — expanded VC observation features
+            feelslike_c           = j.get("current_feelslike_c"),
+            dew_c                 = j.get("current_dew_c"),
+            pressure_hpa          = j.get("current_pressure_hpa"),
+            visibility_km         = j.get("current_visibility_km"),
+            windgust_kph          = j.get("current_windgust_kph"),
+            winddir_deg           = j.get("current_winddir_deg"),
+            preciptype            = preciptype_str,
+            snow_cm               = j.get("current_snow_cm"),
+            snowdepth_cm          = j.get("current_snowdepth_cm"),
+            solarradiation_wm2    = j.get("current_solarradiation_wm2"),
+            solarenergy_mj        = j.get("current_solarenergy_mj"),
+            uvindex               = j.get("current_uvindex"),
         )
         counts["observations"] += 1
 

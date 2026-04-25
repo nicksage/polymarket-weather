@@ -69,11 +69,15 @@ class MarketPriceValueStrategy(Strategy):
         from db import (
             insert_temp_event, insert_temp_outcome,
             insert_bin_price_snapshots_bulk,
+            update_outcomes_ml_bin_probs_bulk,
         )
+        from datetime import date
 
         all_events: list[dict] = []
         signals: list[dict] = []
         skipped = 0
+        ml_persisted_total = 0
+        today_local = date.today()
 
         for event in events:
             city = event.get("city", "")
@@ -123,13 +127,63 @@ class MarketPriceValueStrategy(Strategy):
 
             all_events.append(analysis)
 
+            # ----- ML bin probabilities (D=0 only) ----------------------
+            # Compute the pooled model's empirical-CDF probability for each
+            # bin and UPDATE the temp_outcomes rows we just inserted.  No
+            # behavior change to MPV trade logic — these probs are for
+            # dashboard display + future veto/sizing logic.
+            try:
+                target_d = date.fromisoformat(date_str)
+                if (target_d == today_local
+                        and event.get("event_id")
+                        and event.get("lat") is not None
+                        and event.get("lon") is not None):
+                    bins_c: list[tuple[float | None, float | None]] = []
+                    for o in outcomes:
+                        lo = o.get("range_low")
+                        hi = o.get("range_high")
+                        unit = (o.get("unit") or "celsius").lower()
+                        def _to_c(v):
+                            if v is None:
+                                return None
+                            v = float(v)
+                            return (v - 32.0) * 5.0 / 9.0 if unit == "fahrenheit" else v
+                        bins_c.append((_to_c(lo), _to_c(hi)))
+
+                    from ml.inference import get_ml_bin_probabilities
+                    ml = get_ml_bin_probabilities(
+                        city=event.get("city"),
+                        lat=float(event["lat"]), lon=float(event["lon"]),
+                        target_date=target_d,
+                        event_id=event.get("event_id"),
+                        bins=bins_c,
+                    )
+                    if ml and ml.get("probabilities"):
+                        updates = []
+                        for o, p in zip(outcomes, ml["probabilities"]):
+                            cid = o.get("contract_id")
+                            if not cid:
+                                continue
+                            updates.append({
+                                "scan_timestamp":   scan_ts,
+                                "contract_id":      cid,
+                                "ml_bin_prob":      float(p),
+                                "ml_decision_hour": ml.get("closest_fold"),
+                                "ml_model_version": ml.get("model_version"),
+                            })
+                        n_persisted = update_outcomes_ml_bin_probs_bulk(updates)
+                        ml_persisted_total += n_persisted
+            except Exception as e:
+                logger.debug(f"[{self.name}] ml bin probs failed for {city}: {e}")
+
             # Select bins by market price
             event_signals = self._select_signals(event, scan_ts)
             signals.extend(event_signals)
 
         logger.debug(
             f"[{self.name}] Scan complete: {len(all_events)} events, "
-            f"{len(signals)} signals, {skipped} skipped"
+            f"{len(signals)} signals, {skipped} skipped, "
+            f"ml_bin_probs_persisted={ml_persisted_total}"
         )
         return all_events, signals
 

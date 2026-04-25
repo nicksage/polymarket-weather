@@ -307,3 +307,30 @@ FORECAST_DB_MAX_AGE_HOURS: float = _float("FORECAST_DB_MAX_AGE_HOURS", 3.0)
 
 
 LIVE_ADJ_TAIL_FLATTEN_EXPONENT: float = _float("LIVE_ADJ_TAIL_FLATTEN_EXPONENT", 0.95)
+
+
+# ---------------------------------------------------------------------------
+# ML distribution model (Framing C — per-city observation-driven regressor)
+# Shadow mode by default: predictions are computed and persisted on every
+# scan, but the blended μ/σ is unchanged until ML_BLEND_ENABLED flips True.
+# ---------------------------------------------------------------------------
+
+# Master switch.  When False the inference hook still runs and logs
+# (ml_mu_c, ml_sigma_c) to decision_snapshots, but ML_BLEND_WEIGHT_MAX is
+# forced to 0 in the blender — no behavior change.
+ML_BLEND_ENABLED: bool = _bool("ML_BLEND_ENABLED", False)
+
+# Hard ceiling on the ML source's weight in the ensemble blender.  Start low,
+# ramp up as shadow-mode metrics accumulate.  Set to 0.0 to fully disable
+# blending even when ML_BLEND_ENABLED=True (useful for pure shadow runs).
+ML_BLEND_WEIGHT_MAX: float = _float("ML_BLEND_WEIGHT_MAX", 0.0)
+
+# Per-city models must beat this Brier score on the training hold-out before
+# their weight is allowed to rise above 0 at inference time.  Prevents an
+# undertrained model from degrading the blend.
+ML_MIN_BRIER_TO_ACTIVATE: float = _float("ML_MIN_BRIER_TO_ACTIVATE", 0.20)
+
+# Where per-city trained models are persisted (joblib pickles).
+ML_MODELS_DIR: str = os.getenv(
+    "ML_MODELS_DIR", os.path.join(_BOT_DIR, "ml", "models")
+)

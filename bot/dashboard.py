@@ -21,10 +21,39 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from datetime import datetime
+from datetime import datetime, timezone
+from functools import lru_cache
 from streamlit_autorefresh import st_autorefresh
 
 from config import DB_PATH
+
+
+# ---------------------------------------------------------------------------
+# Local-time helper (cached per-rounded-coord; uses timezonefinder + zoneinfo)
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=512)
+def _resolve_zoneinfo(lat_round: float, lon_round: float):
+    from zoneinfo import ZoneInfo
+    try:
+        from timezonefinder import TimezoneFinder
+        name = TimezoneFinder().timezone_at(lat=lat_round, lng=lon_round)
+        return ZoneInfo(name) if name else timezone.utc
+    except Exception:
+        return timezone.utc
+
+
+def _local_time_str(lat, lon, when_utc: datetime | None = None) -> str:
+    """Formatted local time at (lat, lon).  Returns '' on missing/invalid."""
+    try:
+        if lat is None or lon is None or pd.isna(lat) or pd.isna(lon):
+            return ""
+        if when_utc is None:
+            when_utc = datetime.now(timezone.utc)
+        tz = _resolve_zoneinfo(round(float(lat), 2), round(float(lon), 2))
+        return when_utc.astimezone(tz).strftime("%a %H:%M %Z")
+    except Exception:
+        return ""
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -280,6 +309,21 @@ def _show_event_modal(city: str, date_str: str, rows: list[dict]) -> None:
     )
     st.markdown(f"### {title}")
 
+    # Show local time at the city, if we have coords on any row
+    if rows:
+        _r0 = rows[0]
+        _lat = _r0.get("lat"); _lon = _r0.get("lon")
+        _lt = _local_time_str(_lat, _lon)
+        if _lt:
+            # Also surface the ML decision_hour fold (diagnostic) when present
+            _fold_bits = ""
+            for _r in rows:
+                _fold = _r.get("ml_decision_hour")
+                if _fold is not None and not _is_missing(_fold):
+                    _fold_bits = f"  ·  ML fold: {int(_fold):02d}:00"
+                    break
+            st.caption(f"Local: {_lt}{_fold_bits}")
+
     # Forecast summary metrics
     if rows:
         r0       = rows[0]
@@ -413,10 +457,12 @@ def _show_event_modal(city: str, date_str: str, rows: list[dict]) -> None:
         if held:
             _pnl_val = float(held.get("unrealized_pnl") or 0)
 
+        ml_p = r.get("ml_bin_prob")
         table_rows.append({
             "Range":            _range_label(r.get("range_low"), r.get("range_high"), u),
             "Yes Market Prob":  _fmt_pct(yes_p),
             "Yes Model Prob":   _fmt_pct(mdl),
+            "ML Bin Prob":      _fmt_pct(ml_p),
             "No Market Prob":   _fmt_pct(no_p),
             "No Model Prob":    _fmt_pct(no_mdl),
             "Status":           status,
@@ -425,6 +471,11 @@ def _show_event_modal(city: str, date_str: str, rows: list[dict]) -> None:
         })
 
     df_modal = pd.DataFrame(table_rows)
+    # Hide the ML column entirely when no row has data (e.g., D>0 events
+    # or scans before the pooled model is loaded).  _fmt_pct returns "—"
+    # for None.
+    if "ML Bin Prob" in df_modal.columns and (df_modal["ML Bin Prob"] == "—").all():
+        df_modal = df_modal.drop(columns=["ML Bin Prob"])
 
     def _color_modal_pnl(val):
         if val is None or pd.isna(val):
@@ -456,6 +507,10 @@ def _render_event_card(city: str, date_str: str, grp: pd.DataFrame) -> None:
         else f"Highest temperature in {city} on {date_str}"
     )
     total_vol = grp["volume_usd"].sum() if "volume_usd" in grp.columns else 0
+    _lat = grp["lat"].iloc[0] if "lat" in grp.columns else None
+    _lon = grp["lon"].iloc[0] if "lon" in grp.columns else None
+    local_now = _local_time_str(_lat, _lon)
+
     # Signal count based on active strategy's criteria
     from config import ACTIVE_STRATEGY as _card_strategy
     if _card_strategy == "top_bin_value" and "model_prob" in grp.columns:
@@ -472,43 +527,70 @@ def _render_event_card(city: str, date_str: str, grp: pd.DataFrame) -> None:
     else:
         n_signals = int(grp["is_signal"].sum()) if "is_signal" in grp.columns else 0
 
-    # Top 4 outcomes by market probability (captures majority of market view)
-    parseable = grp[grp["model_prob"].notna()].copy()
-    top4      = parseable.sort_values("market_price", ascending=False).head(4)
+    # Top 4 outcomes — strategy-aware:
+    #   top_bin_value: filter to rows with model_prob, sort by market_price
+    #     (preserves prior behavior — model_prob is needed to display)
+    #   anything else (incl. market_price_value): no model_prob filter, just
+    #     sort by market_price.  Captures majority of market view either way.
+    if _card_strategy == "top_bin_value" and "model_prob" in grp.columns:
+        candidates = grp[grp["model_prob"].notna()].copy()
+    else:
+        candidates = grp.copy()
+    top4 = candidates.sort_values("market_price", ascending=False).head(4)
+
+    # Detect ML bin-prob availability — only show the ML column when we
+    # actually have data (D=0 events with the pooled model loaded).
+    has_ml = (
+        "ml_bin_prob" in top4.columns
+        and top4["ml_bin_prob"].notna().any()
+    )
 
     # Unique stable key
     card_key = f"card_{''.join(c if c.isalnum() else '_' for c in f'{city}_{date_str}')}"
 
     with st.container(border=True):
         st.markdown(f"### {title}")
-        st.caption(f"{days_out}d out  ·  ${total_vol:,.0f} Vol.")
+        # Header line: days-out · volume · local time at the city
+        _header_bits = [f"{days_out}d out", f"${total_vol:,.0f} Vol."]
+        if local_now:
+            _header_bits.append(f"Local: {local_now}")
+        st.caption("  ·  ".join(_header_bits))
 
         st.divider()
 
         if top4.empty:
-            st.caption("No model data available")
+            st.caption("No bin data available")
         else:
-            # Column headers
-            h_lbl, h_mkt, h_mdl = st.columns([2, 1, 1])
-            with h_lbl:
-                st.caption("Range")
-            with h_mkt:
-                st.caption("Market Prob")
-            with h_mdl:
-                st.caption("Model Prob")
+            # Column headers — adjust layout when ML column is shown
+            if has_ml:
+                cols = st.columns([2, 1, 1, 1])
+                cols[0].caption("Range")
+                cols[1].caption("Market Prob")
+                cols[2].caption("Model Prob")
+                cols[3].caption("ML Prob")
+            else:
+                cols = st.columns([2, 1, 1])
+                cols[0].caption("Range")
+                cols[1].caption("Market Prob")
+                cols[2].caption("Model Prob")
 
             for _, row in top4.iterrows():
-                rl  = _range_label(row.get("range_low"), row.get("range_high"), unit)
-                mkt = row.get("market_price")
-                mdl = row.get("model_prob")
+                rl   = _range_label(row.get("range_low"), row.get("range_high"), unit)
+                mkt  = row.get("market_price")
+                mdl  = row.get("model_prob")
+                ml_p = row.get("ml_bin_prob") if has_ml else None
 
-                c_lbl, c_mkt, c_mdl = st.columns([2, 1, 1])
-                with c_lbl:
-                    st.markdown(f"**{rl}**")
-                with c_mkt:
-                    st.markdown(_fmt_pct(mkt))
-                with c_mdl:
-                    st.markdown(_fmt_pct(mdl))
+                if has_ml:
+                    rcols = st.columns([2, 1, 1, 1])
+                    rcols[0].markdown(f"**{rl}**")
+                    rcols[1].markdown(_fmt_pct(mkt))
+                    rcols[2].markdown(_fmt_pct(mdl))
+                    rcols[3].markdown(_fmt_pct(ml_p))
+                else:
+                    rcols = st.columns([2, 1, 1])
+                    rcols[0].markdown(f"**{rl}**")
+                    rcols[1].markdown(_fmt_pct(mkt))
+                    rcols[2].markdown(_fmt_pct(mdl))
 
         st.divider()
 

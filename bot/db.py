@@ -204,6 +204,29 @@ def init_db():
             "ALTER TABLE decision_snapshots ADD COLUMN flag_vc_disagreement_large INTEGER DEFAULT 0",
             "ALTER TABLE decision_snapshots ADD COLUMN flag_vc_warns_hotter INTEGER DEFAULT 0",
             "ALTER TABLE decision_snapshots ADD COLUMN flag_vc_warns_colder INTEGER DEFAULT 0",
+            # --- Phase ML-v1: expanded VC observation features for training ---
+            "ALTER TABLE live_observations ADD COLUMN feelslike_c REAL",
+            "ALTER TABLE live_observations ADD COLUMN dew_c REAL",
+            "ALTER TABLE live_observations ADD COLUMN pressure_hpa REAL",
+            "ALTER TABLE live_observations ADD COLUMN visibility_km REAL",
+            "ALTER TABLE live_observations ADD COLUMN windgust_kph REAL",
+            "ALTER TABLE live_observations ADD COLUMN winddir_deg REAL",
+            "ALTER TABLE live_observations ADD COLUMN preciptype TEXT",
+            "ALTER TABLE live_observations ADD COLUMN snow_cm REAL",
+            "ALTER TABLE live_observations ADD COLUMN snowdepth_cm REAL",
+            "ALTER TABLE live_observations ADD COLUMN solarradiation_wm2 REAL",
+            "ALTER TABLE live_observations ADD COLUMN solarenergy_mj REAL",
+            "ALTER TABLE live_observations ADD COLUMN uvindex REAL",
+            # --- Phase ML-v1: ML distribution model shadow-log columns ---
+            "ALTER TABLE decision_snapshots ADD COLUMN ml_mu_c REAL",
+            "ALTER TABLE decision_snapshots ADD COLUMN ml_sigma_c REAL",
+            "ALTER TABLE decision_snapshots ADD COLUMN ml_model_version TEXT",
+            "ALTER TABLE decision_snapshots ADD COLUMN ml_weight_used REAL",
+            # --- Dashboard ML bin-prob layer (D=0 events): per-outcome
+            #     empirical-CDF probability from the pooled v2.0 model. ---
+            "ALTER TABLE temp_outcomes ADD COLUMN ml_bin_prob REAL",
+            "ALTER TABLE temp_outcomes ADD COLUMN ml_decision_hour INTEGER",
+            "ALTER TABLE temp_outcomes ADD COLUMN ml_model_version TEXT",
         ]:
             try:
                 conn.execute(col_def)
@@ -462,6 +485,104 @@ def init_db():
                 ON vc_forecast_diagnostics(event_id, pulled_at_utc DESC);
             CREATE INDEX IF NOT EXISTS idx_vcdiag_date_time
                 ON vc_forecast_diagnostics(target_date, pulled_at_utc DESC);
+
+            -- Phase ML-v1 — per-city ML distribution model registry.
+            -- One row per (city, version) — records training inputs, evaluation
+            -- scores, and on-disk model path.  Used by inference.py to look up
+            -- the active model version for a city.  `activate_at_utc` gates
+            -- when a trained model is allowed to contribute to the blend.
+            CREATE TABLE IF NOT EXISTS ml_model_registry (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                version              TEXT    NOT NULL,
+                city                 TEXT    NOT NULL,
+                trained_at_utc       TEXT    NOT NULL,
+                training_window_start TEXT,
+                training_window_end   TEXT,
+                feature_count        INTEGER,
+                n_training_rows      INTEGER,
+                point_rmse_c         REAL,
+                residual_sigma_c     REAL,
+                brier_score          REAL,
+                model_path           TEXT    NOT NULL,
+                activate_at_utc      TEXT,
+                notes                TEXT,
+                UNIQUE(city, version)
+            );
+            CREATE INDEX IF NOT EXISTS idx_mlreg_city_trained
+                ON ml_model_registry(city, trained_at_utc DESC);
+
+            -- Phase ML-v1 — per-city training rows assembled by the backfill.
+            -- One row per (city, target_date, decision_hour_local, feature_version).
+            -- features_json is a JSON-encoded list of floats in FEATURE_NAMES
+            -- order (see bot/ml/schema.py); NaN is stored as null.
+            -- Resumable: backfill script skips rows already present.
+            CREATE TABLE IF NOT EXISTS ml_training_rows (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                city                  TEXT    NOT NULL,
+                lat_key               REAL    NOT NULL,
+                lon_key               REAL    NOT NULL,
+                target_date           TEXT    NOT NULL,
+                decision_hour_local   INTEGER NOT NULL,
+                feature_version       TEXT    NOT NULL,
+                features_json         TEXT    NOT NULL,
+                t_max_c               REAL    NOT NULL,
+                fetched_at_utc        TEXT    NOT NULL,
+                UNIQUE(city, target_date, decision_hour_local, feature_version)
+            );
+            CREATE INDEX IF NOT EXISTS idx_mltr_city_date
+                ON ml_training_rows(city, target_date);
+            CREATE INDEX IF NOT EXISTS idx_mltr_city_version
+                ON ml_training_rows(city, feature_version);
+
+            -- Phase 8 — per-(city, doy, hour) climatological mean/std for
+            -- observation variables.  Used by the v2.0 feature builder to
+            -- compute *_anomaly z-scores (e.g., pressure_anomaly).  Built
+            -- once from the VC cache via bot/scripts/build_obs_climatology.
+            CREATE TABLE IF NOT EXISTS obs_climatology_hourly (
+                city                 TEXT    NOT NULL,
+                doy                  INTEGER NOT NULL,        -- 1..366
+                hour                 INTEGER NOT NULL,        -- 0..23 local
+                n_samples            INTEGER NOT NULL,
+                temp_mu              REAL,
+                temp_sigma           REAL,
+                dew_mu               REAL,
+                dew_sigma            REAL,
+                pressure_mu          REAL,
+                pressure_sigma       REAL,
+                cloudcover_mu        REAL,
+                cloudcover_sigma     REAL,
+                windspeed_mu         REAL,
+                windspeed_sigma      REAL,
+                solarradiation_mu    REAL,
+                solarradiation_sigma REAL,
+                fetched_at_utc       TEXT    NOT NULL,
+                PRIMARY KEY (city, doy, hour)
+            );
+            CREATE INDEX IF NOT EXISTS idx_oclim_h_city_doy
+                ON obs_climatology_hourly(city, doy);
+
+            -- Phase 8 — per-(city, doy) daily T_max/T_min climatology +
+            -- selected percentiles.  Used as a calibrated baseline in the
+            -- evaluation script and as a feature in v2.0 (climatology_mu_today).
+            CREATE TABLE IF NOT EXISTS obs_climatology_daily (
+                city                 TEXT    NOT NULL,
+                doy                  INTEGER NOT NULL,
+                n_samples            INTEGER NOT NULL,
+                tmax_mu              REAL,
+                tmax_sigma           REAL,
+                tmax_p10             REAL,
+                tmax_p25             REAL,
+                tmax_p50             REAL,
+                tmax_p75             REAL,
+                tmax_p90             REAL,
+                tmin_mu              REAL,
+                tmin_sigma           REAL,
+                tmean_mu             REAL,
+                fetched_at_utc       TEXT    NOT NULL,
+                PRIMARY KEY (city, doy)
+            );
+            CREATE INDEX IF NOT EXISTS idx_oclim_d_city
+                ON obs_climatology_daily(city);
             CREATE INDEX IF NOT EXISTS idx_vcdiag_large
                 ON vc_forecast_diagnostics(flag_vc_disagreement_large, target_date);
 
@@ -1718,6 +1839,19 @@ def insert_live_observation(
     observed_max_so_far_c: float | None = None,
     stations: str | None = None,
     query_cost: int | None = None,
+    # Phase ML-v1 — expanded VC observation features
+    feelslike_c: float | None = None,
+    dew_c: float | None = None,
+    pressure_hpa: float | None = None,
+    visibility_km: float | None = None,
+    windgust_kph: float | None = None,
+    winddir_deg: float | None = None,
+    preciptype: str | None = None,
+    snow_cm: float | None = None,
+    snowdepth_cm: float | None = None,
+    solarradiation_wm2: float | None = None,
+    solarenergy_mj: float | None = None,
+    uvindex: float | None = None,
 ) -> int:
     sql = """
         INSERT INTO live_observations
@@ -1725,8 +1859,13 @@ def insert_live_observation(
              observed_at_utc, observed_at_local, vc_source,
              current_temp_c, humidity, cloudcover, windspeed_kph,
              precip_mm, conditions, observed_max_so_far_c,
-             stations, query_cost)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             stations, query_cost,
+             feelslike_c, dew_c, pressure_hpa, visibility_km,
+             windgust_kph, winddir_deg, preciptype,
+             snow_cm, snowdepth_cm,
+             solarradiation_wm2, solarenergy_mj, uvindex)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     with _get_conn() as conn:
         cur = conn.execute(sql, (
@@ -1735,6 +1874,10 @@ def insert_live_observation(
             current_temp_c, humidity, cloudcover, windspeed_kph,
             precip_mm, conditions, observed_max_so_far_c,
             stations, query_cost,
+            feelslike_c, dew_c, pressure_hpa, visibility_km,
+            windgust_kph, winddir_deg, preciptype,
+            snow_cm, snowdepth_cm,
+            solarradiation_wm2, solarenergy_mj, uvindex,
         ))
         return cur.lastrowid
 
@@ -1787,6 +1930,8 @@ def insert_decision_snapshot(snapshot: dict) -> int:
         "vc_projected_day_max_c", "vc_vs_blended_mu_c", "vc_vs_adjusted_mu_c",
         "vc_hourly_path_rmse_c", "vc_bins_apart",
         "flag_vc_disagreement_large", "flag_vc_warns_hotter", "flag_vc_warns_colder",
+        # Phase ML-v1 — ML distribution model shadow-log
+        "ml_mu_c", "ml_sigma_c", "ml_model_version", "ml_weight_used",
     ]
     placeholders = ",".join("?" * len(cols))
     sql = f"INSERT INTO decision_snapshots ({','.join(cols)}) VALUES ({placeholders})"
@@ -2154,6 +2299,257 @@ def bump_vc_usage(query_cost: int | None) -> None:
     """
     with _get_conn() as conn:
         conn.execute(sql, (day, cost, now.isoformat()))
+
+
+# ---------------------------------------------------------------------------
+# Phase ML-v1 — training row helpers
+# ---------------------------------------------------------------------------
+
+def get_ml_backfill_cities() -> list[dict]:
+    """Return unique (city, lat, lon) tuples seen in temp_events, for use
+    by the ML training-data backfill script.  One row per city — if a city
+    has been seen at multiple coordinates we pick the most recent.
+    """
+    sql = """
+        SELECT city, lat, lon
+        FROM temp_events
+        WHERE city IS NOT NULL AND lat IS NOT NULL AND lon IS NOT NULL
+        GROUP BY city
+        HAVING MAX(scan_timestamp)
+        ORDER BY city
+    """
+    with _get_conn() as conn:
+        return [dict(r) for r in conn.execute(sql).fetchall()]
+
+
+def ml_training_row_exists(
+    city: str, target_date: str, decision_hour_local: int, feature_version: str
+) -> bool:
+    sql = """
+        SELECT 1 FROM ml_training_rows
+        WHERE city = ? AND target_date = ?
+          AND decision_hour_local = ? AND feature_version = ?
+        LIMIT 1
+    """
+    with _get_conn() as conn:
+        return conn.execute(
+            sql, (city, target_date, decision_hour_local, feature_version)
+        ).fetchone() is not None
+
+
+def insert_ml_training_row(
+    city: str,
+    lat_key: float,
+    lon_key: float,
+    target_date: str,
+    decision_hour_local: int,
+    feature_version: str,
+    features_json: str,
+    t_max_c: float,
+    fetched_at_utc: str,
+) -> int:
+    sql = """
+        INSERT OR IGNORE INTO ml_training_rows
+            (city, lat_key, lon_key, target_date, decision_hour_local,
+             feature_version, features_json, t_max_c, fetched_at_utc)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    with _get_conn() as conn:
+        cur = conn.execute(sql, (
+            city, lat_key, lon_key, target_date, decision_hour_local,
+            feature_version, features_json, t_max_c, fetched_at_utc,
+        ))
+        return cur.lastrowid or 0
+
+
+def load_ml_training_rows(city: str, feature_version: str) -> list[dict]:
+    """Return all training rows for a (city, feature_version), ordered by
+    target_date then decision_hour_local.  Each row keeps features_json as
+    the raw JSON string — parsing is the caller's responsibility."""
+    sql = """
+        SELECT city, lat_key, lon_key, target_date, decision_hour_local,
+               feature_version, features_json, t_max_c, fetched_at_utc
+        FROM ml_training_rows
+        WHERE city = ? AND feature_version = ?
+        ORDER BY target_date ASC, decision_hour_local ASC
+    """
+    with _get_conn() as conn:
+        return [dict(r) for r in conn.execute(sql, (city, feature_version)).fetchall()]
+
+
+def register_ml_model(
+    version: str,
+    city: str,
+    trained_at_utc: str,
+    training_window_start: str | None,
+    training_window_end: str | None,
+    feature_count: int,
+    n_training_rows: int,
+    point_rmse_c: float | None,
+    residual_sigma_c: float | None,
+    brier_score: float | None,
+    model_path: str,
+    activate_at_utc: str | None = None,
+    notes: str | None = None,
+) -> int:
+    sql = """
+        INSERT OR REPLACE INTO ml_model_registry
+            (version, city, trained_at_utc, training_window_start,
+             training_window_end, feature_count, n_training_rows,
+             point_rmse_c, residual_sigma_c, brier_score,
+             model_path, activate_at_utc, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    with _get_conn() as conn:
+        cur = conn.execute(sql, (
+            version, city, trained_at_utc, training_window_start,
+            training_window_end, feature_count, n_training_rows,
+            point_rmse_c, residual_sigma_c, brier_score,
+            model_path, activate_at_utc, notes,
+        ))
+        return cur.lastrowid or 0
+
+
+def get_active_ml_model(city: str) -> dict | None:
+    """Return the most recently trained ml_model_registry row for a city."""
+    sql = """
+        SELECT * FROM ml_model_registry
+        WHERE city = ?
+        ORDER BY trained_at_utc DESC
+        LIMIT 1
+    """
+    with _get_conn() as conn:
+        row = conn.execute(sql, (city,)).fetchone()
+        return dict(row) if row else None
+
+
+def count_ml_training_rows(
+    city: str | None = None, feature_version: str | None = None
+) -> int:
+    where = []
+    args: list = []
+    if city is not None:
+        where.append("city = ?")
+        args.append(city)
+    if feature_version is not None:
+        where.append("feature_version = ?")
+        args.append(feature_version)
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    sql = f"SELECT COUNT(*) FROM ml_training_rows{clause}"
+    with _get_conn() as conn:
+        return int(conn.execute(sql, args).fetchone()[0])
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 — obs_climatology helpers
+# ---------------------------------------------------------------------------
+
+_OBS_CLIM_HOURLY_COLS = [
+    "city", "doy", "hour", "n_samples",
+    "temp_mu", "temp_sigma",
+    "dew_mu", "dew_sigma",
+    "pressure_mu", "pressure_sigma",
+    "cloudcover_mu", "cloudcover_sigma",
+    "windspeed_mu", "windspeed_sigma",
+    "solarradiation_mu", "solarradiation_sigma",
+    "fetched_at_utc",
+]
+
+_OBS_CLIM_DAILY_COLS = [
+    "city", "doy", "n_samples",
+    "tmax_mu", "tmax_sigma",
+    "tmax_p10", "tmax_p25", "tmax_p50", "tmax_p75", "tmax_p90",
+    "tmin_mu", "tmin_sigma", "tmean_mu",
+    "fetched_at_utc",
+]
+
+
+def upsert_obs_climatology_hourly_bulk(rows: list[dict]) -> int:
+    """Replace-on-conflict bulk write of (city, doy, hour) climatology rows."""
+    if not rows:
+        return 0
+    placeholders = ",".join("?" * len(_OBS_CLIM_HOURLY_COLS))
+    sql = (f"INSERT OR REPLACE INTO obs_climatology_hourly "
+           f"({','.join(_OBS_CLIM_HOURLY_COLS)}) VALUES ({placeholders})")
+    with _get_conn() as conn:
+        conn.executemany(sql, [
+            tuple(r.get(c) for c in _OBS_CLIM_HOURLY_COLS) for r in rows
+        ])
+    return len(rows)
+
+
+def upsert_obs_climatology_daily_bulk(rows: list[dict]) -> int:
+    if not rows:
+        return 0
+    placeholders = ",".join("?" * len(_OBS_CLIM_DAILY_COLS))
+    sql = (f"INSERT OR REPLACE INTO obs_climatology_daily "
+           f"({','.join(_OBS_CLIM_DAILY_COLS)}) VALUES ({placeholders})")
+    with _get_conn() as conn:
+        conn.executemany(sql, [
+            tuple(r.get(c) for c in _OBS_CLIM_DAILY_COLS) for r in rows
+        ])
+    return len(rows)
+
+
+def update_outcomes_ml_bin_probs_bulk(updates: list[dict]) -> int:
+    """Update ml_bin_prob, ml_decision_hour, ml_model_version on existing
+    temp_outcomes rows.  Each update dict needs:
+        scan_timestamp, contract_id, ml_bin_prob, ml_decision_hour, ml_model_version
+
+    Matches on (scan_timestamp, contract_id) — the natural per-scan key.
+    Returns the number of rows touched (sum across updates)."""
+    if not updates:
+        return 0
+    sql = """
+        UPDATE temp_outcomes
+        SET ml_bin_prob       = ?,
+            ml_decision_hour  = ?,
+            ml_model_version  = ?
+        WHERE scan_timestamp = ? AND contract_id = ?
+    """
+    n = 0
+    with _get_conn() as conn:
+        for u in updates:
+            cur = conn.execute(sql, (
+                u.get("ml_bin_prob"),
+                u.get("ml_decision_hour"),
+                u.get("ml_model_version"),
+                u.get("scan_timestamp"),
+                u.get("contract_id"),
+            ))
+            n += cur.rowcount
+    return n
+
+
+def get_obs_climatology_hourly(city: str, doy: int, hour: int) -> dict | None:
+    sql = ("SELECT * FROM obs_climatology_hourly "
+           "WHERE city = ? AND doy = ? AND hour = ? LIMIT 1")
+    with _get_conn() as conn:
+        row = conn.execute(sql, (city, doy, hour)).fetchone()
+        return dict(row) if row else None
+
+
+def get_obs_climatology_daily(city: str, doy: int) -> dict | None:
+    sql = "SELECT * FROM obs_climatology_daily WHERE city = ? AND doy = ? LIMIT 1"
+    with _get_conn() as conn:
+        row = conn.execute(sql, (city, doy)).fetchone()
+        return dict(row) if row else None
+
+
+def load_all_obs_climatology_hourly(city: str) -> dict[tuple[int, int], dict]:
+    """Pre-load an entire city's hourly climatology into a (doy, hour) -> row
+    dict.  Backfill calls this once per city to avoid 366*24 = 8784 SQL
+    round-trips per city."""
+    sql = "SELECT * FROM obs_climatology_hourly WHERE city = ?"
+    with _get_conn() as conn:
+        return {(r["doy"], r["hour"]): dict(r)
+                for r in conn.execute(sql, (city,)).fetchall()}
+
+
+def load_all_obs_climatology_daily(city: str) -> dict[int, dict]:
+    sql = "SELECT * FROM obs_climatology_daily WHERE city = ?"
+    with _get_conn() as conn:
+        return {r["doy"]: dict(r) for r in conn.execute(sql, (city,)).fetchall()}
 
 
 import calendar  # kept for any downstream code that imports it from here
