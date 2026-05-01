@@ -51,10 +51,25 @@ os.makedirs(_LOGS_DIR, exist_ok=True)
 
 _console_level = SUMMARY if LOG_LEVEL.upper() == "SUMMARY" else getattr(logging, LOG_LEVEL, logging.INFO)
 
+# Force UTF-8 on both handlers so non-ASCII glyphs in log messages
+# (e.g. "→" in execute_signal CAPPED diagnostics) don't crash the Windows
+# console, whose default code page is cp1252.  reconfigure() is best-effort:
+# it exists on TextIOWrapper streams (the normal sys.stdout) but not on
+# every stream type, so we guard it.
+import sys
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 _console = logging.StreamHandler()
 _console.setLevel(_console_level)
 
-_filelog = logging.FileHandler(os.path.join(_LOGS_DIR, "bot.log"))
+_filelog = logging.FileHandler(
+    os.path.join(_LOGS_DIR, "bot.log"),
+    encoding="utf-8",
+)
 _filelog.setLevel(logging.INFO)
 
 _fmt = logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)-30s | %(message)s")
@@ -88,15 +103,15 @@ def _run_topups(all_events: list[dict], client) -> int:
 
     For each open position where size_usdc < target_size_usdc, check
     the current liquidity for that contract.  If liquidity supports
-    adding more, compute the top-up amount (capped at MAX_LIQUIDITY_TAKE_PCT
+    adding more.  Sizing/cap is delegated to execute_topup which uses
     of current liquidity and the remaining shortfall), and execute.
 
     Only tops up if the model still favors the position (the bin is still
     in the model's top bins for the event).  Does NOT top up positions
     where the thesis has weakened.
     """
-    from config import MAX_LIQUIDITY_TAKE_PCT, PAPER_TRADE
-    from db import get_underfilled_positions, update_position_topup, insert_position
+    from config import PAPER_TRADE
+    from db import get_underfilled_positions
 
     underfilled = get_underfilled_positions()
     if not underfilled:
@@ -141,19 +156,79 @@ def _run_topups(all_events: list[dict], client) -> int:
         except Exception:
             pass
 
+    from execution import execute_topup
+
+    from db import get_committed_usdc
+
     topped_up = 0
     for pos in underfilled:
         pid = pos["id"]
         cid = pos.get("contract_id", "")
-        current_size = float(pos.get("size_usdc") or 0)
         target = float(pos.get("target_size_usdc") or 0)
-        remaining = target - current_size
+        # Phase B (2026-04-30): use the position_orders ledger to compute
+        # how much capital is currently COMMITTED (filled on chain + still
+        # resting on book).  Replaces the old `target - size_usdc` calc
+        # which counted only filled, leading to top-ups stacking on top
+        # of resting partial-fill orders → double-committed exposure
+        # (the user's screenshot bug).
+        committed = get_committed_usdc(pid)
+        remaining = target - committed
+        current_size = float(pos.get("size_usdc") or 0)  # for log line only
         entry_price = float(pos.get("entry_price") or 0)
         city = pos.get("city", "")
         date_str = pos.get("date", "")
 
         if remaining <= 1.0 or entry_price <= 0:
+            if remaining <= 1.0:
+                logger.debug(
+                    f"[TOPUP] Skip pid={pid} {cid[:12]} — already committed "
+                    f"${committed:.2f} of ${target:.2f} target (gap ${remaining:.2f})"
+                )
             continue
+
+        # Skip positions that already have an in-flight top-up — one at a
+        # time per parent.  The monitor's reconciliation will fill or cancel,
+        # then a future scan can issue another if still underfilled.
+        if pos.get("pending_topup_order_id"):
+            logger.debug(
+                f"[TOPUP] Skipping pid={pid} {cid[:12]} — top-up already pending "
+                f"(order={pos['pending_topup_order_id'][:12]})"
+            )
+            continue
+
+        # PHASE A HOTFIX (2026-04-30): skip if the entry order is STILL
+        # RESTING ON THE BOOK with unfilled size.  Without this, the
+        # top-up logic computes `remaining = target - filled_only` and
+        # double-commits capital (the user-reported bug: a $10 entry that
+        # only filled $0.55 would get a $9.45 top-up placed on top of
+        # $9.45 still resting from the original — total exposure $19.45).
+        # Wait until the cancel pass clears the resting portion at the
+        # 10-min age cutoff, then top-up evaluates the gap correctly
+        # next cycle.  Phase B replaces this with the position_orders
+        # ledger which tracks committed (filled + resting) directly.
+        entry_order_id = pos.get("order_id")
+        if entry_order_id and client is not None:
+            try:
+                from execution import get_order_status
+                _stat = get_order_status(entry_order_id, client)
+                if _stat:
+                    s = (_stat.get("status") or "").upper()
+                    sz_match = float(_stat.get("size_matched") or 0)
+                    sz_orig  = float(_stat.get("original_size") or 0)
+                    # Resting = order is LIVE/MATCHED with unfilled size remaining
+                    if s in ("LIVE", "MATCHED", "DELAYED") and sz_match < sz_orig - 1e-9:
+                        logger.info(
+                            f"[TOPUP] Skip pid={pid} {cid[:12]} — entry order "
+                            f"still resting on book ({sz_match:.2f}/{sz_orig:.2f} "
+                            f"shares filled).  Waiting for cancel-pass to free "
+                            f"the resting portion before topping up."
+                        )
+                        continue
+            except Exception as _e:
+                # If the CLOB query fails, fall through (don't block top-ups
+                # on transient errors — the whole point of Phase B is to
+                # remove the dependency on a live CLOB query for this).
+                logger.debug(f"[TOPUP] Resting-order check failed (non-fatal): {_e}")
 
         # Check thesis still intact: model_prob should still be meaningful
         current_prob = model_prob_map.get(cid)
@@ -164,37 +239,42 @@ def _run_topups(all_events: list[dict], client) -> int:
             )
             continue
 
-        # Check available liquidity
+        # Compute the intended top-up size as the FULL remaining gap.
+        # execute_topup applies the ask-depth cap with fresh orderbook data
+        # (replacing the previous stale-Gamma `liquidity_usd * 0.40` rule);
+        # if the book is too thin, execute_topup returns status='skip' and
+        # we'll re-evaluate next cycle.  Gamma's `liquidity_usd` is kept
+        # only for the [TOPUP PLACED] log line as a soft sanity check.
         liquidity = liquidity_map.get(cid, 0)
-        max_take = liquidity * MAX_LIQUIDITY_TAKE_PCT
-        if max_take < 1.0:
+        if remaining < 1.0:
             continue
+        add_amount = remaining
 
-        add_amount = min(remaining, max_take)
-        if add_amount < 1.0:
-            continue
+        # execute_topup handles paper vs live internally.
+        # Paper: merges the add into the parent immediately (current behavior).
+        # Live:  posts CLOB buy, stamps pending_topup_* fields, monitor
+        #        reconciles the fill and merges via update_position_topup.
+        result = execute_topup(pos, add_amount, client=client)
 
-        add_shares = round(add_amount / entry_price, 4)
-
-        # Weighted average price (keep entry_price for simplicity in paper
-        # mode — in live mode we'd use the new fill price)
-        new_avg_price = entry_price
-
-        if PAPER_TRADE:
-            update_position_topup(pid, add_amount, add_shares, new_avg_price)
+        if result.get("status") in ("paper", "placed"):
             topped_up += 1
+            actual_add = float(result.get("add_usdc", add_amount))
             logger.log(SUMMARY,
-                f"[TOPUP] pos={pid} {city} {date_str} "
-                f"+${add_amount:.2f} (${current_size:.2f} -> "
-                f"${current_size + add_amount:.2f} / "
-                f"${target:.2f} target) "
+                f"[TOPUP {result['status'].upper()}] pos={pid} {city} {date_str} "
+                f"+${actual_add:.2f} (${current_size:.2f} -> "
+                f"${current_size + actual_add:.2f} / ${target:.2f} target) "
                 f"liquidity=${liquidity:.0f}"
+                + (f" | order={result.get('order_id', '')[:12]}"
+                   if result.get('order_id') else "")
             )
+        elif result.get("status") == "skip":
+            # already-pending was handled above; this branch covers any
+            # other internal skips from execute_topup.  Quiet log.
+            logger.debug(f"[TOPUP] pid={pid} skip: {result.get('reason')}")
         else:
-            # Live mode: would place a CLOB order for add_amount
-            # For now, same as paper (TODO: implement live top-up orders)
-            update_position_topup(pid, add_amount, add_shares, new_avg_price)
-            topped_up += 1
+            logger.warning(
+                f"[TOPUP FAILED] pid={pid} {cid[:12]}: {result}"
+            )
 
     return topped_up
 
@@ -204,77 +284,105 @@ def _run_topups(all_events: list[dict], client) -> int:
 # ---------------------------------------------------------------------------
 
 def _execute_exit_actions(actions, client) -> tuple[int, list[dict]]:
-    """Execute queued exit actions from position_eval.  Paper mode logs the
-    exit; live mode places CLOB sell orders.
-    Returns (count_executed, list of exit detail dicts for summary display)."""
-    from datetime import timezone
-    from zoneinfo import ZoneInfo
-    from db import (
-        update_position_outcome,
-        update_position_excursions,
-        get_latest_snapshot_id_for_contract,
-    )
-    from execution import cancel_order
+    """Execute queued exit actions from position_eval.
+
+    Paper mode: logs exit + closes position in DB (status='closed').
+    Live mode: routes through execution.execute_exit() which places a CLOB
+    sell at the appropriate ladder rung (retry_count=0 → 0.99 × intended).
+    The position transitions to status='exiting' and the monitor loop
+    advances the ladder + confirms fills on subsequent cycles.
+
+    Returns (count_executed, list of exit detail dicts for summary display).
+    """
+    from db import get_open_positions
+    from execution import execute_exit
 
     executed = 0
     details: list[dict] = []
-    now = datetime.now(ZoneInfo("America/Chicago")).isoformat()
+
+    # Build a position_id → row lookup so we can pass full context to
+    # execute_exit (it needs entry_price, shares, token IDs, etc.)
+    open_by_id = {p["id"]: p for p in get_open_positions()
+                  if p.get("status") in ("open", "exiting")}
 
     for ea in actions:
         if ea.action == "HOLD":
             continue
 
-        exit_price = ea.exit_price or 0.0
-        shares = 0.0
-        entry_price = 0.0
-        try:
-            from config import DB_PATH
-            import sqlite3
-            conn = sqlite3.connect(DB_PATH)
-            row = conn.execute(
-                "SELECT shares, entry_price, unrealized_pnl FROM positions WHERE id = ?",
-                (ea.position_id,)
-            ).fetchone()
-            conn.close()
-            if row:
-                shares = float(row[0] or 0)
-                entry_price = float(row[1] or 0)
-        except Exception:
-            pass
+        position = open_by_id.get(ea.position_id)
+        if position is None:
+            logger.warning(
+                f"[EXIT] pos={ea.position_id} not in open positions — skipping"
+            )
+            continue
+
+        # Skip if already in exit ladder (avoid double-firing within a scan)
+        if position.get("status") == "exiting":
+            logger.debug(
+                f"[EXIT] pos={ea.position_id} already exiting "
+                f"(retry_count={position.get('exit_retry_count', 0)}); skipping"
+            )
+            continue
+
+        exit_price = float(ea.exit_price or 0.0)
 
         if ea.action == "REDUCE_50":
-            shares = shares * 0.5
+            # TODO: implement true partial close (sell shares/2).  For now we
+            # treat REDUCE as full close to keep behavior unchanged.
             logger.info(
-                f"[EXIT] REDUCE_50 treated as SELL for pos={ea.position_id} "
+                f"[EXIT] REDUCE_50 treated as full SELL for pos={ea.position_id} "
                 f"(partial closes not yet implemented)"
             )
 
-        pnl = round((exit_price - entry_price) * shares, 4)
-        exit_snap_id = get_latest_snapshot_id_for_contract(ea.contract_id)
+        result = execute_exit(
+            position             = position,
+            intended_exit_price  = exit_price,
+            exit_reason          = f"{ea.classification}:{ea.reason}",
+            client               = client,
+            retry_count          = 0,
+        )
 
-        update_position_outcome(
-            position_id    = ea.position_id,
-            exit_price     = exit_price,
-            exit_time      = now,
-            pnl            = pnl,
-            status         = "closed",
-            exit_reason    = f"{ea.classification}:{ea.reason}",
-            exit_snapshot_id = exit_snap_id,
-        )
+        # In paper mode, execute_exit closes the position immediately and
+        # returns realized pnl.  In live mode, it places a CLOB sell and
+        # the position transitions to status='exiting' — pnl is realized
+        # later when the fill is reconciled.
         executed += 1
-        details.append({
-            "city": ea.city, "date": ea.date, "side": ea.side,
-            "classification": ea.classification, "pnl": pnl,
-            "pos_id": ea.position_id,
-        })
-        logger.info(
-            f"[EXIT] pos={ea.position_id} {ea.city} {ea.date} {ea.side} "
-            f"| {ea.classification} | exit@{exit_price:.4f} pnl=${pnl:+.4f} "
-            f"| {ea.reason}"
-        )
+        if result.get("status") == "paper_closed":
+            details.append({
+                "city": ea.city, "date": ea.date, "side": ea.side,
+                "classification": ea.classification,
+                "pnl": result.get("pnl", 0.0),
+                "pos_id": ea.position_id,
+            })
+            logger.info(
+                f"[EXIT PAPER] pos={ea.position_id} {ea.city} {ea.date} "
+                f"{ea.side} | {ea.classification} | exit@{exit_price:.4f} "
+                f"pnl=${result.get('pnl', 0):+.4f} | {ea.reason}"
+            )
+        elif result.get("status") == "exit_pending":
+            details.append({
+                "city": ea.city, "date": ea.date, "side": ea.side,
+                "classification": ea.classification,
+                "pnl": None,                     # not yet realized
+                "pos_id": ea.position_id,
+            })
+            logger.info(
+                f"[EXIT LIVE] pos={ea.position_id} {ea.city} {ea.date} "
+                f"{ea.side} | {ea.classification} | "
+                f"order={result.get('order_id', '')[:12]} "
+                f"limit={result.get('limit_price', 0):.4f} "
+                f"intended={exit_price:.4f} | {ea.reason}"
+            )
+        else:
+            # error / failed / unmatched — leave position open and surface
+            logger.warning(
+                f"[EXIT FAILED] pos={ea.position_id} status={result.get('status')} "
+                f"reason={result.get('reason') or result.get('response', '')}"
+            )
+            executed -= 1   # don't count failures
 
     if executed:
-        logger.info(f"[EXIT] {executed} position(s) exited this cycle")
+        logger.info(f"[EXIT] {executed} position(s) exit-triggered this cycle")
     return executed, details
 
 
@@ -310,7 +418,14 @@ def trading_run():
     """
     logger.log(SUMMARY, "=== TRADING RUN START ===")
 
-    bankroll = get_bankroll()
+    # CLOB client is created once at the start of the cycle and reused for:
+    #   1. Wallet balance lookup (sizing.get_bankroll → wallet.get_effective_bankroll)
+    #   2. Order placement in execute_signal()
+    #   3. Top-up orders in _run_topups()
+    #   4. Exit orders in _execute_exit_actions()
+    # In paper mode get_clob_client() returns None, which all callers handle.
+    client = get_clob_client()
+    bankroll = get_bankroll(client=client)
     logger.log(SUMMARY, f"Bankroll: ${bankroll:,.2f} | Strategy: {get_active_strategy().name} | Paper: {PAPER_TRADE}")
 
     # Use cached events if available, otherwise fetch fresh
@@ -346,7 +461,21 @@ def trading_run():
 
     logger.info(f"Risk pre-filter: {len(eligible)} eligible, {skipped} skipped")
 
-    eligible = strategy.rank_signals(eligible, bankroll)
+    # Pass the CLOB client so MPV strategy can do orderbook-aware ranking
+    # (spread + sweepable depth on the top RANK_TOP_N_FOR_ORDERBOOK candidates).
+    # Strategies that don't use the client ignore the kwarg.
+    eligible = strategy.rank_signals(eligible, bankroll, client=client)
+    # Drop signals filtered out by the spread cap (priority_score=-1000) so
+    # they don't show up in the unfunded-reasons summary as "open positions
+    # exceeded" — they were spread-rejected, not capacity-rejected.
+    pre_drop = len(eligible)
+    eligible = [s for s in eligible if s.get("priority_score", 0) > -100]
+    spread_dropped = pre_drop - len(eligible)
+    if spread_dropped > 0:
+        logger.log(SUMMARY,
+            f"  > Spread filter dropped {spread_dropped} signal(s) "
+            f"(spread > MAX_SPREAD_CENTS_FOR_ENTRY)"
+        )
 
     if eligible:
         logger.info("--- SIGNAL PRIORITY RANKING ---")
@@ -371,9 +500,25 @@ def trading_run():
     if skip_reasons:
         for reason, count in sorted(skip_reasons.items(), key=lambda x: x[1], reverse=True):
             logger.log(SUMMARY, f"  > {reason}: {count}")
+        # If position-cap skips dominated this cycle, surface the actionable
+        # mitigation right next to the count so the operator doesn't have
+        # to reason about what to do.  Per-position cap skips are
+        # INTENTIONAL (config: don't enter at less than full target), but
+        # they look identical to a bug at first glance — explicit hint
+        # avoids that confusion.
+        cap_skips = sum(c for r, c in skip_reasons.items()
+                        if "per-position cap" in r)
+        if cap_skips > 0 and cap_skips >= 0.5 * skipped:
+            from config import MAX_POSITION_PCT as _mpp
+            logger.log(SUMMARY,
+                f"  > NOTE: {cap_skips} skip(s) are per-position-cap rejections "
+                f"(MAX_POSITION_PCT={_mpp:.2%}). To trade at smaller sizes, "
+                f"lower the cap in .env; OR wait for bankroll to recover."
+            )
     logger.log(SUMMARY, "")
 
-    client   = get_clob_client()
+    # `client` was already initialized at the top of trading_run() and used
+    # for the bankroll lookup; reuse it here for execute_signal and below.
     executed = 0
     unfunded = 0
     unfunded_reasons: dict[str, int] = {}
@@ -424,21 +569,13 @@ def trading_run():
             logger.debug(f"Skipping {_sig_cid[:12]} — previously stopped out")
             continue
 
-        from config import LIQUIDITY_AWARE_SIZING, MAX_LIQUIDITY_TAKE_PCT
-        original_kelly = signal.get("kelly_size", 0)
-        liq_capped = False
-        if LIQUIDITY_AWARE_SIZING:
-            liquidity = float(signal.get("liquidity_usd") or 0)
-            max_take = liquidity * MAX_LIQUIDITY_TAKE_PCT
-            if max_take > 0 and original_kelly > max_take:
-                liq_capped = True
-                logger.info(
-                    f"Liquidity cap: {signal.get('city')} {signal.get('date')} "
-                    f"${original_kelly:.2f} -> ${max_take:.2f} "
-                    f"(liquidity=${liquidity:.0f} x {MAX_LIQUIDITY_TAKE_PCT*100:.0f}%)"
-                )
-                signal["kelly_size"] = round(max_take, 2)
-            signal["target_size_usdc"] = original_kelly
+        # Liquidity sizing was previously capped here using Gamma's stale
+        # `liquidity_usd` (bid + ask combined).  As of 2026-04-30 the cap
+        # has moved INSIDE execute_signal where it uses the FRESH orderbook
+        # snapshot's ask-side depth at acceptable prices — see
+        # MAX_TAKE_PCT_OF_ASK_DEPTH in config.  We just record the original
+        # intent here so top-ups can fill the gap on later cycles.
+        signal["target_size_usdc"] = signal.get("kelly_size", 0)
 
         result = execute_signal(signal, client=client)
 
@@ -464,6 +601,11 @@ def trading_run():
                 f"| status={result['status']} pos_id={result.get('position_id')} "
                 f"priority=#{executed}"
             )
+        elif result["status"] == "skip":
+            # Expected skip — execute_signal hit a guard like the buy-retry
+            # cap.  Already logged at WARNING by execution.py; nothing more
+            # to do here.  Don't count as executed or as failed.
+            pass
         else:
             logger.error(
                 f"Execution failed for {signal.get('contract_id', '')[:12]}: {result}"
@@ -475,9 +617,19 @@ def trading_run():
         f"{len(signals)} raw signals -> {len(eligible)} eligible"
     )
 
-    # --- SUMMARY: Executed trades table ---
+    # --- SUMMARY: Orders placed (NOT filled — fills come later via WS) ---
+    # The bot has SUBMITTED these orders to Polymarket.  They may or may
+    # not have filled yet:
+    #   * Engine-matched orders may already be on chain (status='matched')
+    #   * Resting orders sit on the book (status='live') until taken
+    #   * The user-channel WS catches the actual fill confirmation and
+    #     updates the position to fill_status='filled' with a separate
+    #     [FILL] activity log entry — that's the truth-of-fill signal.
     if executed_trades:
-        logger.log(SUMMARY, "--- Executed Trades ---")
+        logger.log(SUMMARY, "--- Orders Placed ---")
+        logger.log(SUMMARY,
+            "  (These were submitted to Polymarket — fill confirmation "
+            "appears later in the activity log as [FILL] entries)")
         for t in executed_trades:
             rl = t.get("range_low")
             rh = t.get("range_high")
@@ -492,11 +644,11 @@ def trading_run():
             else:
                 bin_str = "?"
             logger.log(SUMMARY,
-                f"  [ BUY ]  |  {t['city']:<8}  |  {t['date']}  {t['side']:<3}  |  "
-                f"{bin_str:<8}  |  Entry: ${t['price']:.2f}  | Size: ${t['size']:,.0f}"
+                f"  [ ORDER PLACED ]  |  {t['city']:<8}  |  {t['date']}  {t['side']:<3}  |  "
+                f"{bin_str:<8}  |  Limit: ${t['price']:.2f}  | Size: ${t['size']:,.0f}"
             )
     else:
-        logger.log(SUMMARY, "--- No trades executed ---")
+        logger.log(SUMMARY, "--- No orders placed ---")
 
     # --- Liquidity-aware top-ups ---
     from config import LIQUIDITY_AWARE_SIZING
@@ -522,9 +674,13 @@ def trading_run():
     if exit_details:
         logger.log(SUMMARY, "--- Exits ---")
         for ed in exit_details:
+            # Live exits have pnl=None until the sell fills (see
+            # _execute_exit_actions); paper exits realise pnl immediately.
+            _pnl = ed.get('pnl')
+            pnl_str = f"${_pnl:+.2f}" if _pnl is not None else "pending"
             logger.log(SUMMARY,
                 f"  SELL {ed['side']:<3}  {ed['city']:<18} {ed['date']}  "
-                f"{ed['classification']:<18} pnl=${ed['pnl']:+.2f}  pos={ed['pos_id']}"
+                f"{ed['classification']:<18} pnl={pnl_str}  pos={ed['pos_id']}"
             )
 
     if unfunded_reasons:
@@ -534,14 +690,17 @@ def trading_run():
 
     logger.log(SUMMARY, "")
     parts = []
-    parts.append(f"{executed} bought")
+    # `executed` counts orders SUBMITTED, not on-chain fills.  The fill
+    # truth-signal is in the activity log via [FILL] entries that come
+    # from the user-channel WS handler (see fill_handler._apply_confirmed_fill).
+    parts.append(f"{executed} placed")
     if exit_count:
-        parts.append(f"{exit_count} exited")
+        parts.append(f"{exit_count} exit orders placed")
     if topped_up:
         parts.append(f"{topped_up} topped up")
     if unfunded:
         parts.append(f"{unfunded} unfunded")
-    parts.append(f"${total_deployed:,.0f} deployed this cycle")
+    parts.append(f"${total_deployed:,.0f} submitted this cycle")
 
     logger.log(SUMMARY, f"--- Summary: {' | '.join(parts)} ---")
     logger.log(SUMMARY, "")
@@ -558,6 +717,25 @@ def main():
     logger.log(SUMMARY, f"Paper: {PAPER_TRADE} | DB: {DB_PATH}")
 
     init_db()
+
+    # One-shot backfill of position_orders ledger (Phase B, 2026-04-30).
+    # Idempotent — only inserts rows for orders not yet in the ledger.
+    # Existing positions' order_id / pending_topup_order_id / exit_order_id
+    # get a synthesized ledger row so committed_usdc queries work from
+    # cycle 1.  After every position has flowed through the new code path,
+    # this call is a cheap no-op.
+    try:
+        from db import backfill_position_orders
+        _bf = backfill_position_orders()
+        if any(_bf.values()):
+            logger.log(SUMMARY,
+                f"position_orders backfilled: "
+                f"{_bf.get('entries', 0)} entries, "
+                f"{_bf.get('topups', 0)} topups, "
+                f"{_bf.get('exits', 0)} exits"
+            )
+    except Exception as _e:
+        logger.warning(f"position_orders backfill failed (non-fatal): {_e}")
 
     # ----- Startup health check: validate ensemble API connectivity -----
     # Only needed for weather-based strategies. MPV skips this entirely.
@@ -620,6 +798,51 @@ def main():
         logger.log(SUMMARY, "WebSocket price stream started — stop-losses active")
     except Exception as e:
         logger.warning(f"WebSocket price stream failed to start (non-fatal): {e}")
+
+    # Start authenticated user-channel WS for real-time fill detection.
+    # Lives alongside the public price stream above; runs only in live mode.
+    # On every reconnect, triggers a REST reconciliation pass to catch up
+    # on anything missed during downtime.
+    if not PAPER_TRADE:
+        try:
+            from execution import get_clob_client
+            from user_ws import start_user_stream, wire_backfill_callback
+            from monitor import _reconcile_pending_fills
+            from config import WALLET_ADDRESS
+
+            _user_ws_client = get_clob_client()
+
+            # Polymarket maker-side keep-alive: heartbeat every 5s.  Without
+            # this, every restart and every >15s WS hiccup auto-cancels all
+            # of our open orders (Polymarket's market-maker safety mechanism).
+            # See bot/heartbeat.py for the full rationale.
+            try:
+                from heartbeat import start_heartbeat
+                start_heartbeat(_user_ws_client)
+                logger.info("Heartbeat daemon started (5s interval)")
+            except Exception as _hb_err:
+                logger.warning(
+                    f"Heartbeat daemon failed to start (non-fatal): {_hb_err}"
+                )
+
+            def _user_ws_backfill() -> None:
+                # Run REST sweep through the same fill_handler path the WS
+                # uses, catching anything that filled during reconnect downtime.
+                try:
+                    _reconcile_pending_fills(_user_ws_client)
+                except Exception as e:
+                    logger.warning(f"[USER_WS] REST backfill failed: {e}")
+
+            wire_backfill_callback(_user_ws_backfill)
+            start_user_stream(_user_ws_client, wallet_address=WALLET_ADDRESS)
+            logger.log(SUMMARY,
+                "User-channel WS started — real-time fill detection active"
+            )
+        except Exception as e:
+            logger.warning(
+                f"User-channel WS failed to start (non-fatal — REST poller "
+                f"will still reconcile fills every monitor cycle): {e}"
+            )
 
     if _needs_weather:
         try:
@@ -753,6 +976,78 @@ def main():
         id="monitor_run",
         name="Position monitor",
         misfire_grace_time=300,
+        coalesce=True,
+    )
+
+    # Fast exit-ladder advancement: every 5 minutes.
+    # The hourly monitor also calls _advance_exit_ladders (as a safety
+    # net), but the 5-min cadence is what actually drives the ladder
+    # forward in normal operation.  This caps max time-to-fill on a
+    # stop-out at ~20 minutes (4 rungs × 5 min) instead of 4 hours.
+    # Concurrency between the two callers is handled by an internal
+    # lock in _advance_exit_ladders — second concurrent invocation
+    # short-circuits without racing.
+    def _exit_ladder_fast_job() -> None:
+        try:
+            from monitor import run_exit_ladder_fast
+            run_exit_ladder_fast()
+        except Exception as e:
+            logger.exception(f"Fast exit-ladder job failed (non-fatal): {e}")
+
+    scheduler.add_job(
+        _exit_ladder_fast_job,
+        trigger=CronTrigger(minute="*/5", timezone="UTC"),
+        id="exit_ladder_fast",
+        name="Exit ladder fast advance (5-min)",
+        misfire_grace_time=120,
+        coalesce=True,
+    )
+
+    # Orphan topup pointer cleanup: every 5 minutes.
+    # Polymarket sometimes cancels resting orders on its own (account risk
+    # checks, WS auth disconnects, manual UI cancels).  When the WS misses
+    # the resulting CANCELLATION event, the bot's pending_topup_order_id
+    # column carries a dead pointer forever and _run_topups thinks a topup
+    # is still in flight.  This job polls the CLOB directly for every
+    # such pointer and clears the stale ones — see
+    # monitor.detect_externally_cancelled_topups.
+    def _orphan_topup_cleanup_job() -> None:
+        try:
+            from monitor import run_orphan_topup_cleanup_fast
+            run_orphan_topup_cleanup_fast()
+        except Exception as e:
+            logger.exception(f"Orphan topup cleanup job failed (non-fatal): {e}")
+
+    scheduler.add_job(
+        _orphan_topup_cleanup_job,
+        trigger=CronTrigger(minute="*/5", timezone="UTC"),
+        id="orphan_topup_cleanup",
+        name="Orphan topup pointer cleanup (5-min)",
+        misfire_grace_time=120,
+        coalesce=True,
+    )
+
+    # Stale topup re-pricing: every 5 minutes (Lightweight Option B).
+    # When a topup's limit becomes stale relative to the current best_ask
+    # (drift > TOPUP_REPRICE_THRESHOLD_CENTS, default 1.5¢), cancel + re-
+    # issue at the fresh price.  Fixes the "topup sits at $0.30 forever
+    # while asks are now $0.40" failure mode where the position would
+    # otherwise never reach target size despite available liquidity.
+    # Direction-aware: only fires on UPWARD ask drift; downward drift is
+    # already handled by Polymarket's matching at the better price.
+    def _stale_topup_refresh_job() -> None:
+        try:
+            from monitor import run_stale_topup_refresh_fast
+            run_stale_topup_refresh_fast()
+        except Exception as e:
+            logger.exception(f"Stale topup refresh job failed (non-fatal): {e}")
+
+    scheduler.add_job(
+        _stale_topup_refresh_job,
+        trigger=CronTrigger(minute="*/5", timezone="UTC"),
+        id="stale_topup_refresh",
+        name="Stale topup re-pricing (5-min)",
+        misfire_grace_time=120,
         coalesce=True,
     )
 
@@ -892,10 +1187,51 @@ def main():
         )
 
     try:
+        from activity import log_activity
+        log_activity(
+            "SYSTEM",
+            message=(
+                f"bot started: strategy={ACTIVE_STRATEGY} "
+                f"mode={'paper' if PAPER_TRADE else 'LIVE'}"
+            ),
+            strategy=ACTIVE_STRATEGY, paper_trade=PAPER_TRADE,
+        )
+    except Exception:
+        pass
+
+    try:
         scheduler.start()
     except KeyboardInterrupt:
+        try:
+            from activity import log_activity
+            log_activity("SYSTEM", message="bot stopped by user (KeyboardInterrupt)")
+        except Exception:
+            pass
+        # Clean shutdown of the heartbeat daemon — on KeyboardInterrupt
+        # the process is already exiting, so this is mostly cosmetic
+        # (the daemon thread would die with the process anyway), but it
+        # gives us a clean log line + cancels the in-flight sleep.
+        try:
+            from heartbeat import stop_heartbeat
+            stop_heartbeat(timeout=2.0)
+        except Exception:
+            pass
         logger.info("Bot stopped by user")
     except Exception as e:
+        try:
+            from activity import log_activity
+            log_activity(
+                "SYSTEM", level="ERROR",
+                message=f"bot crashed: {e}",
+                error=str(e),
+            )
+        except Exception:
+            pass
+        try:
+            from heartbeat import stop_heartbeat
+            stop_heartbeat(timeout=2.0)
+        except Exception:
+            pass
         logger.exception(f"Bot crashed: {e}")
         raise
 

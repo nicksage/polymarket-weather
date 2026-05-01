@@ -28,6 +28,26 @@ from streamlit_autorefresh import st_autorefresh
 from config import DB_PATH
 
 
+def _connect_db(timeout: float = 30.0):
+    """Open a SQLite connection with WAL + busy_timeout pragmas.
+
+    Mirrors db._get_conn's pragmas so the dashboard's read connections
+    don't lock against the bot's writes.  Without WAL the dashboard's
+    60-second auto-refresh would frequently collide with monitor cycles
+    causing `sqlite3.OperationalError: database is locked` (the user-
+    reported error from 2026-04-30).  WAL mode allows N readers + 1
+    writer concurrently — exactly our access pattern.
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=timeout)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass
+    return conn
+
+
 # ---------------------------------------------------------------------------
 # Local-time helper (cached per-rounded-coord; uses timezonefinder + zoneinfo)
 # ---------------------------------------------------------------------------
@@ -64,7 +84,15 @@ st.set_page_config(
     layout="wide",
 )
 
-_REFRESH_INTERVAL_MS = 60_000
+_REFRESH_INTERVAL_MS = 300_000  # 5 min — was 60s.  See top-of-file note.
+
+# Cache TTL for DB-backed loaders.  Deliberately SHORTER than the refresh
+# interval so every autorefresh hits a warm cache and renders instantly,
+# but the cached data is fresh enough to still feel current.  At 240s
+# (4 min) with 300s refresh, the cache is always populated by the time
+# the autorefresh fires the next render.
+_CACHE_TTL_SHORT = 240
+_CACHE_TTL_LONG  = 600
 
 # Hide autorefresh bar + center tabs + add metric padding
 st.markdown("""<style>
@@ -94,11 +122,11 @@ st_autorefresh(interval=_REFRESH_INTERVAL_MS, limit=None, key="global_autorefres
 # Data loaders (cached, auto-refresh every 15 s — synced with autorefresh)
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=_CACHE_TTL_SHORT)
 def load_events() -> pd.DataFrame:
     """Load the most recent scan row for each event (city+date)."""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = _connect_db()
         df = pd.read_sql(
             """
             SELECT e.* FROM temp_events e
@@ -119,11 +147,11 @@ def load_events() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=_CACHE_TTL_SHORT)
 def load_outcomes(signals_only: bool = False) -> pd.DataFrame:
     """Load the most recent outcomes for each event, joined with event context."""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = _connect_db()
         where = "AND o.is_signal = 1" if signals_only else ""
         df = pd.read_sql(
             f"""
@@ -171,10 +199,10 @@ def load_outcomes(signals_only: bool = False) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=_CACHE_TTL_SHORT)
 def load_positions() -> pd.DataFrame:
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = _connect_db()
         df = pd.read_sql(
             "SELECT * FROM positions ORDER BY entry_time DESC", conn
         )
@@ -186,7 +214,7 @@ def load_positions() -> pd.DataFrame:
 
 def load_scan_timestamp() -> str:
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = _connect_db()
         row = conn.execute("SELECT MAX(scan_timestamp) FROM temp_events").fetchone()
         conn.close()
         return row[0] if row and row[0] else "No scans yet"
@@ -279,6 +307,17 @@ def _is_missing(v) -> bool:
         return pd.isna(v)
     except (TypeError, ValueError):
         return False
+
+
+def _safe_str(v) -> str:
+    """Coerce a possibly-NaN/None value from a pandas row dict into a clean
+    string.  pandas reads SQL NULLs as float NaN — the idiom
+    `(value or "").upper()` blows up because NaN is truthy AND has no
+    .upper().  Use this helper anywhere we read string-ish columns from
+    a DataFrame iterrows() pass."""
+    if _is_missing(v):
+        return ""
+    return str(v)
 
 
 def _range_label(low, high, unit) -> str:
@@ -386,7 +425,7 @@ def _show_event_modal(city: str, date_str: str, rows: list[dict]) -> None:
     # Load open positions for this event to show held status
     _open_pos_by_contract: dict[str, dict] = {}
     try:
-        _pos_conn = sqlite3.connect(DB_PATH)
+        _pos_conn = _connect_db()
         _pos_conn.row_factory = sqlite3.Row
         _pos_rows = _pos_conn.execute(
             "SELECT contract_id, side, size_usdc, target_size_usdc, unrealized_pnl "
@@ -629,6 +668,17 @@ st.markdown(
 
 st.markdown("<h1 style='text-align: center;'>🌡 Polymarket Weather Bot</h1>", unsafe_allow_html=True)
 
+# Manual refresh control — autorefresh fires every 5 min, but the operator
+# can force an immediate cache-clear-and-rerun here.  Centered under the
+# title, narrow column so the button doesn't dominate the header.
+_refresh_left, _refresh_mid, _refresh_right = st.columns([3, 1, 3])
+with _refresh_mid:
+    if st.button("Refresh now", width="stretch", help=(
+        f"Auto-refresh runs every {_REFRESH_INTERVAL_MS // 60000} minutes. "
+        f"Click to clear cached data and re-render immediately."
+    )):
+        _do_light_refresh()
+
 last_scan = load_scan_timestamp()
 
 events_df    = load_events()
@@ -754,7 +804,9 @@ def _do_light_refresh():
 # ===========================================================================
 # Main tabs
 # ===========================================================================
-_tab_contract, _tab_paper, _tab_live, _tab_accuracy = st.tabs(["Contract Data", "Paper Trade Data", "Live Trade Data", "Forecast Accuracy"])
+_tab_contract, _tab_paper, _tab_live, _tab_activity, _tab_accuracy = st.tabs(
+    ["Contract Data", "Paper Trade Data", "Live Trade Data", "Activity", "Forecast Accuracy"]
+)
 
 # ===========================================================================
 # TAB 1 — Contract Data
@@ -865,7 +917,7 @@ with _tab_contract:
                 # Load open positions for status display
                 _list_positions: dict[str, dict] = {}
                 try:
-                    _lp_conn = sqlite3.connect(DB_PATH)
+                    _lp_conn = _connect_db()
                     _lp_conn.row_factory = sqlite3.Row
                     for _lp in _lp_conn.execute(
                         "SELECT contract_id, side, size_usdc FROM positions "
@@ -1108,39 +1160,107 @@ with _tab_contract:
 # Position helpers (shared by Paper Trade Data and Live Trade Data tabs)
 # ===========================================================================
 
-def _build_open_rows(df):
-    # Load current model probabilities from latest scan
-    _current_model_probs: dict[str, float] = {}
+@st.cache_data(ttl=_CACHE_TTL_SHORT)
+def _load_latest_model_probs() -> dict[str, float]:
+    """Latest model probability per contract_id from the most recent scan.
+    Cached so repeated dashboard renders within the TTL window don't
+    re-hit the DB."""
+    out: dict[str, float] = {}
     try:
-        _cmp_conn = sqlite3.connect(DB_PATH)
-        _cmp_ts = _cmp_conn.execute(
-            "SELECT MAX(scan_timestamp) FROM temp_outcomes"
-        ).fetchone()[0]
-        if _cmp_ts:
-            for _r in _cmp_conn.execute(
+        c = _connect_db()
+        ts = c.execute("SELECT MAX(scan_timestamp) FROM temp_outcomes").fetchone()[0]
+        if ts:
+            for r in c.execute(
                 "SELECT contract_id, model_prob FROM temp_outcomes "
                 "WHERE scan_timestamp = ? AND model_prob IS NOT NULL",
-                (_cmp_ts,),
+                (ts,),
             ).fetchall():
-                _current_model_probs[_r[0]] = float(_r[1])
-        _cmp_conn.close()
+                out[r[0]] = float(r[1])
+        c.close()
     except Exception:
         pass
+    return out
 
-    # Load latest volume data by contract_id
-    _volumes: dict[str, float] = {}
+
+@st.cache_data(ttl=_CACHE_TTL_SHORT)
+def _load_latest_volumes() -> dict[str, float]:
+    """Latest volume_usd per contract_id, scoped to the most recent scan
+    only.  The previous version did a full table scan of temp_outcomes
+    (no scan_timestamp filter, no LIMIT) and pulled every historical row
+    into Python — the slowest single query in the dashboard render path
+    once temp_outcomes accumulated tens of thousands of rows."""
+    out: dict[str, float] = {}
     try:
-        _vol_conn = sqlite3.connect(DB_PATH)
-        for _r in _vol_conn.execute("""
-            SELECT contract_id, volume_usd FROM temp_outcomes
-            WHERE volume_usd IS NOT NULL
-            ORDER BY scan_timestamp DESC
-        """).fetchall():
-            if _r[0] not in _volumes:
-                _volumes[_r[0]] = float(_r[1])
-        _vol_conn.close()
+        c = _connect_db()
+        ts = c.execute("SELECT MAX(scan_timestamp) FROM temp_outcomes").fetchone()[0]
+        if ts:
+            for r in c.execute(
+                "SELECT contract_id, volume_usd FROM temp_outcomes "
+                "WHERE scan_timestamp = ? AND volume_usd IS NOT NULL",
+                (ts,),
+            ).fetchall():
+                out[r[0]] = float(r[1])
+        c.close()
     except Exception:
         pass
+    return out
+
+
+@st.cache_data(ttl=_CACHE_TTL_SHORT)
+def _load_ledger_aggregates(pos_ids_tuple: tuple) -> dict[int, tuple[float, float]]:
+    """Per-position (committed_usdc, filled_usdc) summed from the
+    position_orders ledger.  Mirrors db.get_committed_usdc semantics:
+    partial fills count as still-committing (intended_usdc), not filled-only.
+
+    Cached.  Argument is a tuple (hashable) of position ids; the cache
+    key changes only when the open-position set changes — within a single
+    refresh window, called multiple times for free.
+    """
+    if not pos_ids_tuple:
+        return {}
+    out: dict[int, tuple[float, float]] = {}
+    try:
+        c = _connect_db()
+        ph = ",".join(["?"] * len(pos_ids_tuple))
+        for pid, committed, filled in c.execute(f"""
+            SELECT position_id,
+                SUM(CASE
+                    WHEN status = 'filled' AND filled_usdc >= intended_usdc * 0.99
+                        THEN filled_usdc
+                    WHEN status = 'filled' AND filled_usdc < intended_usdc * 0.99
+                        THEN intended_usdc
+                    WHEN status IN ('pending','live','matched','partial')
+                        THEN intended_usdc
+                    ELSE 0
+                END) AS committed,
+                SUM(filled_usdc) AS filled
+            FROM position_orders
+            WHERE position_id IN ({ph})
+              AND role IN ('entry', 'topup')
+            GROUP BY position_id
+        """, list(pos_ids_tuple)).fetchall():
+            out[int(pid)] = (float(committed or 0), float(filled or 0))
+        c.close()
+    except Exception:
+        pass
+    return out
+
+
+def _build_open_rows(df):
+    # All three lookups are cached — first render in a refresh window pays
+    # the DB cost; subsequent renders within _CACHE_TTL_SHORT are free.
+    _current_model_probs = _load_latest_model_probs()
+    _volumes = _load_latest_volumes()
+    _ledger_aggs: dict[int, tuple[float, float]] = {}
+    if not df.empty:
+        try:
+            _pos_ids = tuple(sorted(int(pid) for pid in df["id"].dropna().tolist()))
+            if _pos_ids:
+                _ledger_aggs = _load_ledger_aggregates(_pos_ids)
+        except Exception:
+            pass
+    _ledger_committed = {pid: c for pid, (c, _f) in _ledger_aggs.items()}
+    _ledger_filled    = {pid: f for pid, (_c, f) in _ledger_aggs.items()}
 
     rows = []
     for _, p in df.iterrows():
@@ -1157,7 +1277,33 @@ def _build_open_rows(df):
         _curr_model = _current_model_probs.get(_cid)
         _curr_market = float(curr) if curr else None
         _vol = _volumes.get(_cid)
+        _pid = int(p.get("id")) if p.get("id") is not None else None
+        _committed = _ledger_committed.get(_pid)
+        _filled_lg = _ledger_filled.get(_pid)
+        _target    = float(p.get("target_size_usdc") or 0)
 
+        # Lifecycle (Phase 9): on-chain confirmation stage of the entry
+        # trade.  Healthy live positions show 'confirmed'; legacy/paper
+        # rows pre-dating Phase 9 show NULL → blank.  Anything stuck on
+        # 'matched' or 'mined' here means the on-chain side hasn't
+        # finalized — worth investigating.
+        _trade_status = _safe_str(p.get("trade_status")).lower()
+        _is_paper_row = bool(p.get("is_paper", 0))
+        if _is_paper_row:
+            _lifecycle = "—"  # paper trades have no on-chain lifecycle
+        elif not _trade_status:
+            _lifecycle = ""   # legacy or pre-Phase-9
+        else:
+            _lifecycle = _trade_status.upper()
+
+        # Filled / Committed / Target — surfaces partial-fill state +
+        # in-flight resting orders so the operator can see at a glance
+        # when a position has unfilled orders pulling more capital.
+        # Falls back to the legacy size_usdc when ledger data isn't
+        # available (e.g., pre-Phase-B rows that didn't get backfilled).
+        _legacy_size = float(p.get("size_usdc") or 0)
+        _f = _filled_lg if _filled_lg is not None else _legacy_size
+        _c = _committed if _committed is not None else _legacy_size
         rows.append({
             "Strategy":          p.get("strategy") or "top_bin_value",
             "City":              p.get("city", ""),
@@ -1165,9 +1311,12 @@ def _build_open_rows(df):
             "Local Time":        _fmt_local_time(p.get("local_time")),
             "Side":              p.get("side", ""),
             "Range":             _range,
-            "Size ($)":          f"${p.get('size_usdc', 0):.2f}",
+            "Filled":            f"${_f:.2f}",
+            "Committed":         f"${_c:.2f}",
+            "Target":            f"${_target:.2f}" if _target > 0 else "",
             "Shares":            f"{shares:.2f}" if shares else "",
             "Entered":           _fmt_entered(p.get("entry_time")),
+            "Lifecycle":         _lifecycle,
             "Entry Price":       f"{entry:.4f}" if entry else "",
             "Current Price":     f"{curr:.4f}" if curr else "",
             "Peak Price":        f"{float(p.get('peak_price')):.4f}" if not _is_missing(p.get("peak_price")) else "",
@@ -1180,6 +1329,338 @@ def _build_open_rows(df):
     return rows
 
 
+def _color_lifecycle(val):
+    """Color the Lifecycle column: confirmed=green, mined/matched=amber,
+    failed/retrying=red, blank/dash=neutral."""
+    if not isinstance(val, str):
+        return ""
+    v = val.upper().strip()
+    if v == "CONFIRMED":
+        return "color: #2ca02c"
+    if v in ("MATCHED", "MINED"):
+        return "color: #ff9900"
+    if v in ("FAILED", "RETRYING"):
+        return "color: #d62728"
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Live-tab system health strip (Dashboard #3)
+# ---------------------------------------------------------------------------
+
+def _render_live_health_strip() -> None:
+    """Render the live-mode health strip at the top of the Live Trade tab.
+
+    Reads the most recent monitor_health row.  Surfaces:
+      * WS connection state (🟢 connected / 🔴 down / paper)
+      * Wallet balance vs effective bankroll cap
+      * On-chain reconciliation drift counts
+      * Time since last monitor cycle
+
+    No-op (renders nothing) when monitor_health table is empty (fresh
+    install before first monitor cycle).
+    """
+    try:
+        conn = _connect_db()
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM monitor_health ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+    except Exception:
+        return
+    if row is None:
+        st.caption("System health: waiting for first monitor cycle…")
+        return
+
+    h = dict(row)
+
+    # --- WS status ---
+    ws_state = h.get("ws_running")
+    if ws_state is None:
+        ws_label = "📝 PAPER MODE"
+        ws_color = "#888"
+    elif ws_state == 1:
+        ws_label = "🟢 CONNECTED"
+        ws_color = "#2ca02c"
+    else:
+        ws_label = "🔴 DISCONNECTED"
+        ws_color = "#d62728"
+
+    # --- Wallet vs bankroll ---
+    wb = h.get("wallet_balance_usdc")
+    eb = h.get("effective_bankroll_usdc")
+    if wb is not None and eb is not None:
+        wallet_value = f"${wb:,.2f}"
+        # Bankroll-bound (wallet capped) vs config-bound — eb is the
+        # smaller, so equality means wallet has plenty.
+        bound_marker = "⚠️ wallet-capped" if (wb - eb) < 5.0 else ""
+        bankroll_value = f"${eb:,.2f} {bound_marker}".strip()
+    else:
+        wallet_value = "—"
+        bankroll_value = "—"
+
+    # --- Drift ---
+    drift_total = (
+        int(h.get("drift_orphan_db") or 0)
+        + int(h.get("drift_share_drift") or 0)
+        + int(h.get("drift_orphan_chain") or 0)
+    )
+    drift_value = f"{drift_total}" if drift_total > 0 else "0"
+    drift_help = (
+        f"orphan_db={h.get('drift_orphan_db') or 0} | "
+        f"share_drift={h.get('drift_share_drift') or 0} | "
+        f"orphan_chain={h.get('drift_orphan_chain') or 0}"
+    )
+
+    # --- Last monitor cycle ---
+    last_at = h.get("recorded_at") or ""
+    try:
+        # Parse ISO; compute minutes ago.  Fall back to raw string.
+        dt = datetime.fromisoformat(last_at.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        mins_ago = (datetime.now(timezone.utc) - dt).total_seconds() / 60.0
+        if mins_ago < 60:
+            cycle_value = f"{mins_ago:.0f} min ago"
+        else:
+            cycle_value = f"{mins_ago/60:.1f} hr ago"
+        # Monitor runs every 30 min; if last cycle > 90 min ago, flag
+        cycle_stale = mins_ago > 90
+    except Exception:
+        cycle_value = last_at[:16] or "—"
+        cycle_stale = False
+
+    # --- Render the strip ---
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.markdown(
+            f"<div style='font-size:0.85em;color:#888'>WebSocket</div>"
+            f"<div style='font-weight:600;color:{ws_color}'>{ws_label}</div>",
+            unsafe_allow_html=True,
+        )
+    with c2:
+        st.markdown(
+            f"<div style='font-size:0.85em;color:#888'>Wallet / Bankroll</div>"
+            f"<div style='font-weight:600'>{wallet_value} → {bankroll_value}</div>",
+            unsafe_allow_html=True,
+        )
+    with c3:
+        drift_color = "#d62728" if drift_total > 0 else "#888"
+        st.markdown(
+            f"<div style='font-size:0.85em;color:#888'>On-chain Drift</div>"
+            f"<div style='font-weight:600;color:{drift_color}' title='{drift_help}'>"
+            f"{drift_value}</div>",
+            unsafe_allow_html=True,
+        )
+    with c4:
+        cycle_color = "#d62728" if cycle_stale else "#888"
+        st.markdown(
+            f"<div style='font-size:0.85em;color:#888'>Last Monitor Cycle</div>"
+            f"<div style='font-weight:600;color:{cycle_color}'>{cycle_value}</div>",
+            unsafe_allow_html=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# In-flight orders section (Dashboard #2)
+# ---------------------------------------------------------------------------
+
+def _render_in_flight_orders(positions_df) -> None:
+    """Surface orders that are currently in flight — pending buys,
+    exiting positions, in-flight top-ups.  These are invisible in the
+    Open / Closed tables today, which means a stuck order is invisible
+    until it eventually resolves.
+
+    Renders three small tables.  If all three are empty, the section
+    collapses to a single one-line caption.
+    """
+    if positions_df is None or positions_df.empty:
+        st.caption("In-flight orders: none")
+        return
+
+    df = positions_df.copy()
+
+    # --- Pending BUYS (limit orders awaiting fill) ---
+    pending_buys = df[
+        (df.get("fill_status") == "pending")
+        & (df.get("status") == "open")
+    ] if "fill_status" in df.columns else pd.DataFrame()
+
+    # --- Exiting positions (sell ladder in progress) ---
+    exiting = df[df.get("status") == "exiting"] if "status" in df.columns else pd.DataFrame()
+
+    # --- In-flight top-ups (parent position has pending_topup_order_id) ---
+    if "pending_topup_order_id" in df.columns:
+        topups = df[df["pending_topup_order_id"].notna()
+                    & (df["pending_topup_order_id"] != "")]
+    else:
+        topups = pd.DataFrame()
+
+    if pending_buys.empty and exiting.empty and topups.empty:
+        st.caption("In-flight orders: none")
+        return
+
+    if not pending_buys.empty:
+        st.markdown("**Pending Buys** — limit orders placed but not yet matched")
+        rows = []
+        for _, p in pending_buys.iterrows():
+            ts = _safe_str(p.get("trade_status")).upper() or "—"
+            rows.append({
+                "City":         p.get("city", ""),
+                "Date":         _fmt_date_mmddyyyy(p.get("date")),
+                "Side":         p.get("side", ""),
+                "Limit Price":  f"{float(p.get('entry_price') or 0):.4f}",
+                "Size ($)":     f"${p.get('size_usdc', 0):.2f}",
+                "Lifecycle":    ts,
+                "Order ID":     _safe_str(p.get("order_id"))[:12],
+                "Placed":       _fmt_entered(p.get("entry_time")),
+            })
+        st.dataframe(
+            pd.DataFrame(rows).style.map(_color_lifecycle, subset=["Lifecycle"]),
+            width="stretch", hide_index=True,
+        )
+
+    if not exiting.empty:
+        st.markdown("**Exiting Positions** — sell ladder in progress")
+        rows = []
+        for _, p in exiting.iterrows():
+            ts = _safe_str(p.get("exit_trade_status")).upper() or "—"
+            retry = int(p.get("exit_retry_count") or 0)
+            rows.append({
+                "City":            p.get("city", ""),
+                "Date":            _fmt_date_mmddyyyy(p.get("date")),
+                "Side":            p.get("side", ""),
+                "Entry":           f"{float(p.get('entry_price') or 0):.4f}",
+                "Intended Exit":   f"{float(p.get('exit_intended_price') or 0):.4f}",
+                "Reason":          _safe_str(p.get("exit_reason")),
+                "Rung":             retry,
+                "Lifecycle":       ts,
+                "Order ID":        _safe_str(p.get("exit_order_id"))[:12],
+            })
+        st.dataframe(
+            pd.DataFrame(rows).style.map(_color_lifecycle, subset=["Lifecycle"]),
+            width="stretch", hide_index=True,
+        )
+
+    if not topups.empty:
+        st.markdown("**In-Flight Top-ups** — adds to existing positions awaiting fill")
+        rows = []
+        for _, p in topups.iterrows():
+            rows.append({
+                "City":            p.get("city", ""),
+                "Date":            _fmt_date_mmddyyyy(p.get("date")),
+                "Side":            p.get("side", ""),
+                "Add ($)":         f"${float(p.get('pending_topup_amount_usdc') or 0):.2f}",
+                "Limit Price":     f"{float(p.get('pending_topup_intended_price') or 0):.4f}",
+                "Parent Size":     f"${p.get('size_usdc', 0):.2f}",
+                "Order ID":        _safe_str(p.get("pending_topup_order_id"))[:12],
+            })
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+
+@st.cache_data(ttl=_CACHE_TTL_SHORT)
+def _load_order_ledger_rows(pos_ids_tuple: tuple) -> list[dict]:
+    """Cached fetch of position_orders rows for a fixed set of positions.
+    The tuple arg is hashable so Streamlit can key on it; same set of
+    open positions across renders means a free read."""
+    if not pos_ids_tuple:
+        return []
+    try:
+        conn = _connect_db()
+        conn.row_factory = sqlite3.Row
+        ph = ",".join(["?"] * len(pos_ids_tuple))
+        rows = [dict(r) for r in conn.execute(f"""
+            SELECT po.position_id, po.role, po.intended_usdc, po.filled_usdc,
+                   po.intended_shares, po.filled_shares, po.limit_price,
+                   po.fill_price, po.status, po.trade_status, po.fee_usdc,
+                   po.created_at, po.cancelled_reason, po.order_id,
+                   p.city, p.date
+            FROM position_orders po
+            JOIN positions p ON po.position_id = p.id
+            WHERE po.position_id IN ({ph})
+            ORDER BY po.position_id DESC, po.id ASC
+        """, list(pos_ids_tuple)).fetchall()]
+        conn.close()
+        return rows
+    except Exception:
+        return []
+
+
+def _render_order_ledger(positions_df) -> None:
+    """Render the per-position order ledger (Phase B, 2026-04-30).
+
+    Shows EVERY individual CLOB order placed for every open live
+    position — entry buys, top-ups, and exits.  Each row includes
+    intended size + filled size + status, so the operator can see at
+    a glance which orders are partial / resting / fully filled.
+
+    This is the truth-of-state view: the legacy `positions.size_usdc`
+    aggregates can be misleading on partial fills (the user-reported
+    bug from 2026-04-30 where Busan/Jeddah/Lagos showed $10 size but
+    really had $19+ committed across an entry + a top-up).
+    """
+    if positions_df is None or positions_df.empty:
+        return
+    try:
+        pids = tuple(sorted(int(pid) for pid in positions_df["id"].dropna().tolist()))
+    except Exception:
+        pids = ()
+    if not pids:
+        return
+
+    rows_raw = _load_order_ledger_rows(pids)
+
+    if not rows_raw:
+        return
+
+    feed_rows = []
+    for r in rows_raw:
+        intended = float(r.get("intended_usdc") or 0)
+        filled   = float(r.get("filled_usdc") or 0)
+        resting  = max(0.0, intended - filled) if r.get("status") in (
+            "pending", "live", "matched", "partial"
+        ) else 0.0
+        feed_rows.append({
+            "Pos":      r["position_id"],
+            "Market":   f"{r.get('city', '')[:12]} {r.get('date', '')}",
+            "Role":     r.get("role", "").upper(),
+            "Intended": f"${intended:.2f}",
+            "Filled":   f"${filled:.2f}",
+            "Resting":  f"${resting:.2f}" if resting > 0 else "",
+            "Status":   r.get("status", "").upper(),
+            "Lifecycle": _safe_str(r.get("trade_status")).upper() or "—",
+            "Limit":    f"{float(r.get('limit_price') or 0):.4f}",
+            "Fill":     f"{float(r.get('fill_price') or 0):.4f}" if r.get("fill_price") else "",
+            "Fee":      f"${float(r.get('fee_usdc') or 0):.4f}" if r.get("fee_usdc") else "",
+            "Order ID": _safe_str(r.get("order_id"))[:14],
+        })
+
+    def _color_status(val):
+        if not isinstance(val, str):
+            return ""
+        v = val.upper()
+        if v == "FILLED":           return "color: #2ca02c"
+        if v == "PARTIAL":          return "color: #ff9900; font-weight:600"
+        if v in ("CANCELLED", "FAILED"): return "color: #888"
+        if v in ("PENDING", "LIVE", "MATCHED"): return "color: #1f77b4"
+        return ""
+
+    st.subheader("Order Ledger — every CLOB order per open position")
+    st.caption(
+        "Tracks each individual order placed for the open positions.  "
+        "Multiple orders can sum toward one position's target (e.g. an "
+        "entry + a top-up).  'Resting' = unfilled portion still on the "
+        "book.  Status colors: 🟢 filled · 🟠 partial · 🔵 pending/live · ⬜ cancelled/failed."
+    )
+    df = pd.DataFrame(feed_rows)
+    st.dataframe(
+        df.style.map(_color_status, subset=["Status"]),
+        width="stretch", hide_index=True,
+        height=min(80 + len(df) * 32, 500),
+    )
+
+
 def _build_closed_rows(df):
     rows = []
     for _, p in df.iterrows():
@@ -1187,19 +1668,36 @@ def _build_closed_rows(df):
         _range = _range_label(p.get("range_low"), p.get("range_high"), _unit) if (
             not _is_missing(p.get("range_low")) or not _is_missing(p.get("range_high"))
         ) else (p.get("question") or "")[:30]
+        # Show fee total only when something was captured (live trades).
+        # Paper trades + legacy rows have NULL/0 here and we suppress.
+        _entry_fees = float(p.get("entry_fees") or 0)
+        _exit_fees  = float(p.get("exit_fees") or 0)
+        _total_fees = _entry_fees + _exit_fees
+        _gross_pnl  = p.get("pnl")
+        _net_pnl    = p.get("pnl_net")
         rows.append({
-            "Strategy":     p.get("strategy") or "top_bin_value",
-            "City":         p.get("city", ""),
-            "Date":         _fmt_date_mmddyyyy(p.get("date")),
-            "Side":         p.get("side", ""),
-            "Range":        _range,
-            "Size ($)":     f"${p.get('size_usdc', 0):.2f}",
-            "Realized P&L": f"${p.get('pnl', 0):+.4f}" if p.get("pnl") is not None else "",
-            "Entry":        f"{p.get('entry_price', 0):.4f}",
-            "Exit":         f"{p.get('exit_price', 0):.4f}" if p.get("exit_price") is not None else "",
-            "Entered":      _fmt_entered(p.get("entry_time")),
-            "Closed":       _fmt_entered(p.get("exit_time")),
-            "Exit Reason":  p.get("exit_reason") or "",
+            "Strategy":      p.get("strategy") or "top_bin_value",
+            "City":          p.get("city", ""),
+            "Date":          _fmt_date_mmddyyyy(p.get("date")),
+            "Side":          p.get("side", ""),
+            "Range":         _range,
+            "Size ($)":      f"${p.get('size_usdc', 0):.2f}",
+            "Gross P&L":     f"${_gross_pnl:+.4f}" if _gross_pnl is not None else "",
+            # Show fees explicitly for any position that actually traded
+            # (gross_pnl != None), even when fees are $0.0000 — explicit
+            # zero is more honest than blank for closed positions where
+            # we've verified the fees are genuinely zero.  Cancelled-before-
+            # fill positions (gross_pnl is None) still show blank.
+            "Fees":          f"${_total_fees:.4f}" if _gross_pnl is not None else "",
+            "Net P&L":       (
+                f"${_net_pnl:+.4f}" if _net_pnl is not None
+                else (f"${_gross_pnl:+.4f}" if _gross_pnl is not None else "")
+            ),
+            "Entry":         f"{p.get('entry_price', 0):.4f}",
+            "Exit":          f"{p.get('exit_price', 0):.4f}" if p.get("exit_price") is not None else "",
+            "Entered":       _fmt_entered(p.get("entry_time")),
+            "Closed":        _fmt_entered(p.get("exit_time")),
+            "Exit Reason":   p.get("exit_reason") or "",
         })
     return rows
 
@@ -1686,7 +2184,10 @@ with _tab_paper:
         _df = pd.DataFrame(_build_open_rows(_paper_open))
         _df = _df.sort_values(["City", "Date", "Range"], ascending=True, na_position="last")
         st.dataframe(
-            _df.style.map(_highlight_side, subset=["Side"]).map(_color_pnl, subset=["Unrealized P&L"]),
+            _df.style
+                .map(_highlight_side, subset=["Side"])
+                .map(_color_pnl, subset=["Unrealized P&L"])
+                .map(_color_lifecycle, subset=["Lifecycle"]),
             width="stretch", hide_index=True, height=min(80 + len(_df) * 36, 500),
             column_config={"Question": st.column_config.TextColumn("Question", width="large")},
         )
@@ -1701,7 +2202,9 @@ with _tab_paper:
         _df = pd.DataFrame(_build_closed_rows(_paper_closed))
         _df = _df.sort_values(["City", "Date", "Range"], ascending=True, na_position="last")
         st.dataframe(
-            _df.style.map(_highlight_side, subset=["Side"]).map(_color_pnl, subset=["Realized P&L"]),
+            _df.style
+                .map(_highlight_side, subset=["Side"])
+                .map(_color_pnl, subset=["Gross P&L", "Net P&L"]),
             width="stretch", hide_index=True, height=min(80 + len(_df) * 36, 400),
             column_config={"Question": st.column_config.TextColumn("Question", width="large")},
         )
@@ -1739,6 +2242,11 @@ with _tab_paper:
 with _tab_live:
 
     _show_refresh_messages()
+
+    # System health strip — WS state, wallet/bankroll, drift, last cycle.
+    # Reads from the monitor_health table populated each monitor cycle.
+    _render_live_health_strip()
+    st.divider()
 
     # Strategy filter (applied to ALL content in this tab)
     _live_all_raw = (
@@ -1797,13 +2305,21 @@ with _tab_live:
     _render_pnl_by_date(_live_all)
     st.divider()
 
+    # ── In-flight Orders (pending buys, exiting, top-ups) ────────────────────
+    st.subheader("In-Flight Orders")
+    _render_in_flight_orders(_live_all)
+    st.divider()
+
     # ── Open Positions ────────────────────────────────────────────────────────
     st.subheader("Open Positions")
     if not _live_open.empty:
         _df = pd.DataFrame(_build_open_rows(_live_open))
         _df = _df.sort_values(["City", "Date", "Range"], ascending=True, na_position="last")
         st.dataframe(
-            _df.style.map(_highlight_side, subset=["Side"]).map(_color_pnl, subset=["Unrealized P&L"]),
+            _df.style
+                .map(_highlight_side, subset=["Side"])
+                .map(_color_pnl, subset=["Unrealized P&L"])
+                .map(_color_lifecycle, subset=["Lifecycle"]),
             width="stretch", hide_index=True, height=min(80 + len(_df) * 36, 500),
             column_config={"Question": st.column_config.TextColumn("Question", width="large")},
         )
@@ -1813,13 +2329,20 @@ with _tab_live:
 
     st.divider()
 
+    # ── Order Ledger (Phase B) — every CLOB order per open position ──────────
+    _render_order_ledger(_live_open)
+
+    st.divider()
+
     # ── Closed Positions ──────────────────────────────────────────────────────
     st.subheader("Closed Positions")
     if not _live_closed.empty:
         _df = pd.DataFrame(_build_closed_rows(_live_closed))
         _df = _df.sort_values(["City", "Date", "Range"], ascending=True, na_position="last")
         st.dataframe(
-            _df.style.map(_highlight_side, subset=["Side"]).map(_color_pnl, subset=["Realized P&L"]),
+            _df.style
+                .map(_highlight_side, subset=["Side"])
+                .map(_color_pnl, subset=["Gross P&L", "Net P&L"]),
             width="stretch", hide_index=True, height=min(80 + len(_df) * 36, 400),
             column_config={"Question": st.column_config.TextColumn("Question", width="large")},
         )
@@ -1851,7 +2374,176 @@ with _tab_live:
             _do_refresh("refresh_live")
 
 # ===========================================================================
-# TAB 4 — Forecast Accuracy
+# TAB 4 — Activity
+# ===========================================================================
+with _tab_activity:
+
+    _show_refresh_messages()
+
+    st.markdown(
+        "Critical bot actions in chronological order — buys, sells, fills, "
+        "cancellations, on-chain failures, drift, WebSocket events, system "
+        "lifecycle.  Same content as `bot/logs/activity.log` (see droplet "
+        "for raw file)."
+    )
+
+    # ---- Filters ----
+    _act_categories_available = []
+    try:
+        _act_conn = _connect_db()
+        _act_categories_available = [
+            r[0] for r in _act_conn.execute(
+                "SELECT DISTINCT category FROM activity_log ORDER BY category"
+            ).fetchall()
+        ]
+        _act_conn.close()
+    except Exception:
+        pass
+
+    _act_f1, _act_f2, _act_f3, _act_f4 = st.columns([2, 2, 1, 1])
+    with _act_f1:
+        _sel_categories = st.multiselect(
+            "Category", _act_categories_available,
+            default=_act_categories_available,
+            key="activity_filter_category",
+        )
+    with _act_f2:
+        _sel_levels = st.multiselect(
+            "Level", ["INFO", "WARN", "ERROR"],
+            default=["INFO", "WARN", "ERROR"],
+            key="activity_filter_level",
+        )
+    with _act_f3:
+        _act_window = st.selectbox(
+            "Window",
+            ["Last 1h", "Last 6h", "Last 24h", "Last 7d", "All"],
+            index=2,
+            key="activity_filter_window",
+        )
+    with _act_f4:
+        _act_limit = st.selectbox(
+            "Max rows", [50, 100, 200, 500, 1000],
+            index=2,
+            key="activity_filter_limit",
+        )
+
+    # ---- Window → since_iso ----
+    _window_hours = {
+        "Last 1h": 1, "Last 6h": 6, "Last 24h": 24,
+        "Last 7d": 24 * 7, "All": None,
+    }[_act_window]
+    if _window_hours is None:
+        _since_iso = None
+    else:
+        _since_iso = (
+            datetime.now(timezone.utc).timestamp() - _window_hours * 3600
+        )
+        _since_iso = datetime.fromtimestamp(_since_iso, tz=timezone.utc).isoformat()
+
+    # ---- Query ----
+    _act_rows: list[dict] = []
+    try:
+        _where_parts = []
+        _args: list = []
+        if _sel_categories:
+            _ph = ",".join(["?"] * len(_sel_categories))
+            _where_parts.append(f"category IN ({_ph})")
+            _args.extend(_sel_categories)
+        if _sel_levels:
+            _ph = ",".join(["?"] * len(_sel_levels))
+            _where_parts.append(f"level IN ({_ph})")
+            _args.extend(_sel_levels)
+        if _since_iso:
+            _where_parts.append("timestamp >= ?")
+            _args.append(_since_iso)
+        _where_sql = ("WHERE " + " AND ".join(_where_parts)) if _where_parts else ""
+        _act_conn = _connect_db()
+        _act_conn.row_factory = sqlite3.Row
+        _act_rows = [dict(r) for r in _act_conn.execute(
+            f"SELECT * FROM activity_log {_where_sql} "
+            f"ORDER BY id DESC LIMIT ?",
+            tuple(_args) + (int(_act_limit),),
+        ).fetchall()]
+        _act_conn.close()
+    except Exception as _e:
+        st.warning(f"Could not load activity log: {_e}")
+
+    # ---- Per-category counters ----
+    _act_counts: dict[str, int] = {}
+    for _r in _act_rows:
+        _c = _r.get("category", "?")
+        _act_counts[_c] = _act_counts.get(_c, 0) + 1
+    _err_count = sum(1 for r in _act_rows if r.get("level") == "ERROR")
+    _warn_count = sum(1 for r in _act_rows if r.get("level") == "WARN")
+
+    _hm1, _hm2, _hm3, _hm4 = st.columns(4)
+    _hm1.metric("Total events", len(_act_rows))
+    _hm2.metric("Errors", _err_count)
+    _hm3.metric("Warnings", _warn_count)
+    _hm4.metric("Unique categories", len(_act_counts))
+
+    if _act_counts:
+        _cat_chips = " · ".join(f"**{c}** ({n})" for c, n in sorted(_act_counts.items()))
+        st.caption(_cat_chips)
+
+    st.divider()
+
+    # ---- Activity feed table ----
+    if not _act_rows:
+        st.info("No activity matches the current filters.")
+    else:
+        def _fmt_ts(ts: str) -> str:
+            try:
+                _dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if _dt.tzinfo is None:
+                    _dt = _dt.replace(tzinfo=timezone.utc)
+                return _dt.astimezone(ZoneInfo("America/Chicago")).strftime(
+                    "%m-%d %H:%M:%S"
+                )
+            except Exception:
+                return ts[:19]
+
+        _feed_rows = []
+        for _r in _act_rows:
+            _feed_rows.append({
+                "When":     _fmt_ts(_r.get("timestamp") or ""),
+                "Level":    _r.get("level", ""),
+                "Category": _r.get("category", ""),
+                # Cast to string consistently — pyarrow infers int64 from
+                # the populated rows and chokes on empty strings for events
+                # without a position_id (SYSTEM startup, WS connect, etc.).
+                # Stringification keeps the column homogeneous.
+                "Pos":      str(_r.get("position_id")) if _r.get("position_id") is not None else "",
+                "Message":  _r.get("message", ""),
+            })
+
+        def _color_level(val):
+            if not isinstance(val, str):
+                return ""
+            if val == "ERROR":
+                return "color: #d62728; font-weight:600"
+            if val == "WARN":
+                return "color: #ff9900; font-weight:600"
+            return "color: #888"
+
+        _feed_df = pd.DataFrame(_feed_rows)
+        st.dataframe(
+            _feed_df.style.map(_color_level, subset=["Level"]),
+            width="stretch", hide_index=True,
+            height=min(80 + len(_feed_df) * 32, 700),
+            column_config={
+                "Message": st.column_config.TextColumn("Message", width="large"),
+            },
+        )
+
+    st.divider()
+    _ac1, _ac2, _ac3 = st.columns([2, 1, 2])
+    with _ac2:
+        if st.button("Refresh Activity", key="refresh_activity", type="primary"):
+            _do_refresh("refresh_activity")
+
+# ===========================================================================
+# TAB 5 — Forecast Accuracy
 # ===========================================================================
 with _tab_accuracy:
 
@@ -1864,9 +2556,9 @@ with _tab_accuracy:
         "and tail risk.  Higher = more accurate and tradeable.  Rebuilt daily."
     )
 
-    @st.cache_data(ttl=300)
+    @st.cache_data(ttl=_CACHE_TTL_SHORT)
     def _load_city_accuracy():
-        conn = sqlite3.connect(DB_PATH)
+        conn = _connect_db()
         return pd.read_sql(
             "SELECT * FROM city_forecast_accuracy ORDER BY accuracy_score DESC",
             conn,
@@ -1875,9 +2567,9 @@ with _tab_accuracy:
     _acc_df = _load_city_accuracy()
     if not _acc_df.empty:
         # Get list of cities with active Polymarket contracts
-        @st.cache_data(ttl=300)
+        @st.cache_data(ttl=_CACHE_TTL_SHORT)
         def _get_active_market_cities():
-            conn = sqlite3.connect(DB_PATH)
+            conn = _connect_db()
             rows = conn.execute(
                 "SELECT DISTINCT city FROM forecast_runs "
                 "WHERE date >= DATE('now') AND city IS NOT NULL"
@@ -1945,10 +2637,10 @@ with _tab_accuracy:
         "Only shows dates where both a forecast and an observation exist."
     )
 
-    @st.cache_data(ttl=300)
+    @st.cache_data(ttl=_CACHE_TTL_SHORT)
     def _load_accuracy_data():
         """Load forecast predictions paired with actual observations."""
-        conn = sqlite3.connect(DB_PATH)
+        conn = _connect_db()
         # Use historical_forecasts_previous_runs (model predictions at lead=3)
         # paired with historical_observed_daily (actual tmax).
         # Also include temp_events forecast_mu for recent dates.
@@ -1995,14 +2687,14 @@ with _tab_accuracy:
         df["error_c"] = df["actual_c"] - df["blended_c"]
         return df
 
-    @st.cache_data(ttl=300)
+    @st.cache_data(ttl=_CACHE_TTL_SHORT)
     def _load_future_forecast_data():
         """Load forecast data for future dates (no actual temp yet).
 
         Uses temp_events.forecast_mu_c for the bias-corrected blended average,
         and forecast_runs for the raw per-model values (ECMWF/GFS before bias).
         """
-        conn = sqlite3.connect(DB_PATH)
+        conn = _connect_db()
         df = pd.read_sql("""
             SELECT
                 te.city,
@@ -2052,9 +2744,9 @@ with _tab_accuracy:
         return df
 
     # Build city list from both data sources for the shared selector
-    @st.cache_data(ttl=300)
+    @st.cache_data(ttl=_CACHE_TTL_SHORT)
     def _get_all_accuracy_cities():
-        conn = sqlite3.connect(DB_PATH)
+        conn = _connect_db()
         c1 = pd.read_sql("SELECT DISTINCT city FROM historical_observed_daily WHERE tempmax_c IS NOT NULL", conn)
         c2 = pd.read_sql("SELECT DISTINCT city FROM forecast_runs", conn)
         all_c = pd.concat([c1, c2])["city"].str.title().dropna().unique().tolist()
@@ -2171,9 +2863,9 @@ with _tab_accuracy:
 
         # ---- Contract Prices + Open Positions per date ----
         if not _fut.empty:
-            @st.cache_data(ttl=60)
+            @st.cache_data(ttl=_CACHE_TTL_SHORT)
             def _load_contracts_for_city(city_name):
-                conn = sqlite3.connect(DB_PATH)
+                conn = _connect_db()
                 conn.row_factory = sqlite3.Row
                 # Latest outcomes per event for this city (using most recent
                 # scan per date, not a single global scan timestamp)

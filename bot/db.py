@@ -1,25 +1,61 @@
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 # Single source of truth — always resolves to bot/data/signals.db (absolute).
 from config import DB_PATH
 
 
+def _set_pragmas(conn: sqlite3.Connection) -> None:
+    """Apply concurrency/durability pragmas to a fresh connection.
+
+    journal_mode=WAL — sticks per database file once set; allows
+    concurrent readers + one writer instead of the default rollback
+    journal where readers block writers and vice versa.  Critical for
+    a multi-process setup (bot writer + dashboard reader + scheduler
+    threads all touching the same DB).
+
+    busy_timeout=30000 — if the DB is locked at write time, wait up to
+    30 seconds instead of immediately erroring.  WAL mode makes locked
+    states rare (only on schema changes / VACUUM), but the timeout is
+    cheap insurance.
+
+    synchronous=NORMAL — safe under WAL (atomic at COMMIT boundary),
+    measurably faster than FULL.  The default FULL is overkill for
+    our durability needs (we're not running a bank).
+    """
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        # Pragmas should never fail, but if they do, fall through with
+        # whatever defaults sqlite picked — better than hard-failing
+        # every connection.
+        pass
+
+
 @contextmanager
 def _get_conn():
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
+    _set_pragmas(conn)
     try:
         yield conn
         conn.commit()
     except Exception:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         raise
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def init_db():
@@ -227,6 +263,39 @@ def init_db():
             "ALTER TABLE temp_outcomes ADD COLUMN ml_bin_prob REAL",
             "ALTER TABLE temp_outcomes ADD COLUMN ml_decision_hour INTEGER",
             "ALTER TABLE temp_outcomes ADD COLUMN ml_model_version TEXT",
+            # --- Live exit ladder (Live Phase 3): tracks the in-flight sell
+            # order for a position whose exit has been triggered but not
+            # yet filled.  See bot/exit_ladder.py + bot/execution.execute_exit. ---
+            "ALTER TABLE positions ADD COLUMN exit_order_id TEXT",
+            "ALTER TABLE positions ADD COLUMN exit_intended_price REAL",
+            "ALTER TABLE positions ADD COLUMN actual_exit_price REAL",
+            "ALTER TABLE positions ADD COLUMN exit_retry_count INTEGER DEFAULT 0",
+            # --- Live top-up (Live Phase 6): tracks an in-flight CLOB buy
+            # that's adding to an existing position.  Filled by monitor's
+            # reconciliation; merged into the parent via update_position_topup. ---
+            "ALTER TABLE positions ADD COLUMN pending_topup_order_id TEXT",
+            "ALTER TABLE positions ADD COLUMN pending_topup_amount_usdc REAL",
+            "ALTER TABLE positions ADD COLUMN pending_topup_intended_price REAL",
+            # --- Fee accounting (Live Phase 7): captured from CLOB fill
+            # responses.  entry_fees ACCUMULATES across initial buy + every
+            # top-up.  pnl_net = pnl - entry_fees - exit_fees, computed when
+            # the exit fill is reconciled. ---
+            "ALTER TABLE positions ADD COLUMN entry_fees REAL DEFAULT 0",
+            "ALTER TABLE positions ADD COLUMN exit_fees REAL DEFAULT 0",
+            "ALTER TABLE positions ADD COLUMN pnl_net REAL",
+            # --- User-channel WS lifecycle tracking (Live Phase 9):
+            # Polymarket trades progress MATCHED → MINED → CONFIRMED.
+            # We only mark fill_status='filled' on CONFIRMED, since MATCHED
+            # can still revert during the mining phase.  These columns track
+            # the last-seen lifecycle stage per side. ---
+            "ALTER TABLE positions ADD COLUMN trade_status TEXT",
+            "ALTER TABLE positions ADD COLUMN exit_trade_status TEXT",
+            "ALTER TABLE positions ADD COLUMN last_trade_event_id TEXT",
+            "ALTER TABLE positions ADD COLUMN last_exit_trade_event_id TEXT",
+            # Cumulative USDC realised across all exit-fill chunks.  Used by
+            # add_position_exit_fill to compute weighted-average exit price
+            # and final pnl when a multi-chunk exit completes.  Default 0.
+            "ALTER TABLE positions ADD COLUMN exit_proceeds_usdc REAL DEFAULT 0",
         ]:
             try:
                 conn.execute(col_def)
@@ -660,6 +729,106 @@ def init_db():
                 resolved_at       TEXT,
                 recorded_at       TEXT    NOT NULL
             );
+
+            -- Activity log: every critical bot action (orders, fills,
+            -- cancellations, risk events, WS connect/disconnect).  Same
+            -- content as logs/activity.log but indexed for fast dashboard
+            -- queries — the operator can scroll the recent feed without
+            -- shelling into the droplet to tail the log file.
+            -- Per-position order ledger (added 2026-04-30, Phase B).
+            -- Tracks EVERY individual CLOB order placed for a position
+            -- (initial entry, top-ups, exits) — so we can compute
+            --    committed_usdc = sum(intended_usdc) for non-cancelled orders
+            -- which is what the top-up gap calc needs to avoid double-
+            -- committing capital.  The `positions` table aggregates
+            -- (size_usdc, shares, entry_price) are derived from this
+            -- ledger by summing across role IN ('entry','topup').
+            CREATE TABLE IF NOT EXISTS position_orders (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                position_id     INTEGER NOT NULL,
+                order_id        TEXT    NOT NULL UNIQUE,    -- CLOB order hash
+                role            TEXT    NOT NULL,           -- 'entry' | 'topup' | 'exit'
+                intended_usdc   REAL    NOT NULL,           -- size we asked for
+                intended_shares REAL    NOT NULL,
+                limit_price     REAL    NOT NULL,
+                -- Order lifecycle.  status is OUR view; trade_status is
+                -- the on-chain WS lifecycle when we have it.
+                status          TEXT    NOT NULL,           -- 'pending'|'live'|'partial'|'filled'|'cancelled'|'failed'
+                trade_status    TEXT,                       -- 'matched'|'mined'|'confirmed'|'failed'
+                filled_shares   REAL    DEFAULT 0,
+                filled_usdc     REAL    DEFAULT 0,
+                fill_price      REAL,                       -- weighted avg
+                fee_usdc        REAL    DEFAULT 0,
+                created_at      TEXT    NOT NULL,
+                updated_at      TEXT    NOT NULL,
+                closed_at       TEXT,
+                cancelled_reason TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_pos_orders_pid
+                ON position_orders(position_id);
+            CREATE INDEX IF NOT EXISTS idx_pos_orders_status
+                ON position_orders(status);
+            CREATE INDEX IF NOT EXISTS idx_pos_orders_orderid
+                ON position_orders(order_id);
+
+            -- Activity log: every critical bot action (orders, fills,
+            -- cancellations, risk events, WS connect/disconnect).  Same
+            -- content as logs/activity.log but indexed for fast dashboard
+            -- queries — the operator can scroll the recent feed without
+            -- shelling into the droplet to tail the log file.
+            CREATE TABLE IF NOT EXISTS activity_log (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp   TEXT    NOT NULL,
+                level       TEXT    NOT NULL,    -- INFO | WARN | ERROR
+                category    TEXT    NOT NULL,    -- BUY | SELL | FILL | etc
+                message     TEXT    NOT NULL,
+                position_id INTEGER,             -- nullable — not every event has one
+                metadata    TEXT                 -- JSON blob, optional
+            );
+            CREATE INDEX IF NOT EXISTS idx_activity_log_ts
+                ON activity_log(timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_activity_log_cat
+                ON activity_log(category, timestamp DESC);
+
+            -- Per-monitor-cycle health snapshot.  Read by the dashboard
+            -- to surface bot health (WS connectivity, wallet balance vs
+            -- bankroll cap, on-chain reconciliation drift) without
+            -- requiring the dashboard to tail logs or import bot modules.
+            -- One row written at the end of each monitor cycle.
+            CREATE TABLE IF NOT EXISTS monitor_health (
+                id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+                recorded_at              TEXT    NOT NULL,
+                ws_running               INTEGER,        -- 0/1; NULL in paper mode
+                wallet_balance_usdc      REAL,
+                effective_bankroll_usdc  REAL,
+                drift_orphan_db          INTEGER DEFAULT 0,
+                drift_share_drift        INTEGER DEFAULT 0,
+                drift_orphan_chain       INTEGER DEFAULT 0,
+                buys_filled              INTEGER DEFAULT 0,
+                sells_filled             INTEGER DEFAULT 0,
+                topups_filled            INTEGER DEFAULT 0,
+                positions_open           INTEGER DEFAULT 0,
+                positions_pending        INTEGER DEFAULT 0,
+                positions_exiting        INTEGER DEFAULT 0,
+                summary_text             TEXT
+            );
+
+            -- Per-trade-event dedup table.  Polymarket emits ONE trade
+            -- event per match, and a single limit order frequently matches
+            -- against multiple resting asks (yielding multiple events for
+            -- the same order_id, each with a unique event_id).  We dedup
+            -- on event_id so each unique fill applies exactly once, even
+            -- across the WS+REST safety-net dual paths and Polymarket's
+            -- at-least-once redelivery (matched -> mined -> confirmed
+            -- redeliveries of the SAME trade carry the same event_id and
+            -- are caught here).
+            --
+            -- Replaces the broken per-position trade_status gate that
+            -- previously dropped chunks 2..N of any chunked fill.
+            CREATE TABLE IF NOT EXISTS processed_trade_events (
+                event_id     TEXT    PRIMARY KEY,
+                processed_at TEXT    NOT NULL
+            );
         """)
 
         # --- Phase 2 indexes on existing table (date-windowed scans) ---
@@ -847,7 +1016,21 @@ def insert_position(
 
 
 def get_open_positions() -> list[dict]:
-    sql = "SELECT * FROM positions WHERE status = 'open' ORDER BY entry_time ASC"
+    """Return positions that are economically still open — meaning capital
+    is still committed and on-chain.  Includes:
+      * status='open'    — fully active positions
+      * status='exiting' — sell order placed but not yet filled (still
+                            on-chain, still consumes exposure budget)
+
+    Callers that ONLY want fully-active positions (e.g. to avoid
+    re-firing exit logic on positions already exiting) should filter
+    further by `status == 'open'` themselves.
+    """
+    sql = (
+        "SELECT * FROM positions "
+        "WHERE status IN ('open', 'exiting') "
+        "ORDER BY entry_time ASC"
+    )
     with _get_conn() as conn:
         return [dict(r) for r in conn.execute(sql).fetchall()]
 
@@ -861,6 +1044,43 @@ def get_pending_positions() -> list[dict]:
     """
     with _get_conn() as conn:
         return [dict(r) for r in conn.execute(sql).fetchall()]
+
+
+def get_recent_cancelled_count(contract_id: str, within_hours: int = 6) -> int:
+    """Count BUY orders cancelled for this contract in the last N hours.
+
+    Used by the trading loop to cap buy retries on contracts that never
+    fill — without the cap, a contract whose limit is fundamentally too
+    low (book bids never reach our ask) would generate infinite cancel/
+    re-issue cycles every scan.
+
+    Counts:
+      * status='closed' AND fill_status='cancelled'  (the cancel pass)
+    Excludes:
+      * filled orders (entered the book and either matched or are
+        being held)
+      * positions cancelled for other reasons (e.g., manual closure)
+
+    NOTE: this counts the per-CONTRACT side (e.g., "Chicago 60-65F YES").
+    A different bin in the same event is a different contract, so this
+    doesn't accidentally cap a wholly different bet.
+    """
+    # SQLite stores entry_time as TEXT in ISO-8601 (sometimes with 'T'
+    # separator + microseconds + tz offset, sometimes without).  Wrap in
+    # datetime() on both sides so comparison is done on parsed timestamps,
+    # not on raw strings (which would mis-order 'T' vs space-separated).
+    sql = """
+        SELECT COUNT(*) FROM positions
+        WHERE contract_id = ?
+          AND status = 'closed'
+          AND fill_status = 'cancelled'
+          AND datetime(entry_time) >= datetime('now', ?)
+    """
+    with _get_conn() as conn:
+        row = conn.execute(
+            sql, (contract_id, f"-{int(within_hours)} hours")
+        ).fetchone()
+        return int(row[0]) if row else 0
 
 
 def get_open_positions_for_event(city: str, date: str) -> list[dict]:
@@ -915,6 +1135,770 @@ def update_position_outcome(
                            exit_reason, exit_snapshot_id, position_id))
 
 
+def update_position_exit_pending(
+    position_id: int,
+    exit_order_id: str,
+    exit_intended_price: float,
+    exit_retry_count: int,
+    exit_reason: str | None = None,
+) -> None:
+    """Mark a position as actively exiting via a CLOB sell order.
+
+    Called by execute_exit() in live mode to:
+      * record the live order id so the monitor can poll/cancel it
+      * stamp the intended_exit_price on the FIRST attempt (preserved across
+        retries via COALESCE — the original trigger price doesn't change)
+      * bump the retry counter so the next monitor cycle knows which
+        ladder rung to use
+      * set status='exiting' so the rest of the bot knows the position is
+        in the middle of being closed (don't double-fire exits, don't
+        treat as still-open for sizing decisions).
+    """
+    sql = """
+        UPDATE positions
+        SET exit_order_id = ?,
+            exit_intended_price = COALESCE(exit_intended_price, ?),
+            exit_retry_count = ?,
+            status = 'exiting',
+            exit_reason = COALESCE(?, exit_reason)
+        WHERE id = ?
+    """
+    with _get_conn() as conn:
+        conn.execute(sql, (
+            exit_order_id, exit_intended_price, exit_retry_count,
+            exit_reason, position_id,
+        ))
+
+
+def update_position_exit_filled(
+    position_id: int,
+    actual_exit_price: float,
+    exit_time: str,
+    pnl: float,
+    exit_snapshot_id: int | None = None,
+) -> None:
+    """Confirm an exit order fill: actual_exit_price captures the real
+    fill (vs intended), and the position transitions from 'exiting' to
+    'closed'.  Called by the fill-reconciliation step in monitor.py."""
+    sql = """
+        UPDATE positions
+        SET status = 'closed',
+            actual_exit_price = ?,
+            exit_price = ?,
+            exit_time = ?,
+            pnl = ?,
+            unrealized_pnl = 0,
+            exit_snapshot_id = COALESCE(?, exit_snapshot_id)
+        WHERE id = ?
+    """
+    with _get_conn() as conn:
+        conn.execute(sql, (
+            actual_exit_price, actual_exit_price, exit_time, pnl,
+            exit_snapshot_id, position_id,
+        ))
+
+
+# ---------------------------------------------------------------------------
+# Live Phase 9 — Trade lifecycle tracking (user-channel WS)
+# ---------------------------------------------------------------------------
+
+# Lifecycle stages, monotonic.  Higher rank = closer to terminal.
+# Used by update_position_trade_status to enforce "never downgrade":
+# at-least-once delivery means a CONFIRMED event might be followed by a
+# delayed MATCHED for the same trade — we must ignore the regression.
+_TRADE_STATUS_RANK = {
+    None:        0,
+    "":          0,
+    "matched":   1,
+    "mined":     2,
+    "retrying":  2,   # parallel branch — same priority as mined
+    "confirmed": 3,
+    "failed":    3,
+}
+
+
+def _trade_rank(status: str | None) -> int:
+    return _TRADE_STATUS_RANK.get((status or "").lower(), 0)
+
+
+def update_position_trade_status(
+    position_id: int,
+    new_status: str,
+    *,
+    side: str = "entry",
+    last_event_id: str | None = None,
+) -> bool:
+    """Advance the trade lifecycle stage on a position.  Idempotent and
+    monotonic — a regression (e.g. CONFIRMED → MATCHED from a delayed
+    duplicate) is ignored.  Returns True if the row was updated.
+
+    side='entry' updates trade_status; side='exit' updates exit_trade_status.
+
+    The corresponding last_*_trade_event_id column is updated to the most
+    recent event we acted on, useful for debug + tests.
+    """
+    if side not in ("entry", "exit"):
+        raise ValueError(f"side must be 'entry' or 'exit', got {side!r}")
+    new_status_norm = (new_status or "").lower()
+    new_rank = _trade_rank(new_status_norm)
+    if new_rank == 0:
+        return False
+
+    col_status = "trade_status" if side == "entry" else "exit_trade_status"
+    col_event  = "last_trade_event_id" if side == "entry" else "last_exit_trade_event_id"
+
+    with _get_conn() as conn:
+        row = conn.execute(
+            f"SELECT {col_status} FROM positions WHERE id = ?",
+            (position_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        cur_rank = _trade_rank(row[0])
+        if new_rank <= cur_rank:
+            return False  # never regress; same-rank duplicates are no-ops too
+
+        conn.execute(
+            f"UPDATE positions SET {col_status} = ?, {col_event} = ? WHERE id = ?",
+            (new_status_norm, last_event_id, position_id),
+        )
+        return True
+
+
+def get_position_by_order_id(order_id: str) -> dict | None:
+    """Find the position whose entry order_id, exit_order_id, or
+    pending_topup_order_id matches.  Returns the first match or None.
+
+    Used by the user-channel WS handler to route an order/trade event
+    back to the position it belongs to.  We check all three columns
+    because the same wallet places buys, sells, and top-ups on the
+    same channel.
+    """
+    if not order_id:
+        return None
+    sql = """
+        SELECT * FROM positions
+        WHERE order_id = ?
+           OR exit_order_id = ?
+           OR pending_topup_order_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+    """
+    with _get_conn() as conn:
+        row = conn.execute(sql, (order_id, order_id, order_id)).fetchone()
+        return dict(row) if row else None
+
+
+def classify_position_role(position: dict, order_id: str) -> str:
+    """Return 'entry', 'exit', or 'topup' based on which order_id column
+    matched.  Used by the WS dispatcher to pick the right write path."""
+    if not order_id:
+        return "entry"
+    if position.get("exit_order_id") == order_id:
+        return "exit"
+    if position.get("pending_topup_order_id") == order_id:
+        return "topup"
+    return "entry"
+
+
+# ---------------------------------------------------------------------------
+# Monitor health snapshots (for dashboard health strip)
+# ---------------------------------------------------------------------------
+
+def insert_monitor_health(snapshot: dict) -> None:
+    """Append a row to monitor_health.  Caller passes a dict matching the
+    column names in the table (extras are ignored; missing fields default
+    to NULL/0).  Called once per monitor cycle."""
+    cols = [
+        "recorded_at", "ws_running",
+        "wallet_balance_usdc", "effective_bankroll_usdc",
+        "drift_orphan_db", "drift_share_drift", "drift_orphan_chain",
+        "buys_filled", "sells_filled", "topups_filled",
+        "positions_open", "positions_pending", "positions_exiting",
+        "summary_text",
+    ]
+    placeholders = ",".join(["?"] * len(cols))
+    sql = f"INSERT INTO monitor_health ({','.join(cols)}) VALUES ({placeholders})"
+    values = tuple(snapshot.get(c) for c in cols)
+    with _get_conn() as conn:
+        conn.execute(sql, values)
+
+
+def get_latest_monitor_health() -> dict | None:
+    """Most recent monitor_health snapshot, or None if the table is empty
+    (e.g. fresh install before the first monitor cycle has run)."""
+    sql = "SELECT * FROM monitor_health ORDER BY id DESC LIMIT 1"
+    with _get_conn() as conn:
+        row = conn.execute(sql).fetchone()
+        return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Position-orders ledger (Phase B, 2026-04-30)
+# ---------------------------------------------------------------------------
+
+# Statuses we consider "still committing capital" — i.e., they could yet
+# fill on the book, so they count toward `committed_usdc` for top-up
+# gap calculation.  'partial' means the order matched some shares and
+# the rest is still resting (the screenshot bug — we now correctly
+# count this as committed).
+_ORDER_STATUS_COMMITTING = ("pending", "live", "matched", "partial")
+# Terminal statuses — no further fills possible.
+_ORDER_STATUS_TERMINAL   = ("filled", "cancelled", "failed")
+
+
+def insert_position_order(
+    *,
+    position_id:     int,
+    order_id:        str,
+    role:            str,                # 'entry' | 'topup' | 'exit'
+    intended_usdc:   float,
+    intended_shares: float,
+    limit_price:     float,
+    status:          str = "pending",
+    trade_status:    str | None = None,
+) -> int:
+    """Record a newly-placed CLOB order in the position_orders ledger.
+
+    Called from execute_signal (entry), execute_topup (topup), and
+    execute_exit (exit) immediately after the CLOB POST succeeds.
+    The lifecycle (status, trade_status, filled_*) is updated later
+    by fill_handler events and monitor reconciliation.
+    """
+    if role not in ("entry", "topup", "exit"):
+        raise ValueError(f"role must be 'entry'|'topup'|'exit', got {role!r}")
+    now = datetime.now(timezone.utc).isoformat()
+    sql = """
+        INSERT INTO position_orders
+            (position_id, order_id, role, intended_usdc, intended_shares,
+             limit_price, status, trade_status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    with _get_conn() as conn:
+        cur = conn.execute(sql, (
+            position_id, order_id, role, intended_usdc, intended_shares,
+            limit_price, status, trade_status, now, now,
+        ))
+        return cur.lastrowid
+
+
+def update_position_order_status(
+    order_id: str,
+    *,
+    status:           str | None = None,
+    trade_status:     str | None = None,
+    filled_shares:    float | None = None,
+    filled_usdc:      float | None = None,
+    fill_price:       float | None = None,
+    fee_usdc:         float | None = None,
+    cancelled_reason: str | None = None,
+    closed:           bool = False,
+) -> bool:
+    """Update the lifecycle/fill data for a position_orders row.
+
+    Lookup is by `order_id` (CLOB order hash) since that's the stable
+    identifier surfaced from the CLOB.  Any None field is left unchanged.
+    `closed=True` stamps closed_at to now (call this on terminal status).
+    Returns True if a row was updated.
+    """
+    sets = []
+    args: list = []
+    if status is not None:
+        sets.append("status = ?")
+        args.append(status)
+    if trade_status is not None:
+        sets.append("trade_status = ?")
+        args.append(trade_status)
+    if filled_shares is not None:
+        sets.append("filled_shares = ?")
+        args.append(filled_shares)
+    if filled_usdc is not None:
+        sets.append("filled_usdc = ?")
+        args.append(filled_usdc)
+    if fill_price is not None:
+        sets.append("fill_price = ?")
+        args.append(fill_price)
+    if fee_usdc is not None:
+        sets.append("fee_usdc = ?")
+        args.append(fee_usdc)
+    if cancelled_reason is not None:
+        sets.append("cancelled_reason = ?")
+        args.append(cancelled_reason)
+    now = datetime.now(timezone.utc).isoformat()
+    sets.append("updated_at = ?")
+    args.append(now)
+    if closed:
+        sets.append("closed_at = ?")
+        args.append(now)
+    args.append(order_id)
+    sql = f"UPDATE position_orders SET {', '.join(sets)} WHERE order_id = ?"
+    with _get_conn() as conn:
+        cur = conn.execute(sql, args)
+        return cur.rowcount > 0
+
+
+def get_position_orders(position_id: int, *, role: str | None = None) -> list[dict]:
+    """All orders for a position, oldest first.  Optional role filter
+    ('entry'|'topup'|'exit') for queries like 'sum filled across all
+    entries+topups'."""
+    sql = "SELECT * FROM position_orders WHERE position_id = ?"
+    args: list = [position_id]
+    if role:
+        sql += " AND role = ?"
+        args.append(role)
+    sql += " ORDER BY id ASC"
+    with _get_conn() as conn:
+        return [dict(r) for r in conn.execute(sql, tuple(args)).fetchall()]
+
+
+def get_committed_usdc(position_id: int) -> float:
+    """Sum the dollar exposure that COULD STILL fill — i.e., orders
+    not in a terminal cancelled/failed state.  This is what the top-up
+    gap calc uses: `target - committed_usdc` is the true remaining gap,
+    counting both filled-on-chain AND still-resting-on-book portions.
+
+    Replaces the buggy `target - filled_only` calc that placed top-ups
+    on top of resting orders, double-committing capital (the user-
+    reported screenshot bug from 2026-04-30).
+
+    Edge case: 'filled' status with filled_usdc significantly less than
+    intended_usdc means the order matched a partial fill but the rest
+    is still resting.  The proper status would be 'partial' but legacy
+    fill_handler may have stamped 'filled'.  We defensively count those
+    as still-committing (use intended_usdc) so we don't underestimate.
+    """
+    sql = """
+        SELECT COALESCE(SUM(
+            CASE
+                -- Fully filled (within 1¢ rounding) → count actual cost
+                WHEN status = 'filled' AND filled_usdc >= intended_usdc * 0.99
+                    THEN filled_usdc
+                -- "Filled" but really partial + still resting → count intended
+                WHEN status = 'filled' AND filled_usdc < intended_usdc * 0.99
+                    THEN intended_usdc
+                -- Still actively committing → count intended (rest can fill)
+                WHEN status IN ('pending','live','matched','partial')
+                    THEN intended_usdc
+                -- Cancelled with a partial fill: the filled shares are
+                -- real on-chain capital; the rest was freed by the cancel.
+                -- Count only the filled portion (the partial-cancelled
+                -- semantic — "we kept what we got, gave up the rest").
+                WHEN status = 'cancelled' AND filled_usdc > 0
+                    THEN filled_usdc
+                -- Cancelled with no fill OR failed on chain → no capital
+                ELSE 0
+            END
+        ), 0)
+        FROM position_orders
+        WHERE position_id = ?
+          AND role IN ('entry', 'topup')
+    """
+    with _get_conn() as conn:
+        row = conn.execute(sql, (position_id,)).fetchone()
+        return float(row[0] if row else 0.0)
+
+
+def get_filled_usdc(position_id: int) -> float:
+    """Sum of `filled_usdc` for entry+topup orders.  This is the real
+    on-chain cost so far (excludes resting orders).  Used for accurate
+    P&L math + the dashboard 'Filled' column."""
+    sql = """
+        SELECT COALESCE(SUM(filled_usdc), 0)
+        FROM position_orders
+        WHERE position_id = ? AND role IN ('entry', 'topup')
+    """
+    with _get_conn() as conn:
+        row = conn.execute(sql, (position_id,)).fetchone()
+        return float(row[0] if row else 0.0)
+
+
+def get_overcommitted_positions() -> list[dict]:
+    """Open live positions whose ledger-derived committed_usdc exceeds
+    target_size_usdc.  Used by the auto-cancel sweep to identify which
+    positions need a resting order trimmed.
+
+    Returns rows with: position_id, target_size_usdc, committed_usdc, excess.
+    """
+    # Mirrors the get_committed_usdc semantics so we can sort + filter
+    # in one query.  Tolerance: $1 to avoid sub-cent rounding triggers.
+    sql = """
+        SELECT p.id AS position_id, p.target_size_usdc, p.city, p.date,
+               COALESCE(SUM(
+                   CASE
+                       WHEN po.status = 'filled' AND po.filled_usdc >= po.intended_usdc * 0.99
+                           THEN po.filled_usdc
+                       WHEN po.status = 'filled' AND po.filled_usdc < po.intended_usdc * 0.99
+                           THEN po.intended_usdc
+                       WHEN po.status IN ('pending','live','matched','partial')
+                           THEN po.intended_usdc
+                       WHEN po.status = 'cancelled' AND po.filled_usdc > 0
+                           THEN po.filled_usdc
+                       ELSE 0
+                   END
+               ), 0) AS committed_usdc
+        FROM positions p
+        JOIN position_orders po ON po.position_id = p.id
+        WHERE p.is_paper = 0
+          AND p.status = 'open'
+          AND po.role IN ('entry', 'topup')
+          AND p.target_size_usdc IS NOT NULL
+          AND p.target_size_usdc > 0
+        GROUP BY p.id, p.target_size_usdc, p.city, p.date
+        HAVING committed_usdc > p.target_size_usdc + 1.0
+    """
+    with _get_conn() as conn:
+        rows = []
+        for r in conn.execute(sql).fetchall():
+            d = dict(r)
+            d["excess"] = round(d["committed_usdc"] - d["target_size_usdc"], 4)
+            rows.append(d)
+        return rows
+
+
+def get_cancellable_orders_for_position(position_id: int) -> list[dict]:
+    """Orders that are currently committing capital AND have a non-zero
+    resting portion (intended - filled).  Returned oldest-first so the
+    auto-cancel sweep cancels the longest-stuck order first.
+
+    Excludes already-terminal statuses (filled/cancelled/failed).  An
+    order with status='partial' and filled_usdc < intended_usdc qualifies —
+    cancelling it will free the unfilled portion while the filled shares
+    stay on chain.
+    """
+    sql = """
+        SELECT *,
+               (intended_usdc - COALESCE(filled_usdc, 0)) AS resting_usdc
+        FROM position_orders
+        WHERE position_id = ?
+          AND role IN ('entry', 'topup')
+          AND status IN ('pending', 'live', 'matched', 'partial')
+          AND (intended_usdc - COALESCE(filled_usdc, 0)) > 0.01
+        ORDER BY created_at ASC, id ASC   -- oldest by wall-clock first
+    """
+    with _get_conn() as conn:
+        return [dict(r) for r in conn.execute(sql, (position_id,)).fetchall()]
+
+
+def get_position_order_by_id(order_id: str) -> dict | None:
+    """Look up a position_orders row by its CLOB order id."""
+    if not order_id:
+        return None
+    sql = "SELECT * FROM position_orders WHERE order_id = ? LIMIT 1"
+    with _get_conn() as conn:
+        row = conn.execute(sql, (order_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def backfill_position_orders() -> dict:
+    """One-shot migration: walk every existing position and synthesize
+    position_orders rows from what we can infer from the legacy fields.
+
+    Idempotent — skips positions that already have ledger rows.  Safe
+    to run on every startup as a no-op when there's nothing to backfill.
+
+    For each existing position:
+      * If `order_id` is set → create one 'entry' row.  Status is derived
+        from fill_status: filled→'filled', cancelled→'cancelled',
+        pending→'pending'.  filled_usdc/shares come from the position
+        row's current values.
+      * If `pending_topup_order_id` is set → create one 'topup' row in
+        'pending' state.  Reconciliation will close it.
+      * If `exit_order_id` is set → create one 'exit' row in
+        'pending'/'filled'/'cancelled' based on position.status.
+
+    Returns counts {entries, topups, exits, skipped} for logging.
+    """
+    counts = {"entries": 0, "topups": 0, "exits": 0, "skipped": 0}
+    now = datetime.now(timezone.utc).isoformat()
+    with _get_conn() as conn:
+        positions = [dict(r) for r in conn.execute("""
+            SELECT id, order_id, pending_topup_order_id, exit_order_id,
+                   size_usdc, target_size_usdc, shares, entry_price,
+                   exit_intended_price, fill_status, status, trade_status,
+                   exit_trade_status, cancelled_reason, entry_time,
+                   pending_topup_amount_usdc, pending_topup_intended_price,
+                   actual_exit_price, exit_fees, entry_fees
+            FROM positions
+        """).fetchall()]
+
+        existing_ids = {r[0] for r in conn.execute(
+            "SELECT order_id FROM position_orders"
+        ).fetchall()}
+
+        for p in positions:
+            pid = p["id"]
+            target = float(p.get("target_size_usdc") or p.get("size_usdc") or 0)
+            entry_price = float(p.get("entry_price") or 0)
+
+            # ---- entry ----
+            entry_oid = p.get("order_id")
+            if entry_oid and entry_oid not in existing_ids:
+                fs = (p.get("fill_status") or "").lower()
+                ts = (p.get("trade_status") or "")
+                cancelled = (fs == "cancelled")
+                filled = (fs == "filled")
+                # `status` maps fill_status → ledger status
+                if cancelled:
+                    o_status = "cancelled"
+                elif filled:
+                    o_status = "filled"
+                else:
+                    o_status = "pending"
+                shares = float(p.get("shares") or 0)
+                filled_usdc = float(p.get("size_usdc") or 0) if filled else 0.0
+                conn.execute("""
+                    INSERT INTO position_orders
+                        (position_id, order_id, role, intended_usdc,
+                         intended_shares, limit_price, status, trade_status,
+                         filled_shares, filled_usdc, fill_price, fee_usdc,
+                         created_at, updated_at, closed_at, cancelled_reason)
+                    VALUES (?, ?, 'entry', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    pid, entry_oid,
+                    target if target > 0 else filled_usdc,
+                    (target / entry_price) if (target > 0 and entry_price > 0)
+                        else shares,
+                    entry_price,
+                    o_status, ts or None,
+                    shares if filled else 0,
+                    filled_usdc,
+                    entry_price if filled and shares > 0 else None,
+                    float(p.get("entry_fees") or 0),
+                    p.get("entry_time") or now, now,
+                    now if o_status in ("filled", "cancelled") else None,
+                    p.get("cancelled_reason"),
+                ))
+                counts["entries"] += 1
+
+            # ---- in-flight top-up ----
+            tup_oid = p.get("pending_topup_order_id")
+            if tup_oid and tup_oid not in existing_ids:
+                amt = float(p.get("pending_topup_amount_usdc") or 0)
+                pri = float(p.get("pending_topup_intended_price") or entry_price or 0)
+                shares_intended = (amt / pri) if (amt > 0 and pri > 0) else 0
+                conn.execute("""
+                    INSERT INTO position_orders
+                        (position_id, order_id, role, intended_usdc,
+                         intended_shares, limit_price, status,
+                         created_at, updated_at)
+                    VALUES (?, ?, 'topup', ?, ?, ?, 'pending', ?, ?)
+                """, (pid, tup_oid, amt, shares_intended, pri, now, now))
+                counts["topups"] += 1
+
+            # ---- exit (in-flight or completed) ----
+            exit_oid = p.get("exit_order_id")
+            if exit_oid and exit_oid not in existing_ids:
+                exit_pri = float(p.get("exit_intended_price")
+                                 or p.get("actual_exit_price") or 0)
+                shares = float(p.get("shares") or 0)
+                pos_status = (p.get("status") or "").lower()
+                actual_exit = p.get("actual_exit_price")
+                if pos_status == "closed" and actual_exit is not None:
+                    o_status = "filled"
+                    filled_shares_x = shares
+                    filled_usdc_x = shares * float(actual_exit)
+                elif pos_status == "exiting":
+                    o_status = "pending"
+                    filled_shares_x = 0
+                    filled_usdc_x = 0
+                else:
+                    o_status = "cancelled"
+                    filled_shares_x = 0
+                    filled_usdc_x = 0
+                conn.execute("""
+                    INSERT INTO position_orders
+                        (position_id, order_id, role, intended_usdc,
+                         intended_shares, limit_price, status, trade_status,
+                         filled_shares, filled_usdc, fill_price, fee_usdc,
+                         created_at, updated_at, closed_at)
+                    VALUES (?, ?, 'exit', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    pid, exit_oid,
+                    shares * exit_pri if exit_pri > 0 else 0,
+                    shares, exit_pri,
+                    o_status, p.get("exit_trade_status"),
+                    filled_shares_x, filled_usdc_x,
+                    float(actual_exit) if (o_status == "filled" and actual_exit is not None) else None,
+                    float(p.get("exit_fees") or 0),
+                    now, now,
+                    now if o_status in ("filled", "cancelled") else None,
+                ))
+                counts["exits"] += 1
+
+    return counts
+
+
+# ---------------------------------------------------------------------------
+# Activity log
+# ---------------------------------------------------------------------------
+
+def insert_activity_log(
+    *,
+    timestamp:   str,
+    level:       str,
+    category:    str,
+    message:     str,
+    position_id: int | None = None,
+    metadata:    str | None = None,
+) -> None:
+    """Append one critical-event row.  Called by activity.log_activity().
+    Never raises — the caller guards with a try/except so a DB write
+    failure can't mask the underlying action."""
+    sql = """
+        INSERT INTO activity_log
+            (timestamp, level, category, message, position_id, metadata)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """
+    with _get_conn() as conn:
+        conn.execute(sql, (timestamp, level, category, message, position_id, metadata))
+
+
+def get_recent_activity(
+    limit:       int = 200,
+    *,
+    categories:  list[str] | None = None,
+    levels:      list[str] | None = None,
+    since_iso:   str | None = None,
+) -> list[dict]:
+    """Return recent activity_log rows, newest first, for the dashboard
+    Activity tab.  All filter args are optional."""
+    where = []
+    args: list = []
+    if categories:
+        ph = ",".join(["?"] * len(categories))
+        where.append(f"category IN ({ph})")
+        args.extend(categories)
+    if levels:
+        ph = ",".join(["?"] * len(levels))
+        where.append(f"level IN ({ph})")
+        args.extend(levels)
+    if since_iso:
+        where.append("timestamp >= ?")
+        args.append(since_iso)
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    sql = f"""
+        SELECT * FROM activity_log
+        {where_sql}
+        ORDER BY id DESC
+        LIMIT ?
+    """
+    args.append(int(limit))
+    with _get_conn() as conn:
+        return [dict(r) for r in conn.execute(sql, tuple(args)).fetchall()]
+
+
+def get_activity_categories() -> list[str]:
+    """Distinct categories present in the table — drives the dashboard
+    category filter dropdown."""
+    sql = "SELECT DISTINCT category FROM activity_log ORDER BY category"
+    with _get_conn() as conn:
+        return [r[0] for r in conn.execute(sql).fetchall()]
+
+
+def add_position_entry_fee(position_id: int, fee_usdc: float) -> None:
+    """Accumulate an entry-side fee on a position.
+
+    Called when a buy fills (initial or top-up).  Uses COALESCE so the
+    first call from a row that pre-dates the column (NULL) initializes
+    correctly.  Subsequent calls add to the running total.
+    """
+    if fee_usdc <= 0:
+        return
+    sql = """
+        UPDATE positions
+        SET entry_fees = COALESCE(entry_fees, 0) + ?
+        WHERE id = ?
+    """
+    with _get_conn() as conn:
+        conn.execute(sql, (float(fee_usdc), position_id))
+
+
+def set_position_exit_fee_and_net_pnl(
+    position_id: int, exit_fee_usdc: float,
+) -> None:
+    """Record the exit-side fee and recompute pnl_net = pnl - all fees.
+
+    Called when the exit order fills (during reconciliation).  pnl_net is
+    derived in SQL from the freshly-set exit_fees + accumulated entry_fees +
+    the gross pnl that update_position_exit_filled already wrote.
+    """
+    sql = """
+        UPDATE positions
+        SET exit_fees = ?,
+            pnl_net = COALESCE(pnl, 0)
+                      - COALESCE(entry_fees, 0)
+                      - COALESCE(?, 0)
+        WHERE id = ?
+    """
+    with _get_conn() as conn:
+        conn.execute(sql, (float(exit_fee_usdc), float(exit_fee_usdc), position_id))
+
+
+def update_position_topup_pending(
+    position_id: int,
+    order_id: str,
+    amount_usdc: float,
+    intended_price: float,
+) -> None:
+    """Stamp the pending top-up fields on a position when execute_topup
+    posts a live CLOB buy.  Cleared on fill (via update_position_topup
+    which now also clears these) or on cancel (via clear_position_topup_pending).
+
+    Only ONE pending top-up at a time per position — _run_topups checks
+    pending_topup_order_id IS NULL before issuing.
+    """
+    sql = """
+        UPDATE positions
+        SET pending_topup_order_id       = ?,
+            pending_topup_amount_usdc    = ?,
+            pending_topup_intended_price = ?
+        WHERE id = ?
+    """
+    with _get_conn() as conn:
+        conn.execute(sql, (order_id, amount_usdc, intended_price, position_id))
+
+
+def clear_position_topup_pending(position_id: int) -> None:
+    """Clear the in-flight top-up fields without merging — used when the
+    top-up order is cancelled (externally or because it sat unfilled long
+    enough to be killed by the monitor)."""
+    sql = """
+        UPDATE positions
+        SET pending_topup_order_id       = NULL,
+            pending_topup_amount_usdc    = NULL,
+            pending_topup_intended_price = NULL
+        WHERE id = ?
+    """
+    with _get_conn() as conn:
+        conn.execute(sql, (position_id,))
+
+
+def get_positions_with_pending_topup() -> list[dict]:
+    """Positions whose pending_topup_order_id is set — the in-flight
+    top-up buys awaiting fill.  Used by monitor reconciliation."""
+    sql = """
+        SELECT * FROM positions
+        WHERE pending_topup_order_id IS NOT NULL
+          AND status IN ('open', 'exiting')
+        ORDER BY id ASC
+    """
+    with _get_conn() as conn:
+        return [dict(r) for r in conn.execute(sql).fetchall()]
+
+
+def get_exiting_positions() -> list[dict]:
+    """Positions whose status='exiting' — the in-flight sell ladder.
+    Returned sorted by oldest exit_order_id first (so monitor processes
+    the longest-pending exits before the newer ones)."""
+    sql = """
+        SELECT * FROM positions
+        WHERE status = 'exiting'
+        ORDER BY id ASC
+    """
+    with _get_conn() as conn:
+        return [dict(r) for r in conn.execute(sql).fetchall()]
+
+
 def update_position_topup(
     position_id: int,
     added_usdc: float,
@@ -922,19 +1906,207 @@ def update_position_topup(
     new_avg_price: float,
 ) -> None:
     """Add to an existing position's size (liquidity-aware top-up).
-    Updates size_usdc, shares, and recalculates entry_price as a
-    weighted average."""
+    Updates size_usdc, shares, recalculates entry_price as weighted avg,
+    and clears any pending_topup_* fields (the merge replaces the in-flight
+    state).
+
+    SINGLE-SHOT semantics — clears pending_topup_* atomically.  Use only
+    when you know the topup is fully complete (paper mode, or a synthesized
+    one-shot apply).  For per-chunk WS fills use add_position_topup_fill
+    instead, since clearing pending_topup_order_id mid-stream prevents
+    chunks 2..N from being routed back to this position.
+    """
     sql = """
         UPDATE positions
         SET size_usdc = size_usdc + ?,
             shares = shares + ?,
             entry_price = ?,
-            current_price = ?
+            current_price = ?,
+            pending_topup_order_id       = NULL,
+            pending_topup_amount_usdc    = NULL,
+            pending_topup_intended_price = NULL
         WHERE id = ?
     """
     with _get_conn() as conn:
         conn.execute(sql, (added_usdc, added_shares, new_avg_price,
                            new_avg_price, position_id))
+
+
+def add_position_topup_fill(
+    position_id: int,
+    added_usdc: float,
+    added_shares: float,
+) -> None:
+    """Apply ONE chunk of a topup-order fill, additively, WITHOUT clearing
+    the pending_topup_* fields.
+
+    Mirrors update_position_topup's accumulation math but leaves the
+    in-flight markers alone so subsequent chunks of the same topup order
+    can still be routed back to this position via
+    get_position_by_order_id (which matches on pending_topup_order_id).
+
+    Caller is responsible for invoking clear_position_topup_pending(pid)
+    when the position_orders ledger row signals the order is fully filled.
+
+    Recomputes entry_price as weighted average using the cumulative
+    size_usdc / shares post-update — same cost-basis semantics as the
+    single-shot helper, just split across multiple calls.
+    """
+    a_usdc   = float(added_usdc)
+    a_shares = float(added_shares)
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT shares, size_usdc FROM positions WHERE id = ?",
+            (position_id,),
+        ).fetchone()
+        if row is None:
+            return
+        prev_shares = float(row["shares"]    or 0)
+        prev_usdc   = float(row["size_usdc"] or 0)
+        new_shares  = prev_shares + a_shares
+        new_usdc    = prev_usdc   + a_usdc
+        new_avg     = (new_usdc / new_shares) if new_shares > 0 else 0.0
+        conn.execute("""
+            UPDATE positions
+            SET size_usdc     = ?,
+                shares        = ?,
+                entry_price   = ?,
+                current_price = ?
+            WHERE id = ?
+        """, (new_usdc, new_shares, new_avg, new_avg, position_id))
+
+
+# Tolerance for "is the position fully exited?".  Polymarket fills are
+# at most 4 decimals of share precision, so a residual ≤ 0.001 is rounding.
+_EXIT_COMPLETE_SHARE_TOLERANCE = 0.001
+
+
+def add_position_exit_fill(
+    position_id: int,
+    sold_shares: float,
+    fill_price: float,
+    fee_usdc: float,
+) -> dict:
+    """Apply ONE chunk of an exit-order fill, decrementing shares and
+    accumulating exit proceeds.  Returns a status dict the caller uses
+    to decide whether to log a closed-position activity entry.
+
+    Two modes, gated on whether the cumulative sell would zero out shares:
+
+      partial (shares > tolerance after decrement):
+          shares             := shares - sold_shares
+          exit_proceeds_usdc := exit_proceeds_usdc + sold_shares × fill_price
+          exit_fees          := exit_fees + fee_usdc
+          status stays 'exiting' (or 'open' if it was open)
+
+      complete (shares ≤ tolerance after decrement):
+          shares = 0
+          exit_proceeds_usdc final
+          exit_fees final
+          status = 'closed'
+          actual_exit_price = exit_proceeds_usdc / total_shares_sold (weighted avg)
+          pnl = exit_proceeds_usdc - size_usdc - entry_fees - exit_fees
+
+    Mirrors add_position_entry_fill / add_position_topup_fill — same
+    accumulation pattern, opposite sign (shares decrement instead of
+    increment).
+
+    Returns dict:
+      {"is_complete": bool, "shares_after": float, "pnl": float | None,
+       "actual_exit_price": float | None}
+    """
+    from datetime import datetime, timezone as _tz
+    a_shares = float(sold_shares)
+    a_price  = float(fill_price)
+    a_fee    = float(fee_usdc or 0)
+    a_proceeds = round(a_shares * a_price, 6)
+
+    with _get_conn() as conn:
+        row = conn.execute("""
+            SELECT shares, size_usdc, entry_price, entry_fees, exit_fees,
+                   exit_proceeds_usdc, status
+            FROM positions WHERE id = ?
+        """, (position_id,)).fetchone()
+        if row is None:
+            return {"is_complete": False, "shares_after": 0.0,
+                    "pnl": None, "actual_exit_price": None}
+
+        prev_shares    = float(row["shares"]             or 0)
+        size_usdc      = float(row["size_usdc"]          or 0)
+        entry_fees     = float(row["entry_fees"]         or 0)
+        prev_exit_fees = float(row["exit_fees"]          or 0)
+        prev_proceeds  = float(row["exit_proceeds_usdc"] or 0)
+
+        new_shares    = max(0.0, prev_shares - a_shares)
+        new_proceeds  = prev_proceeds + a_proceeds
+        new_exit_fees = prev_exit_fees + a_fee
+
+        is_complete = new_shares <= _EXIT_COMPLETE_SHARE_TOLERANCE
+
+        if is_complete:
+            # Total shares sold across all chunks (entry-side shares minus
+            # whatever's left, which is ~0).  Used to compute weighted-avg
+            # exit price.  size_usdc / entry_price gives the original entry
+            # share count if shares column had been mutated by prior partials.
+            entry_share_count = (
+                size_usdc / float(row["entry_price"])
+                if (row["entry_price"] or 0) > 0 else prev_shares + a_shares
+            )
+            avg_exit_price = (
+                new_proceeds / entry_share_count
+                if entry_share_count > 0 else a_price
+            )
+            # Schema convention (preserved from legacy code):
+            #   pnl      = GROSS realised pnl (proceeds - cost), pre-fees
+            #   pnl_net  = NET realised pnl (gross - entry_fees - exit_fees)
+            # Dashboard reads both; downstream consumers (closed-positions
+            # list, daily P&L) historically use pnl_net for the bottom line
+            # and pnl for the trading-headline number.
+            gross_pnl = round(new_proceeds - size_usdc, 4)
+            net_pnl   = round(gross_pnl - entry_fees - new_exit_fees, 4)
+            now_iso = datetime.now(_tz.utc).astimezone().isoformat()
+            conn.execute("""
+                UPDATE positions
+                SET shares             = 0,
+                    status             = 'closed',
+                    exit_proceeds_usdc = ?,
+                    exit_fees          = ?,
+                    actual_exit_price  = ?,
+                    exit_price         = ?,
+                    exit_time          = COALESCE(exit_time, ?),
+                    pnl                = ?,
+                    pnl_net            = ?,
+                    unrealized_pnl     = 0
+                WHERE id = ?
+            """, (
+                new_proceeds, new_exit_fees,
+                avg_exit_price, avg_exit_price,
+                now_iso, gross_pnl, net_pnl, position_id,
+            ))
+            return {
+                "is_complete":       True,
+                "shares_after":      0.0,
+                "gross_pnl":         gross_pnl,
+                "net_pnl":           net_pnl,
+                "actual_exit_price": avg_exit_price,
+            }
+        else:
+            # Partial — accumulate, don't close.  Position may still be
+            # 'exiting' (ladder mid-flight) or 'open' (rare, but if a
+            # manual sell was applied via this path).
+            conn.execute("""
+                UPDATE positions
+                SET shares             = ?,
+                    exit_proceeds_usdc = ?,
+                    exit_fees          = ?
+                WHERE id = ?
+            """, (new_shares, new_proceeds, new_exit_fees, position_id))
+            return {
+                "is_complete":       False,
+                "shares_after":      new_shares,
+                "pnl":               None,
+                "actual_exit_price": None,
+            }
 
 
 def get_underfilled_positions() -> list[dict]:
@@ -980,14 +2152,123 @@ def update_position_fill(
     shares: float,
     entry_price: float,
 ) -> None:
-    """Update a pending position once fill is confirmed via CLOB API."""
+    """Update a pending position once fill is confirmed via CLOB API.
+
+    REPLACE semantics — sets shares to the given value.  Suitable when
+    the caller already has the cumulative (final) fill totals.  For
+    per-chunk additive accumulation (which is what the WS fill path now
+    needs since each match emits its own trade event), use
+    add_position_entry_fill() instead.
+
+    Also recomputes size_usdc = shares × entry_price so it reflects the
+    ACTUAL filled cost, not the originally-intended one.  Critical for
+    partial fills: a $10 buy that only matched 7 shares at $0.29 has a
+    real cost of $2.03, not $10 — exposure caps and P&L math both depend
+    on this.  Without the recompute, MAX_TOTAL_EXPOSURE_PCT would treat
+    the position as 5x larger than it actually is on chain.
+    """
+    actual_size_usdc = round(float(shares) * float(entry_price), 4)
     sql = """
         UPDATE positions
-        SET fill_status = ?, shares = ?, entry_price = ?, current_price = ?
+        SET fill_status = ?, shares = ?, entry_price = ?,
+            current_price = ?, size_usdc = ?
         WHERE id = ?
     """
     with _get_conn() as conn:
-        conn.execute(sql, (fill_status, shares, entry_price, entry_price, position_id))
+        conn.execute(sql, (fill_status, shares, entry_price,
+                           entry_price, actual_size_usdc, position_id))
+
+
+def add_position_entry_fill(
+    position_id: int,
+    added_shares: float,
+    fill_price: float,
+) -> None:
+    """Apply ONE chunk of an entry-order fill, accumulating across chunks.
+
+    Replaces update_position_fill on the WS fill path so that entry
+    orders that match against multiple resting asks (yielding N trade
+    events for the same order_id) accumulate correctly.
+
+    Two modes, gated on the position's current fill_status:
+
+      fill_status == 'pending'  (no chunks have landed yet):
+          REPLACE shares/size_usdc/entry_price with this chunk's values
+          and flip fill_status -> 'filled'.  The seeded shares/size_usdc
+          from insert_position are intended estimates, not actuals — so
+          we discard them in favour of the on-chain truth.
+
+      fill_status == 'filled'   (a previous chunk already landed):
+          shares      := shares    + added_shares
+          size_usdc   := size_usdc + added_shares × fill_price
+          entry_price := size_usdc / shares   (weighted average cost basis)
+
+    The weighted-average recompute mirrors the topup path and keeps
+    cost-basis honest when chunks land at different prices (e.g. a
+    sweep walks through the book paying $0.34, $0.35, $0.36).
+
+    No-op for cancelled / closed / non-existent positions.
+    """
+    a_shares = float(added_shares)
+    a_price  = float(fill_price)
+    a_usdc   = round(a_shares * a_price, 6)
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT shares, size_usdc, fill_status "
+            "FROM positions WHERE id = ?",
+            (position_id,),
+        ).fetchone()
+        if row is None:
+            return
+        cur_status = (row["fill_status"] or "").lower()
+        if cur_status not in ("pending", "filled"):
+            # cancelled / closed / unknown — don't touch.
+            return
+        if cur_status == "pending":
+            # First chunk lands.  Discard the intended-shares seed
+            # (set by insert_position) and adopt this chunk's truth.
+            new_shares = a_shares
+            new_usdc   = a_usdc
+            new_avg    = a_price
+        else:
+            prev_shares = float(row["shares"]    or 0)
+            prev_usdc   = float(row["size_usdc"] or 0)
+            new_shares  = prev_shares + a_shares
+            new_usdc    = prev_usdc   + a_usdc
+            new_avg     = (new_usdc / new_shares) if new_shares > 0 else a_price
+        conn.execute("""
+            UPDATE positions
+            SET fill_status   = 'filled',
+                shares        = ?,
+                size_usdc     = ?,
+                entry_price   = ?,
+                current_price = ?
+            WHERE id = ?
+        """, (new_shares, new_usdc, new_avg, new_avg, position_id))
+
+
+def mark_event_processed(event_id: str) -> bool:
+    """Atomic 'have we already processed this trade event?' check.
+
+    INSERT OR IGNORE into processed_trade_events; returns True if the
+    row was inserted (first time seeing this event_id) and False if it
+    was already there (duplicate).  Cheap (~one indexed PRIMARY KEY
+    write or noop), called once per incoming WS+REST trade event.
+
+    Empty/None event_id returns True without recording — callers should
+    fall back to whatever pre-existing dedup the lifecycle column gives
+    them.  In practice Polymarket events always carry an `id`.
+    """
+    if not event_id:
+        return True
+    now = datetime.now(timezone.utc).isoformat()
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO processed_trade_events "
+            "(event_id, processed_at) VALUES (?, ?)",
+            (str(event_id), now),
+        )
+        return cur.rowcount > 0
 
 
 def cancel_position(

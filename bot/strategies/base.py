@@ -48,11 +48,18 @@ class Strategy(ABC):
         self,
         signals: list[dict],
         bankroll: float,
+        client=None,
     ) -> list[dict]:
         """Score and sort signals by priority (highest first).
 
         Must attach 'priority_score' and 'priority_components' to each
         signal dict.
+
+        `client` is an optional authenticated CLOB client.  Strategies
+        that want orderbook-aware ranking can use it to pull
+        spread/depth data; strategies that don't need it ignore the kwarg.
+        Passing it via the signature instead of constructor injection
+        keeps strategy initialization side-effect-free.
         """
 
     @abstractmethod

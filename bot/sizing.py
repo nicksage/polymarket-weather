@@ -310,12 +310,23 @@ def calculate_kelly_size(edge: float, odds: float, bankroll: float) -> float:
     return max(1.0, round(position_size, 2))
 
 
-def get_bankroll(db_path: str | None = None) -> float:
-    """
-    Get current available bankroll from config or database.
-    In production, this should query your actual USDC balance from
-    the Polymarket CLOB API or an on-chain balance check.
-    For now, loads from environment variable.
+def get_bankroll(db_path: str | None = None, client=None) -> float:
+    """Get the effective bankroll the bot should size against.
+
+    When `client` is provided AND we're in live mode AND
+    WALLET_BALANCE_CHECK_ENABLED, returns min(BANKROLL_USDC, on-chain
+    USDC balance - reserve).  Otherwise returns BANKROLL_USDC from env.
+
+    Caller can pass `client=None` to skip the wallet check (e.g., in
+    paper-mode tests).  See bot/wallet.py for the caching + log behavior.
     """
     from config import INITIAL_BANKROLL
+    if client is not None:
+        try:
+            from wallet import get_effective_bankroll
+            return get_effective_bankroll(client)
+        except Exception as e:
+            # Defensive — never let bankroll lookup crash the trading loop.
+            # Fall back to env value with a logger warning.
+            logger.warning(f"get_bankroll: wallet check failed ({e}); using env value")
     return float(os.getenv("BANKROLL_USDC", INITIAL_BANKROLL))

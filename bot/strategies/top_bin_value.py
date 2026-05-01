@@ -362,6 +362,7 @@ class TopBinValueStrategy(Strategy):
         self,
         signals: list[dict],
         bankroll: float,
+        client=None,   # accepted for interface compatibility; not used here
     ) -> list[dict]:
         """Rank YES signals first (primary thesis), then NO signals (hedges).
 

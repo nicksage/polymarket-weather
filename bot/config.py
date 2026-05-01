@@ -35,6 +35,45 @@ MAX_TOTAL_EXPOSURE_PCT: float = _float("MAX_TOTAL_EXPOSURE_PCT", 0.15)
 # MAX_CITY_DAY_EXPOSURE caps total capital across all events for one (city, date).
 MAX_EVENT_EXPOSURE_PCT: float = _float("MAX_EVENT_EXPOSURE_PCT", 0.03)
 MAX_CITY_DAY_EXPOSURE: float = _float("MAX_CITY_DAY_EXPOSURE", 0.05)
+
+# Hard cap on count of simultaneously-open positions (per mode).
+# 0 = unlimited.  Counts anything that's still consuming or could consume
+# capital: status='open' (filled or pending buy) and status='exiting'
+# (sell ladder in progress).  Top-ups don't count — they merge into an
+# existing position rather than create a new one.  Useful guard while
+# easing into live trading: cap exposure by COUNT, not just by dollars.
+MAX_OPEN_POSITIONS: int = int(os.getenv("MAX_OPEN_POSITIONS", "0"))
+
+# Minimum age (minutes) a pending order must reach before the monitor's
+# cancel pass is allowed to kill it.  Without this, fresh orders placed
+# seconds before a monitor cycle (especially the inline cycle that runs
+# right after `trading_run` on startup) get nuked before they have a
+# chance to fill on the book.  10 minutes is a sensible default — long
+# enough that most fillable orders land, short enough that abandoned
+# orders don't pile up across cycles.
+MIN_ORDER_AGE_BEFORE_CANCEL_MIN: float = _float(
+    "MIN_ORDER_AGE_BEFORE_CANCEL_MIN", 10.0
+)
+
+# --- Orderbook-aware execution + ranking (added 2026-04-30) ---
+# Walk-up tolerance (cents) above the touch when placing a BUY.  We compute
+# `limit = min(best_ask + walk, MPV_MAX_PRICE)` and submit GTC.  Polymarket
+# matches the order against asks ≤ limit (cheapest first) and rests the
+# remainder on the book at our limit.  1¢ default keeps slippage tight.
+ORDERBOOK_WALK_CENTS: int = int(os.getenv("ORDERBOOK_WALK_CENTS", "1"))
+
+# Wide-spread skip filter.  Bins where (best_ask - best_bid) exceeds this
+# many cents at signal time are dropped before ranking — the spread
+# implies illiquid book + slippage risk that's not worth the entry.
+# Set to 0 (or very high) to disable the filter.
+MAX_SPREAD_CENTS_FOR_ENTRY: int = int(os.getenv("MAX_SPREAD_CENTS_FOR_ENTRY", "6"))
+
+# Cap on how many top candidates get an orderbook fetch during ranking.
+# We fetch books for the top N by static `liquidity_usd`, then rank those
+# by spread + sweepable depth.  Keeps API call count predictable
+# (Polymarket's CLOB rate-limits aggressively from datacenter IPs).
+RANK_TOP_N_FOR_ORDERBOOK: int = int(os.getenv("RANK_TOP_N_FOR_ORDERBOOK", "15"))
+
 MIN_LIQUIDITY_USD: float = _float("MIN_LIQUIDITY_USD", 500.0)
 MIN_HOURS_TO_EXPIRY: float = _float("MIN_HOURS_TO_EXPIRY", 6.0)
 MAX_DAILY_DRAWDOWN_PCT: float = _float("MAX_DAILY_DRAWDOWN_PCT", 0.10)
@@ -152,10 +191,52 @@ ALLOWED_SIDES: str = os.getenv("ALLOWED_SIDES", "both").lower().strip()
 # Wallet / Data API
 # ---------------------------------------------------------------------------
 
-# Polymarket proxy wallet address — used to query on-chain position data from
-# data-api.polymarket.com.  Required for live trading enrichment; ignored in
-# paper mode.
+# Polymarket proxy wallet address — the contract address that actually holds
+# your USDC and positions.  Critical: this is NOT the same as the EOA derived
+# from POLYMARKET_PRIVATE_KEY.  The private key signs requests; the proxy
+# holds the funds.  Without this set, the CLOB client queries the signer's
+# EOA balance (always ~$0 for a wallet-connect setup) and can't sign orders
+# correctly.  Required for live trading.
 WALLET_ADDRESS: str = os.getenv("WALLET_ADDRESS", "")
+
+# Polymarket signature type — tells the CLOB client which proxy contract
+# scheme owns WALLET_ADDRESS:
+#   0 = EOA              (no proxy — signer == funder; rare)
+#   1 = POLY_PROXY       (Polymarket-app-issued wallets — DEFAULT)
+#   2 = POLY_GNOSIS_SAFE (only if you imported your own Gnosis Safe)
+#
+# Default 1 covers the common case: any wallet created by signing into
+# polymarket.com (whether via email or MetaMask connect) — Polymarket
+# wraps the signer EOA in their own proxy contract.  Only set 2 if you
+# manually attached a separately-deployed Gnosis Safe.  If orders fail
+# with `order_version_mismatch`, the signature_type doesn't match the
+# on-chain proxy type — verify by inspecting the bytecode at WALLET_ADDRESS.
+WALLET_SIGNATURE_TYPE: int = int(os.getenv("WALLET_SIGNATURE_TYPE", "1"))
+
+# ---------------------------------------------------------------------------
+# Wallet balance sync (live trading guard)
+# ---------------------------------------------------------------------------
+# When enabled, the bot queries the actual on-chain USDC balance via the CLOB
+# client at the start of each trading cycle and caps the effective bankroll at
+# min(BANKROLL_USDC, wallet_balance - reserve).  Silent scale-down (logs INFO
+# when the cap binds, never aborts).  Disabled in paper mode automatically.
+#
+# Use case: you set BANKROLL_USDC=5000 but later withdraw $4000 from the
+# wallet — without this check, the bot tries to size against the stale cap
+# and hits CLOB-level rejections.  With this check, sizing scales down to
+# the actual balance gracefully.
+# ---------------------------------------------------------------------------
+
+WALLET_BALANCE_CHECK_ENABLED: bool = _bool("WALLET_BALANCE_CHECK_ENABLED", True)
+
+# Reserve held back from the effective bankroll — covers gas, rounding,
+# and a small safety margin so we never try to spend the very last dollar.
+WALLET_BALANCE_RESERVE_USDC: float = _float("WALLET_BALANCE_RESERVE_USDC", 10.0)
+
+# How long to cache a balance reading before re-querying.  Polymarket's
+# Data API is fast but we don't need to hammer it on every call — once per
+# cycle is plenty.
+WALLET_BALANCE_REFRESH_MIN: float = _float("WALLET_BALANCE_REFRESH_MIN", 30.0)
 
 # ---------------------------------------------------------------------------
 # Strategy selection
@@ -272,6 +353,26 @@ EXIT_WEAKENED_SIGMA_SHIFT: float = _float("EXIT_WEAKENED_SIGMA_SHIFT", 1.0)
 EXIT_HARD_STOP_ENABLED: bool = _bool("EXIT_HARD_STOP_ENABLED", True)
 EXIT_HARD_STOP_PCT: float = _float("EXIT_HARD_STOP_PCT", -0.70)
 
+# Bleed circuit-breaker for the exit ladder.  When an in-flight stop-out's
+# current best_bid drops more than this fraction below the original trigger
+# price, force an immediate cross-spread instead of climbing through the
+# patient ladder rungs.  Stops the "rung 3 limit at $0.40 sitting unfilled
+# while bid is $0.20" failure mode that bleeds the position for hours.
+# Default 0.15 = 15% (consistent with practitioner literature on stop-out
+# urgency in thin markets).  Set to 1.0 to disable.
+EXIT_BLEED_CROSS_PCT: float = _float("EXIT_BLEED_CROSS_PCT", 0.15)
+
+# Stale-topup re-pricing threshold (Lightweight Option B).
+# When a pending topup's limit price is more than this many cents BELOW the
+# live best_ask (i.e., asks moved upward and our bid is now stale), the
+# */5 min stale-topup refresher cancels + re-issues at the fresh price.
+# Direction-aware: only fires on upward drift.  Asks moving DOWN don't
+# need action (Polymarket matches us at the cheaper price by default).
+# Default 1.5¢ = balance between catching meaningful drifts and avoiding
+# constant re-pricing churn (which would leak info to market makers).
+# Set to 0 to disable the refresher entirely.
+TOPUP_REPRICE_THRESHOLD_CENTS: float = _float("TOPUP_REPRICE_THRESHOLD_CENTS", 1.5)
+
 # ---------------------------------------------------------------------------
 # Confidence-weighted Kelly (Phase 3)
 # ---------------------------------------------------------------------------
@@ -286,7 +387,30 @@ CONFIDENCE_AGREEMENT_THRESHOLD: float = _float("CONFIDENCE_AGREEMENT_THRESHOLD",
 # ---------------------------------------------------------------------------
 
 LIQUIDITY_AWARE_SIZING: bool = _bool("LIQUIDITY_AWARE_SIZING", True)
+
+# DEPRECATED 2026-04-30 — replaced by MAX_TAKE_PCT_OF_ASK_DEPTH below.
+# The old "% of total displayed liquidity" rule used Gamma's `liquidityNum`
+# field, which is bid + ask combined.  That over-restricts when bids are
+# deep + asks thin (we get capped despite enough sellers) and under-restricts
+# the inverse.  Kept as a config var only so legacy .env files don't fail
+# config import; nothing in the live code reads it anymore.
 MAX_LIQUIDITY_TAKE_PCT: float = _float("MAX_LIQUIDITY_TAKE_PCT", 0.40)
+
+# Cap on how much of the ask-side depth at acceptable prices we'll take
+# in one order.  Acceptable prices = asks ≤ sweep_limit (best_ask + walk
+# ¢, capped at MPV_MAX_PRICE).  This is the right basis: we only care
+# about asks when buying, and we only care about asks at prices we'd
+# actually pay.  Default 0.66 leaves ⅓ of the relevant depth for other
+# market participants — comfortably above the "dominant taker" floor
+# (most quant rules say 33-50%) but permissive enough that retail $10
+# orders rarely hit the cap unless the book is genuinely thin.
+MAX_TAKE_PCT_OF_ASK_DEPTH: float = _float("MAX_TAKE_PCT_OF_ASK_DEPTH", 0.66)
+
+# Floor (USDC) below which we don't bother placing an order at all.
+# Acceptable-ask-depth × MAX_TAKE_PCT below this means the book is too
+# thin to fill a meaningful fraction of our intended size — better to
+# wait a cycle and re-evaluate than to leave a tiny order on the book.
+MIN_FILLABLE_USDC: float = _float("MIN_FILLABLE_USDC", 2.0)
 
 
 # Tail-probability flattening — applied AFTER per-event bin normalization:
@@ -334,3 +458,99 @@ ML_MIN_BRIER_TO_ACTIVATE: float = _float("ML_MIN_BRIER_TO_ACTIVATE", 0.20)
 ML_MODELS_DIR: str = os.getenv(
     "ML_MODELS_DIR", os.path.join(_BOT_DIR, "ml", "models")
 )
+
+
+# ---------------------------------------------------------------------------
+# Trailing stop-loss (single source of truth)
+# ---------------------------------------------------------------------------
+# A trailing stop exits a position when price falls TRAIL_TIERS[…].pct below
+# its peak.  The tier-table format handles BOTH cases:
+#
+#   * Single trail across the whole probability range:
+#       TRAIL_TIERS=0.00:1.00:0.10                # 10% trail everywhere
+#
+#   * Tiered trail that adapts as price climbs:
+#       TRAIL_TIERS=0.00:0.30:0.15,0.30:0.50:0.10,0.50:0.70:0.07,0.70:0.90:0.05,0.90:1.00:0.03
+#       (looser at low peaks → tighter as resolution converges to YES)
+#
+# Format: comma-separated triples of "lo:hi:pct".  Tiers MUST be in
+# ascending order, MUST partition [0, 1] without overlaps, and pct must be
+# in [0, 1].  Tier matching uses half-open intervals [lo, hi); the last
+# tier's hi is treated inclusively so peak == 1.0 still resolves.
+#
+# TRAIL_ACTIVATION_GAIN: peak must rise at least this far above entry
+# before the trail arms — prevents stops on entry-bar noise.
+# ---------------------------------------------------------------------------
+
+TRAIL_ACTIVATION_GAIN: float = _float("TRAIL_ACTIVATION_GAIN", 0.03)
+
+# Default tier table per the engineering spec:
+#   peak in [0.00, 0.30) -> 15% trail
+#   peak in [0.30, 0.50) -> 10% trail
+#   peak in [0.50, 0.70) ->  7% trail
+#   peak in [0.70, 0.90) ->  5% trail
+#   peak in [0.90, 1.00] ->  3% trail   (last tier inclusive at top)
+_DEFAULT_TIERS = "0.00:0.30:0.15,0.30:0.50:0.10,0.50:0.70:0.07,0.70:0.90:0.05,0.90:1.00:0.03"
+
+
+def _parse_tiers(env_value: str) -> list[tuple[float, float, float]]:
+    """Parse 'lo:hi:pct,lo:hi:pct,...' into a validated tier list.
+
+    Validates:
+      * each triple has 3 numeric fields
+      * 0 <= lo < hi <= 1, 0 <= pct <= 1
+      * tiers are in ascending order with no overlaps
+
+    Raises ValueError on any malformed input — _load_tiers() converts that
+    to a logged warning + fallback to defaults so a typo in .env doesn't
+    crash the whole bot at import time.
+    """
+    tiers: list[tuple[float, float, float]] = []
+    for triple in env_value.split(","):
+        triple = triple.strip()
+        if not triple:
+            continue
+        parts = triple.split(":")
+        if len(parts) != 3:
+            raise ValueError(
+                f"bad tier triple {triple!r}, expected 'lo:hi:pct'"
+            )
+        try:
+            lo, hi, pct = (float(p) for p in parts)
+        except ValueError as e:
+            raise ValueError(f"bad tier numbers in {triple!r}: {e}") from e
+        if not (0.0 <= lo < hi <= 1.0):
+            raise ValueError(
+                f"bad tier bounds in {triple!r}: need 0<=lo<hi<=1, got lo={lo} hi={hi}"
+            )
+        if not (0.0 <= pct <= 1.0):
+            raise ValueError(
+                f"bad trail pct in {triple!r}: need 0<=pct<=1, got pct={pct}"
+            )
+        tiers.append((lo, hi, pct))
+    if not tiers:
+        raise ValueError("no tiers parsed (empty TRAIL_TIERS)")
+    for i in range(1, len(tiers)):
+        if tiers[i][0] < tiers[i - 1][1]:
+            raise ValueError(
+                f"tiers overlap: {tiers[i - 1]} and {tiers[i]}"
+            )
+    return tiers
+
+
+def _load_tiers() -> list[tuple[float, float, float]]:
+    """Parse TRAIL_TIERS from env; fall back to spec defaults on any error.
+    Prints to stderr because this runs at import time before logging is set up."""
+    raw = os.getenv("TRAIL_TIERS", _DEFAULT_TIERS)
+    try:
+        return _parse_tiers(raw)
+    except ValueError as e:
+        import sys
+        print(
+            f"WARN: TRAIL_TIERS invalid ({e}); falling back to default tiers",
+            file=sys.stderr,
+        )
+        return _parse_tiers(_DEFAULT_TIERS)
+
+
+TRAIL_TIERS: list[tuple[float, float, float]] = _load_tiers()

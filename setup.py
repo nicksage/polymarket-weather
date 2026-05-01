@@ -162,12 +162,15 @@ def main() -> int:
             _print_fail(f"{module} ({desc}) - not installed")
             all_ok = False
 
-    # Optional: py_clob_client (only needed for live trading)
+    # Optional: py_clob_client_v2 (only needed for live trading).
+    # We use v2 specifically because v1 has deprecated exchange contract
+    # addresses hardcoded — every live order signed against v1's contracts
+    # gets rejected by Polymarket with `order_version_mismatch`.
     try:
-        __import__("py_clob_client")
-        _print_ok("py_clob_client (Polymarket CLOB - live trading)")
+        __import__("py_clob_client_v2")
+        _print_ok("py_clob_client_v2 (Polymarket CLOB - live trading)")
     except ImportError:
-        _print_warn("py_clob_client not installed (only needed for live trading, not paper mode)")
+        _print_warn("py_clob_client_v2 not installed (only needed for live trading, not paper mode)")
 
     # ------------------------------------------------------------------
     # Step 7: Summary

@@ -13,6 +13,7 @@ from config import (
     MAX_TOTAL_EXPOSURE_PCT,
     MAX_EVENT_EXPOSURE_PCT,
     MAX_CITY_DAY_EXPOSURE,
+    MAX_OPEN_POSITIONS,
     MIN_LIQUIDITY_USD,
     MIN_HOURS_TO_EXPIRY,
     MAX_DAILY_DRAWDOWN_PCT,
@@ -48,10 +49,21 @@ class RiskCheck:
 
 
 def check_position_size(size_usdc: float, bankroll: float) -> RiskCheck:
-    """Hard cap: no single position > MAX_POSITION_PCT of bankroll (default 2%)."""
+    """Hard cap: no single position > MAX_POSITION_PCT of bankroll.
+
+    By design (config decision), we SKIP rather than clamp — if the bot
+    can't enter at full target size, it doesn't enter at all.  The reason
+    string is verbose so the operator can see exactly why a cycle was
+    skipped without having to cross-reference config + bankroll math.
+    """
     max_size = MAX_POSITION_PCT * bankroll
     if size_usdc > max_size:
-        return RiskCheck(False, f"Position ${size_usdc:.2f} exceeds max ${max_size:.2f}")
+        return RiskCheck(
+            False,
+            f"Position ${size_usdc:.2f} > {MAX_POSITION_PCT*100:.1f}% "
+            f"per-position cap of ${max_size:.2f} (bankroll=${bankroll:.2f}) "
+            f"— full target required, signal SKIPPED"
+        )
     return RiskCheck(True)
 
 
@@ -80,6 +92,42 @@ def check_total_exposure(new_position_size: float, bankroll: float) -> RiskCheck
             f"Total {mode} exposure ${new_total:,.2f} would exceed "
             f"{MAX_TOTAL_EXPOSURE_PCT*100:.0f}% cap (${cap:,.2f}); "
             f"current={current_exposure:,.2f} over {len(relevant)} position(s)"
+        )
+    return RiskCheck(True)
+
+
+def check_open_position_count() -> RiskCheck:
+    """Hard cap on count of simultaneously-open positions (per mode).
+
+    Counts anything that's still consuming or could consume capital:
+      * status='open'    — fully active OR pending buy
+      * status='exiting' — sell ladder in progress (still on chain)
+    Top-ups don't count — they merge into an existing position rather
+    than opening a new one (this guard fires only on NEW entries).
+
+    Paper and live are tracked separately (matches the rest of the
+    portfolio guards).  Returns pass when MAX_OPEN_POSITIONS is 0
+    (unlimited)."""
+    if MAX_OPEN_POSITIONS <= 0:
+        return RiskCheck(True)
+    open_positions = get_open_positions()
+    is_paper_int = 1 if PAPER_TRADE else 0
+    relevant = [
+        p for p in open_positions
+        if p.get("is_paper", 1) == is_paper_int
+        and p.get("fill_status") != "cancelled"
+    ]
+    if len(relevant) >= MAX_OPEN_POSITIONS:
+        mode = "paper" if PAPER_TRADE else "live"
+        # Phrasing notes: main.py's unfunded-summary parser groups by
+        # everything before the first `=`, `:`, or `(`.  Avoid those so
+        # the summary line reads cleanly like:
+        #   > MAX_OPEN_POSITIONS cap reached, 3 of 3 positions open: 59
+        # (where 59 is the count of signals that hit this check).
+        return RiskCheck(
+            False,
+            f"MAX_OPEN_POSITIONS cap reached, "
+            f"{len(relevant)} of {MAX_OPEN_POSITIONS} {mode} positions open"
         )
     return RiskCheck(True)
 
@@ -364,6 +412,35 @@ def check_daily_drawdown(bankroll: float) -> RiskCheck:
     return RiskCheck(True)
 
 
+def check_market_accepting_orders(signal: dict) -> RiskCheck:
+    """Skip signals on markets that explicitly aren't accepting orders.
+
+    Polymarket markets occasionally pause order acceptance (e.g. during
+    settlement disputes, contract upgrades, or temporary admin actions).
+    Hitting a paused market wastes a CLOB roundtrip and emits a confusing
+    error.  Default to True when the field is missing — so this guard
+    only blocks when the market explicitly opts out.
+
+    Two signals are checked: `accepting_orders` (per-market enable flag,
+    surfaced from Gamma's acceptingOrders field) and `enable_order_book`
+    (Gamma's enableOrderBook).  Both default True; either being False
+    blocks the signal.
+    """
+    accepting = signal.get("accepting_orders", True)
+    book_on   = signal.get("enable_order_book", True)
+    if not accepting:
+        return RiskCheck(
+            False,
+            f"Market not accepting orders (acceptingOrders=False) — paused upstream"
+        )
+    if not book_on:
+        return RiskCheck(
+            False,
+            f"Market order book disabled (enableOrderBook=False) — non-tradable"
+        )
+    return RiskCheck(True)
+
+
 def run_pre_checks(signal: dict, bankroll: float) -> tuple[bool, list[str]]:
     """
     Signal-level risk checks that are INDEPENDENT of portfolio state.
@@ -381,6 +458,7 @@ def run_pre_checks(signal: dict, bankroll: float) -> tuple[bool, list[str]]:
             signal.get("date", ""), signal.get("recommended_side", "")),
         check_position_size(signal.get("kelly_size", 0), bankroll),
         check_liquidity(signal.get("liquidity_usd", 0)),
+        check_market_accepting_orders(signal),
         check_daily_drawdown(bankroll),
         check_normalization_warning(signal),
         check_us_only(signal.get("lat"), signal.get("lon")),
@@ -428,6 +506,8 @@ def run_portfolio_checks(signal: dict, bankroll: float) -> tuple[bool, list[str]
     failures: list[str] = []
 
     checks = [
+        # Hard count cap fires first — cheapest check, blocks the most aggressively.
+        check_open_position_count(),
         check_bin_limit(signal.get("city", ""), signal.get("date", ""),
                         signal.get("recommended_side", "YES")),
         check_total_exposure(signal.get("kelly_size", 0), bankroll),

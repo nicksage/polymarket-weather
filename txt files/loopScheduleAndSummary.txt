@@ -101,7 +101,7 @@ Entry criteria:
 Exit criteria (evaluated in this order):
   1. TAKE_PROFIT: sell when market price reaches MPV_TAKE_PROFIT (e.g., 0.90)
   2. TOP_BIN_CONFIRMED: when any bin in the event hits MPV_CONFIRM_PRICE (e.g., 0.75), exit all other bins for that event
-  3. TRAILING_STOP: once price rises MPV_TRAIL_ACTIVATION above entry, a trailing stop activates at MPV_TRAIL_PCT below the peak price. The peak is tracked per-position via WebSocket in real-time.
+  3. TRAILING_STOP: once price rises TRAIL_ACTIVATION_GAIN above entry, a trailing stop activates using the TRAIL_TIERS table from config (each tier specifies "lo:hi:pct" — the trail % varies by where the peak sits in [0, 1]).  A single-row tier (e.g. 0.00:1.00:0.10) reproduces the legacy single-pct behavior.  The peak is tracked per-position via WebSocket in real-time.
   4. DYING: market price drops below EXIT_DYING_PROB_THRESHOLD
   5. HARD_STOP: fixed stop at entry * (1 - MPV_HARD_STOP_PCT) as fallback before the trailing stop activates
 
@@ -118,8 +118,8 @@ Configuration variables (in .env):
   MPV_MAX_PRICE=0.50           Maximum YES price to enter
   MPV_BET_SIZE=500             Flat dollar amount per bin
   MPV_TAKE_PROFIT=0.90         Exit when price reaches this level
-  MPV_TRAIL_PCT=0.12           Trailing stop percentage from peak
-  MPV_TRAIL_ACTIVATION=0.05    Price must rise this much above entry before trail activates
+  TRAIL_ACTIVATION_GAIN=0.10   ADDITIVE: peak must reach (entry + gain) before trail arms. Legacy MPV_TRAIL_ACTIVATION was multiplicative; for typical entries 0.20-0.30, MPV_TRAIL_ACTIVATION=0.40 ≈ TRAIL_ACTIVATION_GAIN=0.10
+  TRAIL_TIERS=0.00:1.00:0.10   Trail tiers as "lo:hi:pct" comma-separated; one row = single trail across [0,1]
   MPV_HARD_STOP_PCT=0.30       Fixed stop-loss from entry (fallback)
   MPV_CONFIRM_PRICE=0.75       Exit other bins when one bin hits this price
 

@@ -11,8 +11,9 @@ Entry rules:
   - Flat dollar sizing per bin (MPV_BET_SIZE)
 
 Exit rules:
-  - TRAILING_STOP: adaptive trail from peak price (MPV_TRAIL_PCT)
-    Trail activates once price rises MPV_TRAIL_ACTIVATION above entry.
+  - TRAILING_STOP: trail from peak price using the tier table in config
+    (TRAIL_TIERS).  Trail activates once price rises TRAIL_ACTIVATION_GAIN
+    above entry.
   - TAKE_PROFIT: sell when price reaches MPV_TAKE_PROFIT
   - TOP_BIN_CONFIRMED: when any bin hits >= MPV_CONFIRM_PRICE, exit others
   - DYING: market price drops below EXIT_DYING_PROB_THRESHOLD
@@ -46,8 +47,8 @@ MPV_MIN_PRICE = float(os.getenv("MPV_MIN_PRICE", "0.25"))
 MPV_MAX_PRICE = float(os.getenv("MPV_MAX_PRICE", "0.50"))
 MPV_BET_SIZE = float(os.getenv("MPV_BET_SIZE", "500"))
 MPV_TAKE_PROFIT = float(os.getenv("MPV_TAKE_PROFIT", "0.90"))
-MPV_TRAIL_PCT = float(os.getenv("MPV_TRAIL_PCT", "0.12"))
-MPV_TRAIL_ACTIVATION = float(os.getenv("MPV_TRAIL_ACTIVATION", "0.10"))
+# Trailing stop configuration moved to config.TRAIL_TIERS / TRAIL_ACTIVATION_GAIN
+# (single source of truth; see realtime_exits._evaluate_trail).
 MPV_HARD_STOP_PCT = float(os.getenv("MPV_HARD_STOP_PCT", "0.30"))
 MPV_CONFIRM_PRICE = float(os.getenv("MPV_CONFIRM_PRICE", "0.75"))
 MPV_TOP_BIN_ONLY = os.getenv("MPV_TOP_BIN_ONLY", "true").lower() in ("true", "1", "yes")
@@ -253,19 +254,117 @@ class MarketPriceValueStrategy(Strategy):
         self,
         signals: list[dict],
         bankroll: float,
+        client=None,
     ) -> list[dict]:
-        """Rank by market price (highest first) then by liquidity."""
+        """Orderbook-aware ranking — best fillability first.
+
+        Scoring (changed 2026-04-30; was: rank by raw market price):
+          1. Pre-rank by static `liquidity_usd` (free, no API).
+          2. Take top RANK_TOP_N_FOR_ORDERBOOK by that proxy.
+          3. For each, fetch the live orderbook (1 API call per candidate)
+             and compute:
+                spread_score = max(0, 10 - spread_cents)
+                                 1¢=9pts, 5¢=5pts, 10¢=0pts
+                depth_score  = min(sweepable_usdc / target_size, 1.0) × 10
+                                 0pts if no asks within walk window
+                                 10pts if we can fill the whole position from
+                                 asks within walk_cents of touch
+                priority     = spread_score + depth_score      # 0–20
+          4. Drop signals where spread_cents > MAX_SPREAD_CENTS_FOR_ENTRY
+             (default 4¢) — wide spread = thin book = bad entry.
+          5. Signals OUTSIDE the top N keep a low default score so they
+             can still execute if the top N all fail risk checks (rare).
+
+        `client` is optional — when None (e.g. paper mode, or test runs),
+        falls back to the static liquidity-only ranking.
+        """
+        from config import (
+            RANK_TOP_N_FOR_ORDERBOOK,
+            MAX_SPREAD_CENTS_FOR_ENTRY,
+            ORDERBOOK_WALK_CENTS,
+        )
+
+        # Step 1: pre-rank cheaply by static liquidity proxy
         for s in signals:
-            market_price = float(s.get("market_p") or s.get("market_price") or 0)
-            liquidity = float(s.get("liquidity_usd") or 0)
+            s["_static_liquidity"] = float(s.get("liquidity_usd") or 0)
+        signals.sort(key=lambda s: s["_static_liquidity"], reverse=True)
 
-            score = market_price * 100 + min(liquidity / 1000, 1.0)
+        # Step 2 + 3: orderbook lookup for top N
+        target_size = MPV_BET_SIZE
+        upgraded: set[int] = set()  # track which were re-scored with book data
 
-            s["priority_score"] = round(score, 4)
+        if client is not None:
+            from execution import get_orderbook_snapshot
+            for s in signals[:RANK_TOP_N_FOR_ORDERBOOK]:
+                token_id = s.get("yes_token_id")
+                if not token_id:
+                    continue
+                snap = get_orderbook_snapshot(client, token_id)
+                if snap is None:
+                    s["priority_score"] = -100  # couldn't probe; deprioritize
+                    s["priority_components"] = {"reason": "orderbook_fetch_failed"}
+                    upgraded.add(id(s))
+                    continue
+
+                spread_cents = snap["spread_cents"]
+                best_ask     = snap["best_ask"]
+
+                # Step 4: spread filter
+                if (MAX_SPREAD_CENTS_FOR_ENTRY > 0
+                        and spread_cents is not None
+                        and spread_cents > MAX_SPREAD_CENTS_FOR_ENTRY):
+                    s["priority_score"] = -1000   # block from execution
+                    s["priority_components"] = {
+                        "spread_cents":   spread_cents,
+                        "skip_reason":    f"spread {spread_cents}c > "
+                                          f"{MAX_SPREAD_CENTS_FOR_ENTRY}c cap",
+                    }
+                    upgraded.add(id(s))
+                    continue
+
+                # No-ask edge case — can't sweep what isn't there
+                if best_ask is None:
+                    s["priority_score"] = -50
+                    s["priority_components"] = {"reason": "no_asks"}
+                    upgraded.add(id(s))
+                    continue
+
+                # Sweepable depth: USDC value of asks within walk window
+                walk_limit = best_ask + ORDERBOOK_WALK_CENTS / 100.0
+                sweepable  = sum(
+                    p * sz for (p, sz) in snap["asks_sorted_asc"]
+                    if p <= walk_limit + 1e-9
+                )
+
+                spread_score = max(0.0, 10.0 - (spread_cents or 99))
+                depth_score  = min(sweepable / max(target_size, 1.0), 1.0) * 10.0
+                score        = spread_score + depth_score   # 0..20
+
+                s["priority_score"] = round(score, 4)
+                s["priority_components"] = {
+                    "spread_cents":     spread_cents,
+                    "best_ask":         best_ask,
+                    "sweepable_usdc":   round(sweepable, 2),
+                    "spread_score":     round(spread_score, 2),
+                    "depth_score":      round(depth_score, 2),
+                }
+                upgraded.add(id(s))
+
+        # Step 5: signals not upgraded fall back to a static-liquidity score
+        # in the 0..1 range — always lower than any orderbook-scored signal,
+        # so they only execute if all top-N got filtered out.
+        for s in signals:
+            if id(s) in upgraded:
+                continue
+            s["priority_score"] = round(min(s["_static_liquidity"] / 100_000, 1.0), 4)
             s["priority_components"] = {
-                "market_price": round(market_price, 4),
-                "liquidity": round(liquidity, 0),
+                "static_liquidity": round(s["_static_liquidity"], 0),
+                "reason": f"outside_top_{RANK_TOP_N_FOR_ORDERBOOK}",
             }
+
+        # Cleanup transient field
+        for s in signals:
+            s.pop("_static_liquidity", None)
 
         signals.sort(key=lambda s: s.get("priority_score", 0), reverse=True)
         return signals
@@ -369,13 +468,22 @@ class MarketPriceValueStrategy(Strategy):
                              urgency=0)
 
         # ---- 3. TRAILING STOP ----
-        if peak_price >= entry_price * (1 + MPV_TRAIL_ACTIVATION):
-            trail_level = peak_price * (1 - MPV_TRAIL_PCT)
-            if _price <= trail_level:
-                return _make("TRAILING_STOP", "SELL",
-                             f"price={_price:.4f} <= trail={trail_level:.4f} "
-                             f"(peak={peak_price:.4f}, {MPV_TRAIL_PCT:.0%} trail)",
-                             urgency=0)
+        # Single source of truth: realtime_exits._evaluate_trail wraps
+        # bot.trailing_stop.evaluate_trailing_stop with the configured
+        # tier table.  Same call from realtime_exits._check_mpv_exits so
+        # the strategy and the WS price stream can't drift apart.
+        from realtime_exits import _evaluate_trail as _shared_evaluate_trail
+        trail_decision = _shared_evaluate_trail(entry_price, peak_price, _price)
+        if trail_decision is not None:
+            trail_level, _tag = trail_decision
+            from trailing_stop import lookup_trail_pct
+            from config import TRAIL_TIERS as _tiers
+            _tier_pct = lookup_trail_pct(peak_price, _tiers) or 0.0
+            _reason = (
+                f"price={_price:.4f} <= trail={trail_level:.4f} "
+                f"(peak={peak_price:.4f}, tier={_tier_pct:.0%} trail)"
+            )
+            return _make("TRAILING_STOP", "SELL", _reason, urgency=0)
 
         # ---- 4. DYING ----
         if _price < EXIT_DYING_PROB_THRESHOLD:

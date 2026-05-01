@@ -240,6 +240,24 @@ def _normalize_sub_market(raw: dict, event_title: str) -> dict | None:
         # edge.py will skip probability computation for unparseable ranges but
         # will still display the market price and contract metadata.
 
+        # New fields surfaced for risk gating + accurate execution.  Default to
+        # permissive values so an absent/legacy field never accidentally
+        # blocks a trade — the operator can rely on these, but old cached
+        # market dicts won't crash anything that reads them.
+        accepting_orders   = bool(raw.get("acceptingOrders", True))
+        enable_order_book  = bool(raw.get("enableOrderBook", True))
+        neg_risk           = bool(raw.get("negRisk", False))
+        neg_risk_market_id = raw.get("negRiskMarketID") or ""
+        tick_size          = raw.get("orderPriceMinTickSize")
+        try:
+            tick_size = float(tick_size) if tick_size is not None else None
+        except (TypeError, ValueError):
+            tick_size = None
+        # feeSchedule (Mar 2026) carries per-market maker/taker bps.  Stored
+        # raw — extract_fee_amount in execution.py already handles fee math
+        # at fill time; this is an at-discovery snapshot for diagnostics.
+        fee_schedule = raw.get("feeSchedule") or {}
+
         return {
             "contract_id":      raw.get("conditionId") or raw.get("id"),
             "gamma_market_id":  str(raw.get("id", "")),   # numeric Gamma ID for /markets/{id} lookups
@@ -254,6 +272,12 @@ def _normalize_sub_market(raw: dict, event_title: str) -> dict | None:
             "liquidity_usd":    liquidity,
             "volume_usd":       volume,
             "resolution_date":  raw.get("endDate") or raw.get("resolutionDate", ""),
+            "accepting_orders": accepting_orders,
+            "enable_order_book":enable_order_book,
+            "neg_risk":         neg_risk,
+            "neg_risk_market_id": neg_risk_market_id,
+            "tick_size":        tick_size,
+            "fee_schedule":     fee_schedule,
         }
     except (KeyError, ValueError, TypeError, _json.JSONDecodeError) as e:
         logger.debug(f"Failed to normalize sub-market: {e}")
@@ -681,14 +705,19 @@ def get_data_api_positions(wallet_address: str) -> list[dict]:
 
     Returns a list of position dicts with keys:
         token_id, title, outcome, size, avg_price,
-        initial_value, current_value, cash_pnl, percent_pnl
+        initial_value, current_value, cash_pnl, percent_pnl,
+        condition_id, end_date, negative_risk
+
+    NOTE: as of 2026-04-29 the Data API uses `user` (not `address`) for the
+    wallet param, and returns `asset` as a top-level string (not a nested
+    dict).  Both bugs surfaced when running live for the first time.
     """
     if not wallet_address:
         return []
     try:
         resp = httpx.get(
             "https://data-api.polymarket.com/positions",
-            params={"address": wallet_address, "sizeThreshold": "0"},
+            params={"user": wallet_address, "sizeThreshold": "0"},
             timeout=15,
         )
         resp.raise_for_status()
@@ -697,17 +726,29 @@ def get_data_api_positions(wallet_address: str) -> list[dict]:
             return []
         result = []
         for p in raw:
-            asset = p.get("asset", {})
+            # `asset` is a top-level string (the ERC-1155 token id).  Older
+            # versions of the API nested it under `asset.token_id`; we keep
+            # a fallback so a future revert doesn't blow up parsing.
+            asset_field = p.get("asset")
+            if isinstance(asset_field, dict):
+                token_id = asset_field.get("token_id") or ""
+                outcome  = asset_field.get("outcome") or p.get("outcome") or ""
+            else:
+                token_id = asset_field or p.get("asset_id") or ""
+                outcome  = p.get("outcome") or ""
             result.append({
-                "token_id":      asset.get("token_id") or p.get("asset_id", ""),
+                "token_id":      str(token_id),
                 "title":         p.get("title", ""),
-                "outcome":       asset.get("outcome", ""),
+                "outcome":       outcome,
                 "size":          float(p.get("size", 0)),
                 "avg_price":     float(p.get("avgPrice", 0)),
                 "initial_value": float(p.get("initialValue", 0)),
                 "current_value": float(p.get("currentValue", 0)),
                 "cash_pnl":      float(p.get("cashPnl", 0)),
                 "percent_pnl":   float(p.get("percentPnl", 0)),
+                "condition_id":  p.get("conditionId", ""),
+                "end_date":      p.get("endDate", ""),
+                "negative_risk": bool(p.get("negativeRisk", False)),
             })
         logger.info(f"Data API: fetched {len(result)} on-chain positions for {wallet_address[:10]}...")
         return result
