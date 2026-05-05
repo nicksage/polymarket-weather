@@ -296,6 +296,13 @@ def init_db():
             # add_position_exit_fill to compute weighted-average exit price
             # and final pnl when a multi-chunk exit completes.  Default 0.
             "ALTER TABLE positions ADD COLUMN exit_proceeds_usdc REAL DEFAULT 0",
+            # Counter for consecutive monitor cycles where this position
+            # was flagged as orphan_db (DB has shares, chain has none).
+            # Used by the auto-close gate: only positions orphaned for >=
+            # ORPHAN_DB_AUTO_CLOSE_CYCLES cycles get auto-closed, so a
+            # single Data API hiccup can't close real positions.  Reset
+            # to 0 whenever the chain shows shares again.  Default 0.
+            "ALTER TABLE positions ADD COLUMN orphan_db_cycles INTEGER DEFAULT 0",
         ]:
             try:
                 conn.execute(col_def)

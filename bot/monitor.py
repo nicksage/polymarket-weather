@@ -191,6 +191,13 @@ def _cancel_pending_orders(client) -> int:
     now = _now()
     now_dt = datetime.fromisoformat(now)
     skipped_too_young = 0
+    skipped_ensure_fill = 0
+
+    # Strategies whose entry orders must ultimately fill (not abandoned).
+    # For these, the stale-entry repricer (run_stale_tkh_entry_refresh_fast)
+    # cancels-and-replaces at the new best_ask instead of the cancel sweep
+    # marking them dead.
+    _ENSURE_FILL_STRATEGIES = {"top_k_hedged"}
 
     for pos in pending:
         pos_id   = pos["id"]
@@ -199,6 +206,21 @@ def _cancel_pending_orders(client) -> int:
         date     = pos.get("date", "")
         contract = pos.get("contract_id", "")[:12]
         entry    = pos.get("entry_time") or ""
+        strategy = (pos.get("strategy") or "").strip()
+
+        # Ensure-fill strategies (TKH): NEVER abandon a pending entry.
+        # The stale-entry repricer chases the moving best_ask until the
+        # order crosses; without this exemption the monitor would mark
+        # a TKH bin "cancelled" the moment the market drifted past our
+        # limit, and TKH per-event dedup would lock out re-entry.
+        if strategy in _ENSURE_FILL_STRATEGIES:
+            skipped_ensure_fill += 1
+            logger.debug(
+                f"[MONITOR] Skipping cancel of pos={pos_id} {city} {date} "
+                f"{contract} -- strategy={strategy} is ensure-fill "
+                f"(handled by stale-entry repricer instead)"
+            )
+            continue
 
         # Age check — skip orders too young to be presumed dead.  Without
         # this, the inline monitor that runs ~5s after trading_run would
@@ -250,6 +272,11 @@ def _cancel_pending_orders(client) -> int:
         logger.info(
             f"[MONITOR] Cancel pass skipped {skipped_too_young} order(s) younger "
             f"than {MIN_ORDER_AGE_BEFORE_CANCEL_MIN}m — they'll be re-evaluated next cycle"
+        )
+    if skipped_ensure_fill > 0:
+        logger.info(
+            f"[MONITOR] Cancel pass skipped {skipped_ensure_fill} ensure-fill order(s) "
+            f"(TKH etc.) -- handled by the stale-entry repricer"
         )
     return cancelled
 
@@ -713,6 +740,14 @@ def _advance_exit_ladders(client) -> int:
                     f"[MONITOR] pos={pid} ladder advance superseded by "
                     f"balance-mismatch self-heal: {status}"
                 )
+            elif status == "skip":
+                # Intentional skip from a gate inside execute_exit (let-it-decay
+                # price floor or dust-shares floor).  Not an error -- the
+                # position will be auto-closed when chain catches up.
+                logger.info(
+                    f"[MONITOR] pos={pid} ladder advance skipped: "
+                    f"{result.get('reason','?')} ({result})"
+                )
             else:
                 logger.warning(
                     f"[MONITOR] pos={pid} ladder advance failed: {result}"
@@ -1067,6 +1102,667 @@ def run_stale_topup_refresh_fast() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Aggressive REST trade-fill polling (Option A — WS replacement).
+#
+# Polymarket's user-channel WebSocket has been confirmed degraded:
+# connections succeed but trade events never arrive.  Until that's
+# resolved upstream, the only authoritative path for fills is REST.
+# The hourly safety-net poll (`_reconcile_pending_fills`) catches
+# eventually, but a 1-hour latency on fills creates:
+#   - drift snapshots in every monitor cycle (DB lags chain by up to 60min)
+#   - stale dashboard P&L between fills and reconciliation
+#   - delayed exit decisions (TAKE_PROFIT etc fire on stale `current_price`)
+#
+# This polling job runs every 2 minutes and pulls fresh trades from
+# Polymarket via `client.get_trades(TradeParams(market, asset_id))` for
+# every (market, token) pair we have an open position on.  Each new trade
+# is dedup'd via `mark_event_processed(event.id)` and applied via the
+# SAME `apply_trade_event` handler the WS uses -- so no path divergence,
+# no double-counting if WS ever recovers.
+#
+# Cost: ~30 unique tokens × 30 polls/hour = 900 API calls/hour, well
+# below CLOB's ~6 req/s rate limit (~21,600/hour).
+# ---------------------------------------------------------------------------
+
+_poll_trade_fills_lock = _threading.Lock()
+
+
+def poll_trade_fills_via_get_trades(client) -> dict:
+    """Pull fresh trades for every active (market, token) pair and apply
+    any new chunks via apply_trade_event.  Returns a dict of counts."""
+    if PAPER_TRADE or client is None:
+        return {"polled_pairs": 0, "trades_seen": 0, "trades_applied": 0,
+                "buys": 0, "sells": 0, "topups": 0, "duplicates": 0,
+                "no_position": 0}
+
+    if not _poll_trade_fills_lock.acquire(blocking=False):
+        logger.debug(
+            "[POLL-FILLS] poll_trade_fills_via_get_trades already running"
+            " -- skipping invocation"
+        )
+        return {"polled_pairs": 0, "trades_seen": 0, "trades_applied": 0,
+                "buys": 0, "sells": 0, "topups": 0, "duplicates": 0,
+                "no_position": 0, "lock_busy": True}
+
+    counts = {
+        "polled_pairs":   0,
+        "trades_seen":    0,
+        "trades_applied": 0,
+        "buys":           0,
+        "sells":          0,
+        "topups":         0,
+        "duplicates":     0,
+        "no_position":    0,
+        "errors":         0,
+    }
+    try:
+        from db import _get_conn
+        from fill_handler import apply_trade_event
+        from py_clob_client_v2.clob_types import TradeParams
+
+        # Gather unique (market, token_id) pairs across every position with
+        # a live or recently-active footprint.  Includes:
+        #   - status='open' rows (entry, topup, exit-in-flight)
+        #   - status='exiting' rows (sell ladder mid-flight)
+        # Excludes paper rows.
+        with _get_conn() as conn:
+            rows = conn.execute("""
+                SELECT DISTINCT contract_id, side, yes_token_id, no_token_id
+                FROM positions
+                WHERE status IN ('open', 'exiting')
+                  AND COALESCE(is_paper, 0) = 0
+                  AND contract_id IS NOT NULL
+            """).fetchall()
+
+        # Build token list (deduped).  YES and NO tokens for the same
+        # market are different tokens -- include whichever side(s) we
+        # actually hold positions on.
+        pairs: set[tuple[str, str]] = set()
+        for r in rows:
+            market = r["contract_id"]
+            side   = r["side"] or "YES"
+            tok    = (r["yes_token_id"] if side == "YES"
+                      else r["no_token_id"])
+            if market and tok:
+                pairs.add((market, tok))
+
+        if not pairs:
+            return counts
+
+        # Wallet address used by apply_trade_event to disambiguate
+        # maker_orders -- pass it through as the WS path does.
+        my_wallet = (WALLET_ADDRESS or "").lower() or None
+
+        for (market, token_id) in pairs:
+            counts["polled_pairs"] += 1
+            try:
+                trades = client.get_trades(
+                    params=TradeParams(market=market, asset_id=token_id),
+                    only_first_page=False,
+                ) or []
+            except Exception as e:
+                counts["errors"] += 1
+                logger.warning(
+                    f"[POLL-FILLS] get_trades failed for "
+                    f"market={market[:12]} token={token_id[:14]}: {e}"
+                )
+                continue
+
+            for t in trades:
+                counts["trades_seen"] += 1
+                # Synthesize the event shape apply_trade_event expects.
+                # get_trades returns confirmed trades by definition (they
+                # wouldn't appear in /trades otherwise), so status='confirmed'.
+                event = dict(t)
+                event["status"] = "confirmed"
+                # Ensure the dedup id is present; Polymarket's trade dict
+                # carries it as 'id'.  If missing (defensive), synthesize
+                # from order_id + size to make duplicates collide.
+                if not event.get("id"):
+                    event["id"] = (
+                        f"trade:{event.get('taker_order_id','?')}:"
+                        f"{event.get('size','?')}:{event.get('price','?')}"
+                    )
+
+                result = apply_trade_event(event, my_wallet=my_wallet)
+                action = result.get("action", "")
+                if action == "filled":
+                    counts["trades_applied"] += 1
+                    role = (result.get("role") or "").lower()
+                    if   role == "entry": counts["buys"]   += 1
+                    elif role == "exit":  counts["sells"]  += 1
+                    elif role == "topup": counts["topups"] += 1
+                elif action == "ignored_duplicate_event":
+                    counts["duplicates"] += 1
+                elif action in ("ignored_no_position", "ignored_no_order_id"):
+                    counts["no_position"] += 1
+
+        if counts["trades_applied"] > 0:
+            logger.log(SUMMARY_LEVEL,
+                f"[POLL-FILLS] applied {counts['trades_applied']} new fill(s) "
+                f"({counts['buys']} buy, {counts['sells']} sell, "
+                f"{counts['topups']} topup) across "
+                f"{counts['polled_pairs']} token(s); "
+                f"{counts['duplicates']} dedup'd, "
+                f"{counts['no_position']} foreign"
+            )
+        return counts
+    finally:
+        _poll_trade_fills_lock.release()
+
+
+def run_trade_fill_poll_fast() -> dict:
+    """Fast-cycle wrapper for the */2 minute APScheduler job."""
+    if PAPER_TRADE:
+        return {}
+    try:
+        from execution import get_clob_client
+        client = get_clob_client()
+        if client is None:
+            return {}
+        return poll_trade_fills_via_get_trades(client)
+    except Exception as e:
+        logger.exception(
+            f"run_trade_fill_poll_fast failed (non-fatal): {e}"
+        )
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Stale ENTRY-ORDER repricer for ensure-fill strategies (TKH).
+#
+# TKH places its hedged-bin entries at best_ask + 1¢ as marketable BUYs.
+# When the ask drifts up before our order matches, the order rests below
+# the new best_ask and never crosses.  The legacy monitor sweep would
+# then mark the position cancelled, abandoning the bin and (worse)
+# locking the event out of re-entry forever via TKH per-event dedup.
+#
+# This refresher is the entry-order analogue of refresh_stale_topups:
+# detect upward drift past ENTRY_REPRICE_THRESHOLD_CENTS, cancel the
+# stale CLOB order WITHOUT triggering the position-cancel cleanup
+# (which would mark the row dead), and re-place at the new best_ask + 1¢.
+# The position row is then UPDATED in place with the new order_id /
+# entry_price / entry_time, so target_size_usdc, ledger linkage, and
+# event dedup all remain consistent.
+#
+# Idempotent across concurrent invocations via an internal lock.
+# ---------------------------------------------------------------------------
+
+_refresh_stale_entries_lock = _threading.Lock()
+
+# Strategies whose entry orders must keep being chased until they fill
+# (matches the same set in _cancel_pending_orders).
+_ENSURE_FILL_STRATEGIES = {"top_k_hedged"}
+
+
+def _capture_partial_fills_before_cancel(
+    client, *, position_id: int, contract_id: str,
+    token_id: str, old_oid: str,
+) -> tuple[float, float, float]:
+    """Reconcile any silent partial fills on `old_oid` BEFORE cancelling.
+
+    Race we're closing: between the snapshot get_order_status() reading
+    and the actual cancel arriving at Polymarket, additional asks can
+    cross our resting order.  Those fills are real on chain but their
+    trade-event WS deliveries may be silently lost (the bot's user
+    channel was confirmed degraded -- "REST is doing 100% of fills").
+    Without this reconciliation, the ledger marks the cancelled row as
+    filled=$0 even though chain holds N shares.  When the repricer then
+    re-places the FULL gap, the new order's fill stacks on top of the
+    silent partial -> over-allocation (the New York pid=107 bug).
+
+    Algorithm:
+      1. Fetch all trades for (market=contract_id, asset_id=token_id)
+         from the CLOB REST endpoint.
+      2. Filter to trades whose taker_order_id OR any maker_orders[].order_id
+         matches `old_oid`.
+      3. For each matching trade event with an `id` we haven't yet
+         processed, dedupe via mark_event_processed and apply via
+         add_position_entry_fill.  This mirrors the WS path exactly,
+         so a late-arriving WS event for the same trade is a no-op.
+      4. Return (total_filled_shares, total_filled_usdc, weighted_avg_price)
+         so the caller can record them on the cancelled ledger row.
+
+    Returns (0.0, 0.0, 0.0) on any failure -- safer to fall back to the
+    pre-fix behaviour (treat the cancel as fully-unfilled) than to risk
+    misreporting partials.  Worst case: we re-introduce the original
+    over-allocation, which the repair_share_drift script can clean up.
+    """
+    if client is None or not old_oid or not token_id or not contract_id:
+        return 0.0, 0.0, 0.0
+    try:
+        from py_clob_client_v2.clob_types import TradeParams
+        trades = client.get_trades(
+            params=TradeParams(market=contract_id, asset_id=token_id),
+            only_first_page=False,
+        ) or []
+    except Exception as e:
+        logger.warning(
+            f"[REPRICE-ENTRY] pid={position_id} get_trades for partial-fill "
+            f"reconciliation raised: {e}; treating as no-fill"
+        )
+        return 0.0, 0.0, 0.0
+
+    from db import mark_event_processed, add_position_entry_fill
+
+    total_shares = 0.0
+    total_usdc   = 0.0
+    n_chunks_applied = 0
+    for t in trades:
+        # Match: this trade's taker_order_id is ours, OR one of the
+        # maker_orders is ours.  Same matching logic as
+        # execution.backfill_position_fees.
+        taker_oid = t.get("taker_order_id") or ""
+        is_match = (taker_oid == old_oid)
+        if not is_match:
+            for mo in (t.get("maker_orders") or []):
+                if mo.get("order_id") == old_oid:
+                    is_match = True
+                    break
+        if not is_match:
+            continue
+
+        try:
+            sz    = float(t.get("size") or 0)
+            price = float(t.get("price") or 0)
+        except (TypeError, ValueError):
+            continue
+        if sz <= 0 or price <= 0:
+            continue
+
+        # Dedup at trade-event level using the same table the WS path uses.
+        # If this trade's event has already been processed (e.g. WS delivered
+        # it before we ran), skip — the position row is already up-to-date
+        # for this chunk, so we just need to count it for the ledger total.
+        evt_id = t.get("id") or ""
+        is_first_time = mark_event_processed(evt_id) if evt_id else True
+
+        if is_first_time:
+            # WS hadn't delivered this -- apply it now so the position
+            # row reflects the partial fill.
+            try:
+                add_position_entry_fill(
+                    position_id  = position_id,
+                    added_shares = sz,
+                    fill_price   = price,
+                )
+                n_chunks_applied += 1
+            except Exception as e:
+                logger.warning(
+                    f"[REPRICE-ENTRY] pid={position_id} add_position_entry_fill "
+                    f"failed for trade chunk size={sz} price={price}: {e}"
+                )
+                # Don't include this chunk in totals if we couldn't apply
+                # it — keeps ledger / position row consistent.
+                continue
+
+        # Always count toward ledger totals (whether or not WS already
+        # applied it to the position row, the ledger row needs to reflect
+        # the order's actual filled amount).
+        total_shares += sz
+        total_usdc   += sz * price
+
+    if total_shares > 0 or n_chunks_applied > 0:
+        avg_price = (total_usdc / total_shares) if total_shares > 0 else 0.0
+        logger.warning(
+            f"[REPRICE-ENTRY] pid={position_id} captured silent partial fills "
+            f"on cancelled order {old_oid[:14]}: {total_shares:.4f} shares "
+            f"@ avg ${avg_price:.4f} = ${total_usdc:.2f} "
+            f"({n_chunks_applied} chunk(s) applied to position row)"
+        )
+        try:
+            from activity import log_activity
+            log_activity(
+                "FILL", level="WARN", position_id=position_id,
+                message=(
+                    f"silent partial fill recovered before reprice cancel: "
+                    f"{total_shares:.4f} sh @ ${avg_price:.4f} "
+                    f"= ${total_usdc:.2f}"
+                ),
+                source="reprice_partial_fill_capture",
+                old_order_id=old_oid,
+                filled_shares=total_shares,
+                filled_usdc=total_usdc,
+                avg_price=avg_price,
+                chunks_applied=n_chunks_applied,
+            )
+        except Exception:
+            pass
+
+    avg_price = (total_usdc / total_shares) if total_shares > 0 else 0.0
+    return total_shares, total_usdc, avg_price
+
+
+def refresh_stale_ensure_fill_entries(client) -> int:
+    """Cancel + re-issue ensure-fill (TKH) entry orders whose resting
+    limit has fallen behind the live best_ask.  Returns count repriced."""
+    if PAPER_TRADE or client is None:
+        return 0
+
+    from db import _get_conn
+    from execution import get_orderbook_snapshot, compute_sweep_limit
+    from config import ORDERBOOK_WALK_CENTS
+
+    # Reprice threshold (cents) — re-place when ask drifted up by at least
+    # this many cents.  Uses the same env var as topup repricing so the
+    # operator only has one knob to tune.
+    import os
+    THRESHOLD = float(os.getenv("ENTRY_REPRICE_THRESHOLD_CENTS",
+                                os.getenv("TOPUP_REPRICE_THRESHOLD_CENTS", "1.5")))
+    if THRESHOLD <= 0:
+        return 0
+
+    if not _refresh_stale_entries_lock.acquire(blocking=False):
+        logger.debug(
+            "[REPRICE-ENTRY] refresh_stale_ensure_fill_entries already running -- skipping invocation"
+        )
+        return 0
+    try:
+        # Pull all live entries belonging to ensure-fill strategies that
+        # could still have resting capacity on their original entry order.
+        # Two flavours qualify:
+        #   - fill_status='pending' AND shares=0   -> fully unfilled (no chunks landed yet)
+        #   - fill_status='filled'  AND shares>0   -> partial fill landed,
+        #                                              but original order may
+        #                                              still have a resting
+        #                                              remainder we need to chase.
+        # The CLOB get_order_status check below filters out fully-filled
+        # rows (no resting capacity → nothing to reprice).
+        strategy_placeholders = ",".join("?" * len(_ENSURE_FILL_STRATEGIES))
+        with _get_conn() as conn:
+            rows = [dict(r) for r in conn.execute(f"""
+                SELECT id, contract_id, side, yes_token_id, no_token_id,
+                       order_id, entry_price, entry_time, size_usdc, shares,
+                       target_size_usdc, strategy, city, date
+                FROM positions
+                WHERE strategy IN ({strategy_placeholders})
+                  AND status = 'open'
+                  AND fill_status IN ('pending', 'filled')
+                  AND COALESCE(is_paper, 0) = 0
+                  AND order_id IS NOT NULL
+            """, tuple(_ENSURE_FILL_STRATEGIES)).fetchall()]
+
+        if not rows:
+            return 0
+
+        from py_clob_client_v2 import OrderArgs, OrderType, Side
+        from execution import get_order_status
+        from db import get_committed_usdc, update_position_order_status, insert_position_order
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+
+        repriced = 0
+        skipped_drift = 0
+        skipped_no_resting = 0
+        for pos in rows:
+            pid       = pos["id"]
+            old_oid   = pos["order_id"]
+            old_limit = float(pos.get("entry_price") or 0)
+            side      = pos.get("side", "YES")
+            token_id  = (pos.get("yes_token_id") if side == "YES"
+                         else pos.get("no_token_id"))
+            cur_shares  = float(pos.get("shares") or 0)
+            target      = float(pos.get("target_size_usdc") or pos.get("size_usdc") or 0)
+            if not token_id or old_limit <= 0 or target <= 0:
+                continue
+
+            # ---- Determine if the OLD entry order still has resting
+            # capacity on the book.  This is the bridge between "no fill"
+            # and "partial fill" cases — both need repricing iff the
+            # original order is still LIVE/MATCHED with size_matched <
+            # original_size.  A fully-filled or already-cancelled order
+            # has no resting capacity and is skipped silently.
+            order_stat = get_order_status(old_oid, client)
+            if order_stat is None:
+                # CLOB query failed — safer to skip this cycle than risk
+                # double-placement.  Next 5-min tick will retry.
+                continue
+            stat_str = (order_stat.get("status") or "").upper()
+            sz_match = float(order_stat.get("size_matched") or 0)
+            sz_orig  = float(order_stat.get("original_size") or order_stat.get("size") or 0)
+            has_resting = (
+                stat_str in ("LIVE", "MATCHED", "DELAYED", "PARTIAL")
+                and sz_orig > 0
+                and sz_match < sz_orig - 1e-9
+            )
+            if not has_resting:
+                skipped_no_resting += 1
+                continue
+
+            # Fresh book check — skip silently when book is unavailable.
+            snap = get_orderbook_snapshot(client, token_id)
+            if snap is None or snap.get("best_ask") is None:
+                continue
+            best_ask = float(snap["best_ask"])
+
+            # Direction-aware drift: only fire when ask moved UP.  If ask
+            # came DOWN to or past our limit, Polymarket's matcher fills
+            # us at the cheaper price — no action needed.
+            drift_cents = (best_ask - old_limit) * 100
+            if drift_cents <= THRESHOLD + 1e-6:
+                skipped_drift += 1
+                continue
+
+            # ---- Step 0: Capture any silent partial fills BEFORE cancel.
+            # Closes the race where chunks crossed our resting order
+            # between the get_order_status snapshot and the cancel arriving
+            # at Polymarket.  Without this the ledger marks the cancel as
+            # filled=$0 even though chain holds N shares -> the new order
+            # below stacks on top -> over-allocation (the New York pid=107
+            # bug).  Helper applies any unprocessed chunks to the position
+            # row and returns the totals to record on the ledger.
+            cid = pos.get("contract_id") or ""
+            partial_shares, partial_usdc, partial_avg = (
+                _capture_partial_fills_before_cancel(
+                    client,
+                    position_id = pid,
+                    contract_id = cid,
+                    token_id    = token_id,
+                    old_oid     = old_oid,
+                )
+            )
+
+            # ---- Step 1: Cancel old CLOB order WITHOUT touching position row.
+            # We deliberately bypass execution.cancel_order() because its
+            # built-in entry-order cleanup would mark fill_status='cancelled'
+            # / status='closed', killing the bin we're trying to keep alive.
+            try:
+                resp = client.cancel_orders([old_oid])
+                if not resp:
+                    logger.warning(
+                        f"[REPRICE-ENTRY] pid={pid} cancel returned falsy -- skipping"
+                    )
+                    continue
+            except Exception as e:
+                logger.error(f"[REPRICE-ENTRY] pid={pid} cancel raised: {e}")
+                continue
+
+            # Mark the OLD ledger row terminal so committed_usdc reflects
+            # reality: any partial fill we captured stays counted as
+            # filled (NOT cancelled), and only the resting remainder is
+            # released.  When committed = filled_chunks + new_pending,
+            # the gap calc below correctly subtracts the partial before
+            # placing the replacement order.
+            try:
+                update_position_order_status(
+                    order_id         = old_oid,
+                    status           = "cancelled",
+                    filled_shares    = (partial_shares if partial_shares > 0 else None),
+                    filled_usdc      = (round(partial_usdc, 4) if partial_usdc > 0 else None),
+                    fill_price       = (partial_avg if partial_avg > 0 else None),
+                    cancelled_reason = "repriced_by_stale_entry_refresh",
+                    closed           = True,
+                )
+            except Exception as _e:
+                logger.debug(f"[REPRICE-ENTRY] ledger cancel-mark failed: {_e}")
+
+            # ---- Step 2: Compute new sweep limit at current ask + walk.
+            # Cap at 0.99 (Polymarket's max BUY price).
+            new_limit = round(min(best_ask + ORDERBOOK_WALK_CENTS / 100.0, 0.99), 4)
+
+            # ---- Compute intended size as the REMAINING gap.
+            # For a fully-unfilled row (shares==0), committed after the
+            # cancel is ~0 → intended_size = full target.  For a partial
+            # fill, committed after the cancel is just the filled portion
+            # (~size_usdc of the parent) → intended_size = target - filled.
+            committed_after_cancel = get_committed_usdc(pid)
+            intended_size = round(max(0.0, target - committed_after_cancel), 2)
+            if intended_size < 1.0:
+                logger.info(
+                    f"[REPRICE-ENTRY] pid={pid} {pos.get('city','?')} "
+                    f"{pos.get('date','?')} remaining gap "
+                    f"${intended_size:.2f} < $1 minimum -- bin already "
+                    f"satisfied (target=${target:.2f}, committed="
+                    f"${committed_after_cancel:.2f}); skipping re-place"
+                )
+                continue
+
+            # ---- Step 3: Place the new order.
+            try:
+                order_args = OrderArgs(
+                    price    = new_limit,
+                    size     = intended_size / new_limit,
+                    side     = Side.BUY,
+                    token_id = token_id,
+                )
+                response = client.create_and_post_order(order_args, order_type=OrderType.GTC)
+            except Exception as e:
+                logger.error(
+                    f"[REPRICE-ENTRY] pid={pid} {pos.get('city','?')} "
+                    f"{pos.get('date','?')} placement raised: {e}"
+                )
+                # Position row still has fill_status='pending' but its
+                # order_id now points at a dead order.  Next cycle of THIS
+                # refresher will retry (the SELECT only requires order_id
+                # not null — a stale id is fine since it'll be cancelled
+                # again as a no-op).  Better: clear the order_id so the
+                # next trading_run picks the bin up via topup once filled
+                # share count is positive (it's not, here, so just retry).
+                continue
+
+            if not response or not response.get("success"):
+                logger.error(
+                    f"[REPRICE-ENTRY] pid={pid} {pos.get('city','?')} "
+                    f"{pos.get('date','?')} re-place FAILED -- response={response}"
+                )
+                continue
+
+            new_oid = response.get("orderID", "")
+            new_entry_time = _dt.now(_ZI("America/Chicago")).isoformat()
+            # Treat as partial-fill if EITHER cur_shares (the row's pre-capture
+            # snapshot) was > 0 OR the partial-fill capture above just added
+            # shares to the row.  Without the second clause, a silent partial
+            # fill caught by the capture would be erroneously treated as a
+            # no-fill and overwrite entry_price/fill_status, blowing away the
+            # weighted-avg cost basis we just established.
+            is_partial_fill = (cur_shares > 0) or (partial_shares > 0)
+
+            # ---- Step 4: Update the position row in place.
+            #
+            # Two flavours, branching on whether ANY shares have already
+            # confirmed for this position:
+            #
+            # No-fill (cur_shares == 0):
+            #     The original entry never crossed.  Replace order_id,
+            #     entry_price, entry_time; fill_status stays 'pending'.
+            #
+            # Partial-fill (cur_shares > 0):
+            #     The first chunk(s) already landed at the original ask.
+            #     entry_price is the weighted-avg cost basis of the
+            #     filled chunks -- DO NOT overwrite.  fill_status is
+            #     already 'filled' and must stay that way.  We only swap
+            #     the order_id (so the next fill chunk routes to this
+            #     position via apply_order_event) and update entry_time
+            #     to mark the latest re-issue.
+            with _get_conn() as conn:
+                if is_partial_fill:
+                    conn.execute(
+                        "UPDATE positions SET order_id = ?, entry_time = ? "
+                        "WHERE id = ?",
+                        (new_oid, new_entry_time, pid),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE positions SET order_id = ?, entry_price = ?, "
+                        "entry_time = ?, fill_status = 'pending' "
+                        "WHERE id = ?",
+                        (new_oid, new_limit, new_entry_time, pid),
+                    )
+
+            # ---- Step 5: Insert new ledger row for the replacement order.
+            try:
+                insert_position_order(
+                    position_id     = pid,
+                    order_id        = new_oid,
+                    role            = "entry",
+                    intended_usdc   = intended_size,
+                    intended_shares = intended_size / new_limit,
+                    limit_price     = new_limit,
+                    status          = "pending",
+                    trade_status    = None,
+                )
+            except Exception as _e:
+                logger.debug(f"[REPRICE-ENTRY] ledger insert failed: {_e}")
+
+            repriced += 1
+            kind = "partial-fill remainder" if is_partial_fill else "no-fill entry"
+            logger.warning(
+                f"[REPRICE-ENTRY] pid={pid} {pos.get('city','?')} "
+                f"{pos.get('date','?')} {kind} re-placed: "
+                f"old_limit=${old_limit:.4f}, new_ask=${best_ask:.4f}, "
+                f"drift={drift_cents:.1f}c, new_limit=${new_limit:.4f}, "
+                f"gap=${intended_size:.2f}, new_order={new_oid[:12]}"
+            )
+            try:
+                from activity import log_activity
+                log_activity(
+                    "BUY", level="INFO", position_id=pid,
+                    message=(
+                        f"TKH {kind} repriced: old=${old_limit:.4f} -> "
+                        f"new=${new_limit:.4f} (best_ask=${best_ask:.4f}, "
+                        f"drift={drift_cents:.1f}c, gap=${intended_size:.2f}) "
+                        f"{pos.get('city','?')} {pos.get('date','?')}"
+                    ),
+                    source="stale_entry_refresh",
+                    old_order_id=old_oid, new_order_id=new_oid,
+                    old_limit=old_limit, new_limit=new_limit,
+                    drift_cents=drift_cents,
+                    gap_usdc=intended_size,
+                    is_partial_fill=is_partial_fill,
+                )
+            except Exception:
+                pass
+
+        if repriced > 0:
+            logger.log(SUMMARY_LEVEL,
+                f"[MONITOR] {repriced} stale ensure-fill entry order(s) "
+                f"re-priced (drift > {THRESHOLD}c)"
+            )
+        return repriced
+    finally:
+        _refresh_stale_entries_lock.release()
+
+
+def run_stale_entry_refresh_fast() -> int:
+    """Fast-cycle wrapper for the */5 minute APScheduler job — repricing
+    of TKH (and other ensure-fill) entry orders that have fallen behind
+    the live best_ask."""
+    if PAPER_TRADE:
+        return 0
+    try:
+        from execution import get_clob_client
+        client = get_clob_client()
+        if client is None:
+            return 0
+        return refresh_stale_ensure_fill_entries(client)
+    except Exception as e:
+        logger.exception(
+            f"run_stale_entry_refresh_fast failed (non-fatal): {e}"
+        )
+        return 0
+
+
+# ---------------------------------------------------------------------------
 # Step 2 — Detect resolved markets, close positions, record P&L
 # ---------------------------------------------------------------------------
 
@@ -1186,30 +1882,390 @@ def _settle_resolved_positions(data_api_index: dict,
 _RECONCILE_SHARE_TOLERANCE = 0.5
 
 
+def _bump_orphan_db_counter(pid: int) -> int:
+    """Increment positions.orphan_db_cycles and return the new value.
+    Used by the multi-cycle confirmation gate before auto-close fires."""
+    from db import _get_conn
+    try:
+        with _get_conn() as conn:
+            conn.execute(
+                "UPDATE positions "
+                "SET orphan_db_cycles = COALESCE(orphan_db_cycles, 0) + 1 "
+                "WHERE id = ?",
+                (pid,),
+            )
+            row = conn.execute(
+                "SELECT COALESCE(orphan_db_cycles, 0) AS n "
+                "FROM positions WHERE id = ?", (pid,),
+            ).fetchone()
+        return int(row["n"] if row else 0)
+    except Exception as e:
+        logger.warning(f"[ORPHAN-DB] counter bump failed pid={pid}: {e}")
+        return 0
+
+
+def _reset_orphan_db_counter(pid: int) -> None:
+    """Reset positions.orphan_db_cycles to 0.  Called whenever the chain
+    shows shares for this position again -- the orphan condition cleared
+    on its own (e.g., late-arriving Data API confirmation)."""
+    from db import _get_conn
+    try:
+        with _get_conn() as conn:
+            conn.execute(
+                "UPDATE positions "
+                "SET orphan_db_cycles = 0 "
+                "WHERE id = ? AND COALESCE(orphan_db_cycles, 0) > 0",
+                (pid,),
+            )
+    except Exception:
+        pass   # best-effort -- a stale counter just delays auto-close
+
+
+def _fetch_activity_history(wallet: str, max_pages: int = 30) -> list[dict]:
+    """Pull the wallet's full activity history from the Polymarket Data
+    API (paginated).  Used by _compute_realized_pnl_from_activity to
+    determine the ACTUAL realized P&L for orphan_db positions before
+    auto-closing them.
+
+    Returns [] on any error (caller falls back to the legacy
+    "assume total loss" path).
+    """
+    if not wallet:
+        return []
+    import httpx as _httpx
+    out: list[dict] = []
+    offset = 0
+    PAGE = 100
+    for _ in range(max_pages):
+        try:
+            r = _httpx.get(
+                "https://data-api.polymarket.com/activity",
+                params={"user": wallet, "limit": PAGE, "offset": offset},
+                timeout=20,
+            )
+            r.raise_for_status()
+            page = r.json()
+        except Exception as e:
+            logger.warning(
+                f"[ORPHAN-CLOSE] activity fetch at offset={offset} failed: {e}"
+            )
+            break
+        if not isinstance(page, list) or not page:
+            break
+        out.extend(page)
+        if len(page) < PAGE:
+            break
+        offset += PAGE
+    return out
+
+
+def _compute_realized_pnl_from_activity(
+    pos: dict, activity: list[dict],
+) -> tuple[float, str]:
+    """For an orphan_db position, walk the wallet's activity history to
+    determine the ACTUAL realized P&L.  Returns (pnl, classification).
+
+    Classifications:
+      - 'never_filled':            no BUY trades for this token; assume
+                                    pnl=$0 (placement never confirmed
+                                    on chain, no capital deployed)
+      - 'computed_from_activity':  realized = sells + redeems - buys
+      - 'no_activity_data':        couldn't fetch activity; legacy
+                                    fallback (caller uses -size_usdc)
+
+    The chain says 0 shares for this position.  If we never bought any,
+    we never paid anything -- pnl=$0, not pnl=-size_usdc.  If we bought
+    but didn't sell/redeem, the realized loss is the cost basis.  If we
+    bought AND sold/redeemed, realized = whatever the trades imply.
+    """
+    if not activity:
+        return -float(pos.get("size_usdc", 0) or 0), "no_activity_data"
+
+    side       = pos.get("side", "YES")
+    token_id   = (pos.get("yes_token_id") if side == "YES"
+                  else pos.get("no_token_id")) or ""
+    contract_id = pos.get("contract_id", "") or ""
+
+    if not token_id and not contract_id:
+        return -float(pos.get("size_usdc", 0) or 0), "no_token_id"
+
+    sum_buy    = 0.0
+    sum_sell   = 0.0
+    sum_redeem = 0.0
+    for it in activity:
+        ttype = it.get("type", "")
+        if ttype == "TRADE":
+            asset = str(it.get("asset", "") or "")
+            if asset != str(token_id):
+                continue
+            usdc = float(it.get("usdcSize", 0) or 0)
+            tside = it.get("side", "")
+            if tside == "BUY":
+                sum_buy  += usdc
+            elif tside == "SELL":
+                sum_sell += usdc
+        elif ttype == "REDEEM":
+            cid = str(it.get("conditionId", "") or "")
+            if cid != str(contract_id):
+                continue
+            sum_redeem += float(it.get("usdcSize", 0) or 0)
+
+    if sum_buy == 0:
+        # Position record says we placed an order, but no BUY trade ever
+        # confirmed for this token.  No capital was actually deployed.
+        return 0.0, "never_filled"
+
+    realized = round(sum_sell + sum_redeem - sum_buy, 4)
+    return realized, "computed_from_activity"
+
+
+def _auto_close_orphan_db(pid: int, db_shares: float, size_usdc: float,
+                           city: str, date_str: str, side: str,
+                           token_id: str,
+                           pos: dict | None = None,
+                           activity: list[dict] | None = None) -> bool:
+    """Mark an orphan_db position closed.
+
+    Triggered when a position has been orphan_db for >=
+    ORPHAN_DB_AUTO_CLOSE_CYCLES consecutive monitor cycles.  By then a
+    transient Data API miss has been ruled out; the chain genuinely has
+    no balance for this token.
+
+    P&L computation (when `pos` and `activity` are passed):
+      * Walks Polymarket /activity to find actual BUY/SELL/REDEEM events
+        for this token.
+      * realized_pnl = sells + redeems - buys.
+      * If no BUY trades ever happened, pnl=$0 (placement never confirmed
+        on chain -- no capital was actually deployed, so no real loss).
+
+    Legacy fallback (when activity unavailable):
+      * Assumes total loss: pnl = -size_usdc.
+
+    Sets status='closed', fill_status='cancelled', shares=0,
+    exit_time=now, pnl=<computed>, cancelled_reason='orphan_db_auto_close'.
+    Audit-logged under category='REPAIR'.
+
+    Returns True on success, False on DB error.
+    """
+    from db import _get_conn
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Compute true realized PnL when we have the data; fall back to
+    # legacy "assume total loss" otherwise.
+    if pos is not None and activity is not None:
+        pnl, classification = _compute_realized_pnl_from_activity(pos, activity)
+    else:
+        pnl = round(-float(size_usdc or 0), 4)
+        classification = "legacy_assumed_total_loss"
+    try:
+        with _get_conn() as conn:
+            conn.execute("""
+                UPDATE positions
+                SET status           = 'closed',
+                    fill_status      = 'cancelled',
+                    shares           = 0,
+                    exit_time        = ?,
+                    pnl              = ?,
+                    cancelled_reason = 'orphan_db_auto_close'
+                WHERE id = ?
+            """, (now_iso, pnl, pid))
+        try:
+            from activity import log_activity
+            # Tailor the audit message to the PnL classification so the
+            # operator can immediately tell "real loss" from "phantom".
+            if classification == "never_filled":
+                msg = (
+                    f"orphan_db auto-closed: {city} {date_str} {side} "
+                    f"db_shares={db_shares:.4f} -- placement never confirmed "
+                    f"on chain (no BUY trades).  Marked closed at $0 "
+                    f"(no capital actually deployed).  Token={token_id[:14]}..."
+                )
+            elif classification == "computed_from_activity":
+                msg = (
+                    f"orphan_db auto-closed: {city} {date_str} {side} "
+                    f"db_shares={db_shares:.4f} but chain held 0.  Realized "
+                    f"P&L computed from activity: ${pnl:+.2f}.  "
+                    f"Token={token_id[:14]}..."
+                )
+            else:
+                msg = (
+                    f"orphan_db auto-closed: {city} {date_str} {side} "
+                    f"db_shares={db_shares:.4f} but chain held 0 across "
+                    f"multiple monitor cycles.  Marked closed at assumed "
+                    f"total loss (pnl=${pnl:.2f}).  "
+                    f"Token={token_id[:14]}..."
+                )
+            log_activity(
+                "REPAIR", level="WARN", position_id=pid,
+                message=msg,
+                repair_kind="orphan_db_auto_close",
+                pnl_classification=classification,
+                db_shares=db_shares, size_usdc=size_usdc, pnl=pnl,
+                token_id=token_id,
+            )
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        logger.warning(f"[ORPHAN-DB-CLOSE] write failed pid={pid}: {e}")
+        return False
+
+
+def _heal_share_drift_auto(
+    pid: int, contract_id: str, token_id: str,
+    chain_size: float, client,
+) -> tuple[bool, float | None, float | None]:
+    """Sync a position's shares + cost basis to chain truth.
+
+    Replaces what `repair_share_drift.py --apply` did manually.  Walks
+    the position's ledger orders (entry + topup), pulls trades for the
+    market+token via CLOB get_trades, and recomputes:
+      shares       = chain_size                       (Data API truth)
+      entry_price  = sum(size*price) / sum(size)      (weighted avg from trades)
+      size_usdc    = sum(size*price)                  (actual capital deployed)
+
+    When the trade fetch fails (no client / API error / no matched
+    trades), falls back to shares-only repair so we still converge on
+    the chain truth even if cost basis stays approximate.
+
+    Returns (ok, new_avg_price, new_size_usdc).  ok=False means we
+    couldn't write anything (caller falls back to WARN logging).
+    """
+    from db import _get_conn
+    new_avg = None
+    new_usdc = None
+
+    # ---- Try to fetch trades for cost-basis recompute ----
+    if client is not None:
+        try:
+            from py_clob_client_v2.clob_types import TradeParams
+            with _get_conn() as conn:
+                ledger_orders = [r["order_id"] for r in conn.execute(
+                    "SELECT order_id FROM position_orders "
+                    "WHERE position_id = ? AND role IN ('entry', 'topup') "
+                    "  AND order_id IS NOT NULL",
+                    (pid,),
+                ).fetchall()]
+                if not ledger_orders:
+                    legacy = conn.execute(
+                        "SELECT order_id FROM positions WHERE id = ?",
+                        (pid,),
+                    ).fetchone()
+                    if legacy and legacy["order_id"]:
+                        ledger_orders = [legacy["order_id"]]
+            our_oids: set[str] = set(ledger_orders)
+            if our_oids and contract_id and token_id:
+                trades = client.get_trades(
+                    params=TradeParams(market=contract_id, asset_id=token_id),
+                    only_first_page=False,
+                ) or []
+                tot_sh = 0.0
+                tot_usd = 0.0
+                for t in trades:
+                    taker_oid = t.get("taker_order_id") or ""
+                    is_match = (taker_oid in our_oids)
+                    if not is_match:
+                        for mo in (t.get("maker_orders") or []):
+                            if mo.get("order_id") in our_oids:
+                                is_match = True
+                                break
+                    if not is_match:
+                        continue
+                    try:
+                        sz    = float(t.get("size") or 0)
+                        price = float(t.get("price") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if sz <= 0 or price <= 0:
+                        continue
+                    tot_sh  += sz
+                    tot_usd += sz * price
+                if tot_sh > 0:
+                    new_avg = round(tot_usd / tot_sh, 6)
+                    new_usdc = round(tot_usd, 4)
+        except Exception as e:
+            logger.debug(
+                f"[DRIFT-HEAL] cost-basis fetch failed pid={pid}: {e} "
+                f"-- falling back to shares-only"
+            )
+
+    # ---- Apply the update ----
+    try:
+        with _get_conn() as conn:
+            if new_avg is not None and new_usdc is not None:
+                conn.execute(
+                    "UPDATE positions "
+                    "SET shares = ?, entry_price = ?, size_usdc = ? "
+                    "WHERE id = ?",
+                    (chain_size, new_avg, new_usdc, pid),
+                )
+            else:
+                conn.execute(
+                    "UPDATE positions SET shares = ? WHERE id = ?",
+                    (chain_size, pid),
+                )
+        return True, new_avg, new_usdc
+    except Exception as e:
+        logger.warning(f"[DRIFT-HEAL] write failed pid={pid}: {e}")
+        return False, None, None
+
+
 def _reconcile_onchain(data_api_index: dict) -> dict:
-    """Compare DB live positions against on-chain positions and log drift.
+    """Compare DB live positions against on-chain positions.
 
     Three drift classes:
       * orphan_db    — DB has it open, chain has no balance for that token
+                       Behaviour: log at WARN (auto-close is too risky --
+                       a transient Data API hiccup could close real positions).
       * share_drift  — both have it, |db_shares - chain_size| > tolerance
+                       Behaviour: when DRIFT_AUTO_HEAL=True (default), sync
+                       the position row to chain truth (shares +
+                       cost basis from trades).  Otherwise log at WARN.
       * orphan_chain — chain has a token that no open DB row references
+                       Behaviour: log at INFO -- usually pre-bot positions
+                       or manual trades.
 
-    Pure log-only.  Does not mutate state — by design, per the user's
-    "log only" call.  If the bot's view diverges from on-chain, a human
-    decides what to do.
+    Skipped when data_api_index is empty (paper mode / missing wallet /
+    Data API fetch failed) -- can't distinguish drift from API failure.
 
-    Skipped when:
-      * data_api_index is empty (paper mode, missing wallet, or fetch failed
-        — we can't tell drift apart from "couldn't reach the chain")
-
-    Returns {orphan_db, share_drift, orphan_chain} counts for the summary.
+    Returns {orphan_db, share_drift, orphan_chain, share_drift_healed,
+    share_drift_unhealed} for the cycle summary.
     """
     if not data_api_index:
-        return {"orphan_db": 0, "share_drift": 0, "orphan_chain": 0}
+        return {
+            "orphan_db": 0, "share_drift": 0, "orphan_chain": 0,
+            "share_drift_healed": 0, "share_drift_unhealed": 0,
+            "orphan_db_auto_closed": 0,
+        }
 
-    # Live positions that should have an on-chain footprint.  Top-up state
-    # ('exiting' status) still has shares on chain until the sell fills, so
-    # include those too.
+    from config import (
+        DRIFT_AUTO_HEAL,
+        ORPHAN_DB_AUTO_CLOSE,
+        ORPHAN_DB_AUTO_CLOSE_CYCLES,
+    )
+    auto_heal = bool(DRIFT_AUTO_HEAL)
+    auto_close_orphans = bool(ORPHAN_DB_AUTO_CLOSE)
+    orphan_close_threshold = int(ORPHAN_DB_AUTO_CLOSE_CYCLES)
+
+    # Lazy-fetched once per cycle and reused across multiple orphan-db
+    # auto-closes that fire in this same cycle.  None means "not fetched
+    # yet"; [] means "tried but got nothing".
+    _wallet_activity_cache: list[dict] | None = None
+
+    # Lazy-acquire CLOB client once for cost-basis recomputes.  None if
+    # paper mode or creds missing -- helper falls back to shares-only.
+    client = None
+    if auto_heal:
+        try:
+            from execution import get_clob_client
+            client = get_clob_client()
+        except Exception:
+            client = None
+
+    # Live positions that should have an on-chain footprint.  Top-up
+    # state ('exiting' status) still has shares on chain until the sell
+    # fills, so include those too.
     live_positions = [
         p for p in get_open_positions()
         if not bool(p.get("is_paper", 1))
@@ -1218,7 +2274,10 @@ def _reconcile_onchain(data_api_index: dict) -> dict:
 
     db_token_ids: set[str] = set()
     orphan_db = 0
+    orphan_db_auto_closed = 0
     share_drift = 0
+    share_drift_healed = 0
+    share_drift_unhealed = 0
 
     for pos in live_positions:
         side      = pos.get("side", "YES")
@@ -1232,25 +2291,80 @@ def _reconcile_onchain(data_api_index: dict) -> dict:
         on_chain  = data_api_index.get(token_id)
 
         if on_chain is None:
+            # Orphan_db: DB thinks we own shares, chain says zero.
+            #
+            # Multi-cycle confirmation gate: increment a counter on the
+            # position row.  When the counter reaches the threshold (default
+            # 2), auto-close the position at total loss.  Until then, just
+            # WARN-log so a single Data API hiccup can't close real
+            # positions.
             orphan_db += 1
             from activity import log_activity
+
+            cycles_so_far = (
+                _bump_orphan_db_counter(pos["id"])
+                if auto_close_orphans else 0
+            )
+
+            if (auto_close_orphans
+                    and cycles_so_far >= orphan_close_threshold):
+                # Lazy-fetch wallet activity once per cycle: the orphan
+                # auto-close uses it to compute REAL realized P&L
+                # (avoids over-stating losses when an order never
+                # actually filled on chain).  See
+                # _compute_realized_pnl_from_activity for details.
+                if _wallet_activity_cache is None:
+                    _wallet_activity_cache = _fetch_activity_history(
+                        WALLET_ADDRESS or ""
+                    )
+                ok = _auto_close_orphan_db(
+                    pid        = pos["id"],
+                    db_shares  = db_shares,
+                    size_usdc  = float(pos.get("size_usdc") or 0),
+                    city       = pos.get("city") or "",
+                    date_str   = pos.get("date") or "",
+                    side       = side,
+                    token_id   = token_id,
+                    pos        = pos,
+                    activity   = _wallet_activity_cache,
+                )
+                if ok:
+                    orphan_db_auto_closed += 1
+                    continue
+                # Fall through to WARN log if write failed.
+
             log_activity(
                 "DRIFT", level="WARN", position_id=pos["id"],
                 message=(
                     f"DRIFT orphan_db: {pos.get('city')} {pos.get('date')} "
                     f"{side} db_shares={db_shares:.4f} but no on-chain "
+                    f"balance for token={token_id[:14]}... "
+                    f"(cycle {cycles_so_far}/{orphan_close_threshold})"
+                    if auto_close_orphans else
+                    f"DRIFT orphan_db: {pos.get('city')} {pos.get('date')} "
+                    f"{side} db_shares={db_shares:.4f} but no on-chain "
                     f"balance for token={token_id[:14]}..."
                 ),
                 drift_kind="orphan_db", token_id=token_id,
-                db_shares=db_shares,
+                db_shares=db_shares, cycles_so_far=cycles_so_far,
             )
             continue
 
+        # Chain shows shares for this token -- reset the orphan counter
+        # in case it had been incrementing.
+        if auto_close_orphans:
+            _reset_orphan_db_counter(pos["id"])
+
         chain_size = float(on_chain.get("size") or 0)
         delta = abs(db_shares - chain_size)
-        if delta > _RECONCILE_SHARE_TOLERANCE:
-            share_drift += 1
-            from activity import log_activity
+        if delta <= _RECONCILE_SHARE_TOLERANCE:
+            continue
+
+        share_drift += 1
+        from activity import log_activity
+
+        if not auto_heal:
+            # Legacy behaviour: log only.
             log_activity(
                 "DRIFT", level="WARN", position_id=pos["id"],
                 message=(
@@ -1259,6 +2373,44 @@ def _reconcile_onchain(data_api_index: dict) -> dict:
                     f"chain_size={chain_size:.4f} delta={delta:.4f}"
                 ),
                 drift_kind="share_drift", token_id=token_id,
+                db_shares=db_shares, chain_size=chain_size, delta=delta,
+            )
+            continue
+
+        # Auto-heal: sync to chain truth.
+        ok, new_avg, new_usdc = _heal_share_drift_auto(
+            pos["id"],
+            pos.get("contract_id") or "",
+            token_id, chain_size, client,
+        )
+        if ok:
+            share_drift_healed += 1
+            basis_msg = ""
+            if new_avg is not None and new_usdc is not None:
+                basis_msg = (f", entry=${new_avg:.4f}, "
+                             f"size=${new_usdc:.2f}")
+            log_activity(
+                "DRIFT", level="INFO", position_id=pos["id"],
+                message=(
+                    f"DRIFT auto-healed: {pos.get('city')} "
+                    f"{pos.get('date')} {side} shares "
+                    f"{db_shares:.4f} -> {chain_size:.4f} "
+                    f"(delta {delta:.4f}){basis_msg}"
+                ),
+                drift_kind="share_drift_healed", token_id=token_id,
+                db_shares=db_shares, chain_size=chain_size, delta=delta,
+                new_entry_price=new_avg, new_size_usdc=new_usdc,
+            )
+        else:
+            share_drift_unhealed += 1
+            log_activity(
+                "DRIFT", level="WARN", position_id=pos["id"],
+                message=(
+                    f"DRIFT share_drift (heal failed): {pos.get('city')} "
+                    f"{pos.get('date')} {side} db_shares={db_shares:.4f} "
+                    f"chain_size={chain_size:.4f} delta={delta:.4f}"
+                ),
+                drift_kind="share_drift_unhealed", token_id=token_id,
                 db_shares=db_shares, chain_size=chain_size, delta=delta,
             )
 
@@ -1280,14 +2432,34 @@ def _reconcile_onchain(data_api_index: dict) -> dict:
         )
 
     if orphan_db or share_drift or orphan_chain:
+        # Build a single-line summary that surfaces auto-action counts when
+        # they're nonzero.  Keeps quiet otherwise (no log spam).
+        parts = []
+        if orphan_db_auto_closed:
+            parts.append(
+                f"{orphan_db} orphan_db ({orphan_db_auto_closed} auto-closed)"
+            )
+        else:
+            parts.append(f"{orphan_db} orphan_db")
+        if share_drift_healed and auto_heal:
+            parts.append(
+                f"{share_drift} share_drift "
+                f"({share_drift_healed} auto-healed, "
+                f"{share_drift_unhealed} unhealed)"
+            )
+        else:
+            parts.append(f"{share_drift} share_drift")
+        parts.append(f"{orphan_chain} orphan_chain")
         logger.log(SUMMARY_LEVEL,
-            f"[MONITOR] Reconciliation: {orphan_db} orphan_db | "
-            f"{share_drift} share_drift | {orphan_chain} orphan_chain"
+            f"[MONITOR] Reconciliation: " + " | ".join(parts)
         )
     return {
-        "orphan_db":    orphan_db,
-        "share_drift":  share_drift,
-        "orphan_chain": orphan_chain,
+        "orphan_db":             orphan_db,
+        "orphan_db_auto_closed": orphan_db_auto_closed,
+        "share_drift":           share_drift,
+        "share_drift_healed":    share_drift_healed,
+        "share_drift_unhealed":  share_drift_unhealed,
+        "orphan_chain":          orphan_chain,
     }
 
 

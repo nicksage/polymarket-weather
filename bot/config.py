@@ -412,6 +412,47 @@ MAX_TAKE_PCT_OF_ASK_DEPTH: float = _float("MAX_TAKE_PCT_OF_ASK_DEPTH", 0.66)
 # wait a cycle and re-evaluate than to leave a tiny order on the book.
 MIN_FILLABLE_USDC: float = _float("MIN_FILLABLE_USDC", 2.0)
 
+# Ensure-fill strategies (TKH and any future strategy whose thesis
+# requires owning every bin in a basket) use a LOWER min-fillable floor
+# so a thin book doesn't cause a bin to be skipped entirely.  TKH's
+# per-event dedup means a skipped bin is never retried -- breaking the
+# hedge.  The repricer + topup loop chase any remaining gap, so the
+# correct behaviour is "place what the book allows, even if small".
+# Default $1.05 = Polymarket's $1 strict minimum + 5c buffer for the
+# share-rounding that occurs inside py_clob_client.
+ENSURE_FILL_MIN_FILLABLE_USDC: float = _float(
+    "ENSURE_FILL_MIN_FILLABLE_USDC", 1.05
+)
+ENSURE_FILL_STRATEGIES: set[str] = {"top_k_hedged"}
+
+# Drift auto-healing.  When True, the monitor's on-chain reconciliation
+# does not just LOG share_drift -- it AUTOMATICALLY syncs the position
+# row to chain truth (shares + entry_price + size_usdc).  Without this,
+# every drift event accumulates and requires a manual run of
+# repair_share_drift to clean up.  With it on, drift never persists
+# beyond one monitor cycle; the chain becomes the authoritative source.
+# orphan_db (DB has shares chain doesn't) is still WARN-only -- closing
+# a position based on a possibly-transient API result is too risky to
+# automate.  Set to False to revert to legacy log-only behaviour.
+DRIFT_AUTO_HEAL: bool = _bool("DRIFT_AUTO_HEAL", True)
+
+# Orphan_db auto-close.  An orphan_db row means the DB believes we own
+# shares but the chain says zero.  Closing such a position based on a
+# single Data API result is risky (a transient API miss could close real
+# positions), so we require multi-cycle confirmation: only close when a
+# row has been orphan_db for >= ORPHAN_DB_AUTO_CLOSE_CYCLES consecutive
+# monitor cycles.  Counter is tracked in positions.orphan_db_cycles and
+# RESET to 0 whenever the chain shows shares again.
+#
+# When the threshold is reached, the position is marked status='closed',
+# shares=0, pnl = -size_usdc (assume total loss -- the shares aren't on
+# chain, they were either never received or sold without our knowledge).
+# Audited under activity_log category='REPAIR'.
+ORPHAN_DB_AUTO_CLOSE: bool = _bool("ORPHAN_DB_AUTO_CLOSE", True)
+ORPHAN_DB_AUTO_CLOSE_CYCLES: int = int(
+    os.getenv("ORPHAN_DB_AUTO_CLOSE_CYCLES", "2")
+)
+
 
 # Tail-probability flattening — applied AFTER per-event bin normalization:
 #     p' = p ** LIVE_ADJ_TAIL_FLATTEN_EXPONENT

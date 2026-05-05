@@ -652,10 +652,13 @@ def get_market_status(contract_id: str, gamma_market_id: str = None) -> dict | N
         if gamma_market_id:
             data = _gamma_get(f"/markets/{gamma_market_id}", {})
         else:
-            # Fallback: scan first page for a matching conditionId
-            result = _gamma_get("/markets", {"limit": 100})
-            markets = result if isinstance(result, list) else []
-            data = next((m for m in markets if m.get("conditionId") == contract_id), None)
+            # Fallback: query Gamma directly by conditionId (same approach
+            # as get_contract_price).  Previous implementation pulled the
+            # FIRST 100 markets and scanned for a match -- only worked
+            # when our contract happened to be in that page (almost never
+            # for our use case).
+            result = _gamma_get("/markets", {"conditionId": contract_id})
+            data = result[0] if isinstance(result, list) and result else result
 
         if not data:
             return None

@@ -101,15 +101,23 @@ def _update_peak(
 def on_price_update(token_id: str, price: float) -> None:
     """Callback fired by the WebSocket on every price change.
 
-    Checks trailing stop (MPV) or hard stop (TBV) depending on strategy.
-    Also updates peak_price in DB for position tracking.
+    Routes to the right exit checker based on each POSITION's recorded
+    strategy column, NOT the global ACTIVE_STRATEGY.  Per-position
+    routing is necessary because:
+      (a) the DB can hold positions from prior strategies if the
+          operator switches ACTIVE_STRATEGY between runs.
+      (b) each strategy uses different stop config (TKH_HARD_STOP_PCT
+          for TKH; MPV_HARD_STOP_PCT for MPV; stop_loss_price column
+          for TBV).  Misrouting silently applies the wrong floor and
+          can liquidate positions far above their intended stop.
+
+    Also updates peak_price + current_price + unrealized_pnl in DB for
+    every tick.
     """
     by_token = _get_positions_by_token()
     positions = by_token.get(token_id)
     if not positions:
         return
-
-    is_mpv = ACTIVE_STRATEGY == "market_price_value"
 
     for pos in positions:
         pid = pos["id"]
@@ -137,9 +145,16 @@ def on_price_update(token_id: str, price: float) -> None:
         except Exception:
             pass
 
-        if is_mpv:
+        # Route by the POSITION's strategy (not the global ACTIVE_STRATEGY).
+        # Falls back to ACTIVE_STRATEGY only when the row pre-dates the
+        # strategy column (legacy data); modern rows always carry it.
+        pos_strategy = (pos.get("strategy") or ACTIVE_STRATEGY or "").strip()
+        if pos_strategy == "top_k_hedged":
+            _check_tkh_exits(pos, pid, price, peak, entry_price, shares, unrealized_pnl)
+        elif pos_strategy == "market_price_value":
             _check_mpv_exits(pos, pid, price, peak, entry_price, shares, unrealized_pnl)
         else:
+            # top_bin_value (default) and any other / legacy strategy
             _check_tbv_exits(pos, pid, price, entry_price, shares, unrealized_pnl)
 
 
@@ -194,14 +209,19 @@ def _check_mpv_exits(
             if pid in _exited_positions:
                 return
             _exited_positions.add(pid)
-        _execute_realtime_exit(
+        result = _execute_realtime_exit(
             pos, price, unrealized_pnl,
             reason=f"RT_TAKE_PROFIT: price={price:.4f} >= TP={_MPV_TAKE_PROFIT}"
         )
-        logger.warning(
-            f"[ Take Profit ]  |  {city}  |  {date_str} {side}  |  {bin_str}  |  "
-            f"Entry: ${entry_price:.4f}  |  Exit: ${price:.4f}  |  "
-            f"P&L: ${(price - entry_price) * shares:+.2f}"
+        _finalize_exit_attempt(
+            pid, result,
+            success_log=(
+                f"[ Take Profit ]  |  {city}  |  {date_str} {side}  |  "
+                f"{bin_str}  |  Entry: ${entry_price:.4f}  |  "
+                f"Exit: ${price:.4f}  |  "
+                f"P&L: ${(price - entry_price) * shares:+.2f}"
+            ),
+            skip_label="Take Profit", city=city, bin_str=bin_str,
         )
         return
 
@@ -219,12 +239,17 @@ def _check_mpv_exits(
             f"(peak={peak:.4f}, tier={tier_pct:.0%} trail)"
         )
         log_pct = tier_pct
-        _execute_realtime_exit(pos, trail_level, unrealized_pnl, reason=reason)
-        logger.warning(
-            f"[ Trail Stop ]  |  {city}  |  {date_str} {side}  |  {bin_str}  |  "
-            f"Entry: ${entry_price:.4f}  |  Peak: ${peak:.4f}  |  "
-            f"Exit: ${trail_level:.4f}  |  Trail: {log_pct:.0%}  |  "
-            f"P&L: ${(trail_level - entry_price) * shares:+.2f}"
+        result = _execute_realtime_exit(pos, trail_level, unrealized_pnl, reason=reason)
+        _finalize_exit_attempt(
+            pid, result,
+            success_log=(
+                f"[ Trail Stop ]  |  {city}  |  {date_str} {side}  |  "
+                f"{bin_str}  |  Entry: ${entry_price:.4f}  |  "
+                f"Peak: ${peak:.4f}  |  Exit: ${trail_level:.4f}  |  "
+                f"Trail: {log_pct:.0%}  |  "
+                f"P&L: ${(trail_level - entry_price) * shares:+.2f}"
+            ),
+            skip_label="Trail Stop", city=city, bin_str=bin_str,
         )
         return
 
@@ -235,14 +260,210 @@ def _check_mpv_exits(
             if pid in _exited_positions:
                 return
             _exited_positions.add(pid)
-        _execute_realtime_exit(
+        result = _execute_realtime_exit(
             pos, price, unrealized_pnl,
             reason=f"RT_HARD_STOP: price={price:.4f} <= stop={hard_stop_level:.4f}"
         )
-        logger.warning(
-            f"[ Stop Loss ]  |  {city}  |  {date_str} {side}  |  {bin_str}  |  "
-            f"Entry: ${entry_price:.4f}  |  Exit: ${price:.4f}  |  "
-            f"P&L: ${(price - entry_price) * shares:+.2f}"
+        _finalize_exit_attempt(
+            pid, result,
+            success_log=(
+                f"[ Stop Loss ]  |  {city}  |  {date_str} {side}  |  "
+                f"{bin_str}  |  Entry: ${entry_price:.4f}  |  "
+                f"Exit: ${price:.4f}  |  "
+                f"P&L: ${(price - entry_price) * shares:+.2f}"
+            ),
+            skip_label="Stop Loss", city=city, bin_str=bin_str,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Top-K Hedged real-time exit checks
+# ---------------------------------------------------------------------------
+#
+# Mirrors strategies/top_k_hedged._classify on every WS price tick instead
+# of waiting for the hourly monitor cycle.  Crucially, uses TKH-specific
+# config vars (TKH_TAKE_PROFIT, TKH_CONFIRM_PRICE, TKH_HARD_STOP_PCT) NOT
+# the global EXIT_HARD_STOP_PCT / stop_loss_price column.  Pre-fix, TKH
+# positions were silently routed through _check_tbv_exits which uses the
+# stop_loss_price column (entry × (1+EXIT_HARD_STOP_PCT)) — that's why
+# Tokyo (and other TKH bins) were exiting at -30% instead of the
+# operator's intended TKH_HARD_STOP_PCT-derived floor.
+
+def _trigger_tkh_hedge_resolved(winning_pos: dict) -> None:
+    """When a TKH bin crosses TKH_CONFIRM_PRICE, find its sibling
+    positions in the same event and trigger HEDGE_RESOLVED exits on them.
+
+    The 'winning' bin is the one whose price tick triggered this call
+    (it's about to win the event, so the others are about to die).  We
+    do NOT exit the winner here — the caller decides whether to ride it
+    to TKH_TAKE_PROFIT or to take profit immediately.
+
+    Idempotent via _exit_lock + _exited_positions; siblings already in
+    the exit set are skipped.
+    """
+    event_id = winning_pos.get("event_id")
+    winning_contract = winning_pos.get("contract_id")
+    if not event_id or not winning_contract:
+        return
+
+    try:
+        from db import _get_conn
+        with _get_conn() as conn:
+            siblings = [dict(r) for r in conn.execute("""
+                SELECT id, contract_id, city, date, side, entry_price,
+                       shares, current_price, range_low, range_high,
+                       unit, yes_token_id, no_token_id, gamma_market_id
+                FROM positions
+                WHERE strategy = 'top_k_hedged'
+                  AND event_id = ?
+                  AND contract_id != ?
+                  AND status = 'open'
+                  AND fill_status = 'filled'
+                  AND COALESCE(is_paper, 0) = 0
+            """, (event_id, winning_contract)).fetchall()]
+    except Exception as e:
+        logger.warning(f"[TKH] sibling lookup failed: {e}")
+        return
+
+    for sib in siblings:
+        sib_pid = sib["id"]
+        with _exit_lock:
+            if sib_pid in _exited_positions:
+                continue
+            _exited_positions.add(sib_pid)
+        sib_curr  = sib.get("current_price")
+        sib_price = (float(sib_curr) * 0.98 if sib_curr else 0.01)
+        sib_shares = float(sib.get("shares") or 0)
+        sib_entry  = float(sib.get("entry_price") or 0)
+        sib_pnl = ((sib_price - sib_entry) * sib_shares
+                   if sib_entry > 0 else 0)
+        result = _execute_realtime_exit(
+            sib, sib_price, sib_pnl,
+            reason=(f"RT_HEDGE_RESOLVED (TKH): sibling "
+                    f"{winning_contract[:12]} crossed confirm threshold")
+        )
+        _finalize_exit_attempt(
+            sib_pid, result,
+            success_log=(
+                f"[ Hedge Resolved ]  |  {sib.get('city','')}  |  "
+                f"{sib.get('date','')} {sib.get('side','')}  |  "
+                f"{_bin_label(sib)}  |  Entry: ${sib_entry:.4f}  |  "
+                f"Exit: ${sib_price:.4f}  |  P&L: ${sib_pnl:+.2f}  |  "
+                f"Reason: sibling won"
+            ),
+            skip_label="Hedge Resolved",
+            city=sib.get("city", ""), bin_str=_bin_label(sib),
+        )
+
+
+def _check_tkh_exits(
+    pos: dict, pid: int, price: float, peak: float,
+    entry_price: float, shares: float, unrealized_pnl: float,
+) -> None:
+    """Top-K Hedged exits: take-profit, hedge-resolved, trailing stop,
+    hard stop -- mirrors top_k_hedged._classify but fires on every WS
+    price tick instead of waiting for the hourly monitor cycle."""
+    # Lazy import — top_k_hedged.py is only loaded when its strategy
+    # registers (avoids paying its module-load cost during MPV/TBV runs).
+    from strategies.top_k_hedged import (
+        TKH_TAKE_PROFIT, TKH_CONFIRM_PRICE, TKH_HARD_STOP_PCT,
+    )
+
+    city = pos.get("city", "")
+    date_str = pos.get("date", "")
+    side = pos.get("side", "YES")
+    bin_str = _bin_label(pos)
+
+    # 1. Take profit -- this bin reached TKH_TAKE_PROFIT.  Also implies
+    # the event has resolved in our favour, so trigger HEDGE_RESOLVED on
+    # siblings (their value is about to drop to ~zero).
+    if price >= TKH_TAKE_PROFIT:
+        with _exit_lock:
+            if pid in _exited_positions:
+                return
+            _exited_positions.add(pid)
+        result = _execute_realtime_exit(
+            pos, price, unrealized_pnl,
+            reason=(f"RT_TAKE_PROFIT (TKH): price={price:.4f} >= "
+                    f"TP={TKH_TAKE_PROFIT}")
+        )
+        _finalize_exit_attempt(
+            pid, result,
+            success_log=(
+                f"[ Take Profit ]  |  {city}  |  {date_str} {side}  |  "
+                f"{bin_str}  |  Entry: ${entry_price:.4f}  |  "
+                f"Exit: ${price:.4f}  |  "
+                f"P&L: ${(price - entry_price) * shares:+.2f}"
+            ),
+            skip_label="Take Profit", city=city, bin_str=bin_str,
+        )
+        # Only trigger sibling sweep when this bin's exit actually placed.
+        # Otherwise we'd start cascading exits on the basket without any
+        # confirmation that the "winning" bin actually sold.
+        if _placement_succeeded(result):
+            _trigger_tkh_hedge_resolved(pos)
+        return
+
+    # 2. Hedge resolved -- THIS bin crossed the confirm threshold (won
+    # the event).  Exit the SIBLINGS but hold this one for the full
+    # payout (or until take-profit fires).
+    if price >= TKH_CONFIRM_PRICE:
+        _trigger_tkh_hedge_resolved(pos)
+        # Do NOT mark this position exited; it's the winner.
+
+    # 3. Trailing stop (shared logic, single source of truth)
+    trail_decision = _evaluate_trail(entry_price, peak, price)
+    if trail_decision is not None:
+        trail_level, _tag = trail_decision
+        with _exit_lock:
+            if pid in _exited_positions:
+                return
+            _exited_positions.add(pid)
+        tier_pct = lookup_trail_pct(peak, TRAIL_TIERS) or 0.0
+        result = _execute_realtime_exit(
+            pos, trail_level, unrealized_pnl,
+            reason=(f"RT_TRAILING_STOP (TKH): price={price:.4f} <= "
+                    f"trail={trail_level:.4f} (peak={peak:.4f}, "
+                    f"tier={tier_pct:.0%} trail)")
+        )
+        _finalize_exit_attempt(
+            pid, result,
+            success_log=(
+                f"[ Trail Stop ]  |  {city}  |  {date_str} {side}  |  "
+                f"{bin_str}  |  Entry: ${entry_price:.4f}  |  "
+                f"Peak: ${peak:.4f}  |  Exit: ${trail_level:.4f}  |  "
+                f"Trail: {tier_pct:.0%}  |  "
+                f"P&L: ${(trail_level - entry_price) * shares:+.2f}"
+            ),
+            skip_label="Trail Stop", city=city, bin_str=bin_str,
+        )
+        return
+
+    # 4. Hard stop -- TKH_HARD_STOP_PCT (NOT EXIT_HARD_STOP_PCT).
+    # With TKH_HARD_STOP_PCT=0.99 (recommended for hedged baskets), this
+    # never fires in practice -- the bin tolerates near-total drawdown,
+    # since hedge-resolved or take-profit will have cleaned it up first.
+    hard_stop_level = entry_price * (1 - TKH_HARD_STOP_PCT)
+    if price <= hard_stop_level:
+        with _exit_lock:
+            if pid in _exited_positions:
+                return
+            _exited_positions.add(pid)
+        result = _execute_realtime_exit(
+            pos, price, unrealized_pnl,
+            reason=(f"RT_HARD_STOP (TKH): price={price:.4f} <= "
+                    f"stop={hard_stop_level:.4f} (entry={entry_price:.4f}, "
+                    f"{TKH_HARD_STOP_PCT*100:.0f}%)")
+        )
+        _finalize_exit_attempt(
+            pid, result,
+            success_log=(
+                f"[ Stop Loss ]  |  {city}  |  {date_str} {side}  |  "
+                f"{bin_str}  |  Entry: ${entry_price:.4f}  |  "
+                f"Exit: ${price:.4f}  |  "
+                f"P&L: ${(price - entry_price) * shares:+.2f}"
+            ),
+            skip_label="Stop Loss", city=city, bin_str=bin_str,
         )
 
 
@@ -266,21 +487,26 @@ def _check_tbv_exits(
         side = pos.get("side", "YES")
         bin_str = _bin_label(pos)
 
-        _execute_realtime_exit(
+        result = _execute_realtime_exit(
             pos, price, unrealized_pnl,
             reason=f"HARD_STOP: price={price:.4f} <= SL={float(sl_price):.4f} "
                    f"(entry={entry_price:.4f}, {EXIT_HARD_STOP_PCT*100:.0f}%)"
         )
-        logger.warning(
-            f"[ Stop Loss ]  |  {city}  |  {date_str} {side}  |  {bin_str}  |  "
-            f"Entry: ${entry_price:.4f}  |  Exit: ${price:.4f}  |  "
-            f"P&L: ${(price - entry_price) * shares:+.2f}"
+        _finalize_exit_attempt(
+            pid, result,
+            success_log=(
+                f"[ Stop Loss ]  |  {city}  |  {date_str} {side}  |  "
+                f"{bin_str}  |  Entry: ${entry_price:.4f}  |  "
+                f"Exit: ${price:.4f}  |  "
+                f"P&L: ${(price - entry_price) * shares:+.2f}"
+            ),
+            skip_label="Stop Loss", city=city, bin_str=bin_str,
         )
 
 
 def _execute_realtime_exit(
     pos: dict, exit_price: float, pnl: float, reason: str,
-) -> None:
+) -> dict | None:
     """Trigger an exit for a position that breached a real-time threshold.
 
     Paper mode: closes the position in DB (status='closed') with the
@@ -308,11 +534,71 @@ def _execute_realtime_exit(
         retry_count          = 0,
     )
     # Result dict logged at INFO inside execute_exit; nothing more to do.
-    if result.get("status") not in ("paper_closed", "exit_pending"):
+    # Known/handled return statuses (each represents a successful path,
+    # not an error -- so don't WARN-log them):
+    #   paper_closed                 - paper position closed in DB
+    #   exit_pending                 - live SELL placed on book
+    #   closed_via_balance_recovery  - balance-mismatch self-heal kicked in
+    #                                  (chain has 0; position correctly
+    #                                  marked closed at approximate PnL)
+    #   shares_resynced              - chain shares re-sync in progress;
+    #                                  next monitor cycle will retry
+    #   skip                         - "let it decay" gate fired
+    #                                  (price below MIN_EXIT_LIMIT_USDC)
+    _HANDLED_EXIT_STATUSES = {
+        "paper_closed", "exit_pending",
+        "closed_via_balance_recovery", "shares_resynced",
+        "skip",
+    }
+    if result.get("status") not in _HANDLED_EXIT_STATUSES:
         logger.warning(
             f"realtime exit for pos={pos.get('id')} returned unexpected "
             f"status={result.get('status')}: {result}"
         )
+    # Return the result so callers can decide whether to log the exit
+    # as "actually happened" vs "skipped" and whether to mark the
+    # position as exited in the in-memory cache.
+    return result
+
+
+def _placement_succeeded(result: dict | None) -> bool:
+    """True iff execute_exit actually placed/filled an order (vs. skip).
+
+    Used to gate the "[ Stop Loss ]" / "[ Trail Stop ]" / "[ Take Profit ]"
+    log lines and the _exited_positions cache write -- both should only
+    fire when a real CLOB order was placed (or a paper close happened).
+    """
+    if not result:
+        return False
+    s = result.get("status", "")
+    return s in ("paper_closed", "exit_pending", "closed_via_balance_recovery")
+
+
+def _finalize_exit_attempt(
+    pid: int, result: dict | None, success_log: str,
+    skip_label: str, city: str, bin_str: str,
+) -> None:
+    """After _execute_realtime_exit returns, decide whether the
+    "[ ... ]" warning fires (real exit happened) vs. the "[ ... SKIPPED ]"
+    info (gate blocked it -- e.g. price below MIN_EXIT_LIMIT_USDC, or
+    dust shares).  Also rolls back the eager _exited_positions cache
+    claim when the exit was skipped, so the position remains evaluable
+    on future ticks if price recovers.
+    """
+    if _placement_succeeded(result):
+        logger.warning(success_log)
+        return
+    # Skip path: roll back the eager claim, log INFO instead of WARN
+    with _exit_lock:
+        _exited_positions.discard(pid)
+    reason = ((result or {}).get("reason")
+              or (result or {}).get("status")
+              or "unknown")
+    logger.info(
+        f"[ {skip_label} SKIPPED ]  |  {city}  |  {bin_str}  |  "
+        f"pid={pid} -- exit gate blocked the order (reason={reason}). "
+        f"Position remains evaluable; will retry on price tick / next monitor."
+    )
 
 
 def _update_peak_in_db(pid: int, peak_price: float) -> None:

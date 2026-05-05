@@ -373,6 +373,22 @@ def _execute_exit_actions(actions, client) -> tuple[int, list[dict]]:
                 f"limit={result.get('limit_price', 0):.4f} "
                 f"intended={exit_price:.4f} | {ea.reason}"
             )
+        elif result.get("status") in (
+            "skip", "closed_via_balance_recovery", "shares_resynced",
+        ):
+            # Handled non-failure paths -- log at INFO with a clear label
+            # so the operator can distinguish "gate did its job" from
+            # "real failure".
+            #   skip                          - let-it-decay or dust gate fired
+            #   closed_via_balance_recovery   - chain held 0; self-heal closed
+            #   shares_resynced               - chain shares re-synced; retry next cycle
+            logger.info(
+                f"[EXIT SKIPPED] pos={ea.position_id} {ea.city} {ea.date} "
+                f"{ea.side} | {ea.classification} | "
+                f"status={result.get('status')} "
+                f"reason={result.get('reason') or '-'}"
+            )
+            executed -= 1   # not a real exit, but not an error either
         else:
             # error / failed / unmatched — leave position open and surface
             logger.warning(
@@ -738,8 +754,18 @@ def main():
         logger.warning(f"position_orders backfill failed (non-fatal): {_e}")
 
     # ----- Startup health check: validate ensemble API connectivity -----
-    # Only needed for weather-based strategies. MPV skips this entirely.
-    _needs_weather = ACTIVE_STRATEGY != "market_price_value"
+    # Only needed for weather-based strategies.  Strategies that trade
+    # purely on market price (MPV, TKH) skip the weather pipeline entirely
+    # for efficiency — no forecast pulls, observations, bias updates, or
+    # health checks against weather APIs.
+    #
+    # Allowlist semantics: a strategy is treated as needing weather data
+    # ONLY if it's explicitly listed below.  This is safer than the prior
+    # exclusion-list approach (`!= "market_price_value"`) because adding
+    # a new market-price strategy doesn't accidentally flip the bot into
+    # weather-pulling mode.
+    _WEATHER_DATA_STRATEGIES = {"top_bin_value"}
+    _needs_weather = ACTIVE_STRATEGY in _WEATHER_DATA_STRATEGIES
 
     if _needs_weather:
         from weather import _get_ecmwf_ensemble_distribution, _get_gfs_ensemble_distribution
@@ -785,7 +811,10 @@ def main():
             sys.exit(1)
         logger.log(SUMMARY, "Ensemble health check passed.")
     else:
-        logger.log(SUMMARY, "Strategy: market_price_value — skipping weather health check")
+        logger.log(SUMMARY,
+            f"Strategy: {ACTIVE_STRATEGY} — skipping weather health check "
+            f"(strategy doesn't use forecast data)"
+        )
 
     # Start WebSocket price stream immediately so stop-losses are active
     # while the slower startup loops (bias, forecast, trading) run.
@@ -868,7 +897,10 @@ def main():
             except Exception as e:
                 logger.warning(f"Startup bias update failed (non-fatal): {e}")
     else:
-        logger.log(SUMMARY, "Strategy: market_price_value — skipping weather data loops")
+        logger.log(SUMMARY,
+            f"Strategy: {ACTIVE_STRATEGY} — skipping weather data loops "
+            f"(forecast pulls, live observations, bias updates)"
+        )
 
     events = discovery_run()
     _cached_events_ref = events  # seed the module-level cache
@@ -1050,6 +1082,67 @@ def main():
         misfire_grace_time=120,
         coalesce=True,
     )
+
+    # Stale ENTRY-order repricer for ensure-fill strategies (TKH).
+    # Without this, TKH's hedged-bin entries placed at best_ask + 1c
+    # would rest below the new ask whenever the market drifted up, sit
+    # unfilled, and eventually get nuked by the cancel sweep -- locking
+    # the event out of re-entry forever via TKH per-event dedup.  This
+    # job chases the moving best_ask until the order crosses, ensuring
+    # all K bins per event ultimately fill.
+    def _stale_entry_refresh_job() -> None:
+        try:
+            from monitor import run_stale_entry_refresh_fast
+            run_stale_entry_refresh_fast()
+        except Exception as e:
+            logger.exception(f"Stale entry refresh job failed (non-fatal): {e}")
+
+    scheduler.add_job(
+        _stale_entry_refresh_job,
+        trigger=CronTrigger(minute="*/5", timezone="UTC"),
+        id="stale_entry_refresh",
+        name="Stale ensure-fill entry re-pricing (5-min)",
+        misfire_grace_time=120,
+        coalesce=True,
+    )
+
+    # Aggressive REST trade-fill polling -- DISABLED 2026-05-03.
+    #
+    # This job was doubling share counts because of a cold-start dedup
+    # race: when WS is degraded, the hourly REST safety-net synthesizes
+    # fake events with id="rest:{order_id}" and applies the aggregate
+    # fill to the position row.  Real trade event IDs (the actual trade
+    # hashes from Polymarket) never enter the dedup table because WS
+    # never delivered them.  When this poller starts pulling real trades
+    # via get_trades(), each real trade has a hash that's never been
+    # seen, so apply_trade_event treats it as a new fill and ADDS the
+    # chunks on top of what the synthetic event already applied.
+    # Result: every position doubled (db_shares = 2 x chain_size).
+    #
+    # The fix needed before re-enabling: a bootstrap pass that walks
+    # every active position's order_ids, fetches their trades, and marks
+    # each trade event as processed (without applying) IF the position
+    # row's shares already reflect that fill.  Only NEW trades after
+    # bootstrap should be applied.
+    #
+    # Until that bootstrap is implemented, leave this job out of the
+    # scheduler.  The hourly REST safety-net continues to work as before.
+    #
+    # def _trade_fill_poll_job() -> None:
+    #     try:
+    #         from monitor import run_trade_fill_poll_fast
+    #         run_trade_fill_poll_fast()
+    #     except Exception as e:
+    #         logger.exception(f"Trade-fill poll job failed (non-fatal): {e}")
+    #
+    # scheduler.add_job(
+    #     _trade_fill_poll_job,
+    #     trigger=CronTrigger(minute="*/2", timezone="UTC"),
+    #     id="trade_fill_poll",
+    #     name="Aggressive trade-fill polling (2-min)",
+    #     misfire_grace_time=60,
+    #     coalesce=True,
+    # )
 
     # Bias update: daily at 05:00 UTC.  Fetches the last 14 days of VC
     # observations + Open-Meteo Previous Runs ECMWF/GFS forecasts for every

@@ -66,7 +66,10 @@ def _ensure_file_handler() -> None:
             bot_dir = os.path.dirname(os.path.abspath(__file__))
             logs_dir = os.path.join(bot_dir, "logs")
             os.makedirs(logs_dir, exist_ok=True)
-            handler = logging.FileHandler(os.path.join(logs_dir, "activity.log"))
+            handler = logging.FileHandler(
+                os.path.join(logs_dir, "activity.log"),
+                encoding="utf-8",
+            )
             handler.setLevel(logging.INFO)
             handler.setFormatter(logging.Formatter(
                 "%(asctime)s | %(levelname)-5s | %(message)s",

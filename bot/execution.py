@@ -429,13 +429,29 @@ def execute_signal(signal: dict, client: ClobClient | None = None) -> dict:
         LIQUIDITY_AWARE_SIZING,
         MAX_TAKE_PCT_OF_ASK_DEPTH,
         MIN_FILLABLE_USDC,
+        ENSURE_FILL_MIN_FILLABLE_USDC,
+        ENSURE_FILL_STRATEGIES,
     )
     sweepable_usdc = float(_sweep_diag.get("sweepable_usdc", 0) or 0)
     final_size_usdc = size_usdc
     cap_diag = ""
+
+    # Strategy-aware min-fillable floor.  Ensure-fill strategies (TKH)
+    # MUST own every bin in the basket; the per-event dedup blocks any
+    # retry once an event has been touched.  So a thin-book skip is
+    # PERMANENT for those bins -- they break the hedge thesis.  We
+    # therefore lower the min-fillable floor to Polymarket's $1 minimum
+    # (+ buffer) for ensure-fill strategies and place WHATEVER the book
+    # allows.  The repricer + topup loop will chase any remaining gap.
+    sig_strategy = (signal.get("strategy") or ACTIVE_STRATEGY or "").strip()
+    is_ensure_fill = sig_strategy in ENSURE_FILL_STRATEGIES
+    effective_min_fillable = (
+        ENSURE_FILL_MIN_FILLABLE_USDC if is_ensure_fill else MIN_FILLABLE_USDC
+    )
+
     if LIQUIDITY_AWARE_SIZING and sweepable_usdc > 0:
         max_take = sweepable_usdc * MAX_TAKE_PCT_OF_ASK_DEPTH
-        if max_take < MIN_FILLABLE_USDC:
+        if max_take < effective_min_fillable:
             from activity import log_activity
             log_activity(
                 "RISK", level="WARN",
@@ -443,10 +459,12 @@ def execute_signal(signal: dict, client: ClobClient | None = None) -> dict:
                     f"BUY skipped (book too thin): {side} ${size_usdc:.2f} "
                     f"{signal.get('city')} {signal.get('date')} {contract_id[:12]} "
                     f"— acceptable ask depth ${sweepable_usdc:.2f}, "
-                    f"max take ${max_take:.2f} < floor ${MIN_FILLABLE_USDC:.2f}"
+                    f"max take ${max_take:.2f} < floor ${effective_min_fillable:.2f}"
+                    + (f" (ensure-fill {sig_strategy})" if is_ensure_fill else "")
                 ),
                 contract_id=contract_id, sweepable_usdc=sweepable_usdc,
-                max_take=max_take, min_floor=MIN_FILLABLE_USDC,
+                max_take=max_take, min_floor=effective_min_fillable,
+                ensure_fill=is_ensure_fill, strategy=sig_strategy,
             )
             return {"status": "skip", "reason": "book_too_thin",
                     "sweepable_usdc": sweepable_usdc, "max_take": max_take}
@@ -456,6 +474,8 @@ def execute_signal(signal: dict, client: ClobClient | None = None) -> dict:
                 f" CAPPED: intended=${size_usdc:.2f} → ${final_size_usdc:.2f} "
                 f"(ask_depth=${sweepable_usdc:.2f} × "
                 f"{MAX_TAKE_PCT_OF_ASK_DEPTH*100:.0f}%)"
+                + (" [ensure-fill: repricer/topup will chase remainder]"
+                   if is_ensure_fill else "")
             )
     logger.info(
         f"[SWEEP] {contract_id[:12]} side={side} "
@@ -998,6 +1018,107 @@ def execute_exit(
             # but defensive
             return {"status": "error", "reason": f"bad retry_count={retry_count}"}
         limit_price = rung_price
+
+    # ---- "Let it decay" gate ----
+    # If the computed limit is below the platform's recoverable
+    # threshold, skip the exit attempt entirely and let the position
+    # ride to market resolution (where it'll settle at zero anyway).
+    # Selling at minimum tick generates fees with negligible recovery
+    # and the CLOB rejects sub-minimum limits with "invalid price".
+    #
+    # Polymarket runs two tick-size regimes per market:
+    #   * $0.001 tick -> minimum price $0.001 (most markets)
+    #   * $0.01 tick  -> minimum price $0.01  (some markets, common
+    #     for thin/decayed bins)
+    # We can't tell which a market uses without extra metadata, so the
+    # default floor is set to $0.011 -- just above the higher-of-two
+    # minimums.  This safely skips both "invalid price (0.0005)" (from
+    # $0.001-tick markets) and "invalid price (0.0099), min: 0.01"
+    # (from $0.01-tick markets) errors at the cost of giving up on
+    # exits between $0.005 and $0.011 -- which were never going to
+    # recover meaningful capital anyway.  Tunable via env.
+    import os as _os
+    _MIN_EXIT_LIMIT = float(_os.getenv("MIN_EXIT_LIMIT_USDC", "0.011"))
+    if limit_price < _MIN_EXIT_LIMIT:
+        logger.info(
+            f"execute_exit pid={pid}: skipping -- computed limit "
+            f"${limit_price:.4f} < MIN_EXIT_LIMIT_USDC ${_MIN_EXIT_LIMIT:.4f}.  "
+            f"Position is essentially worthless ({shares:.2f} shares); "
+            f"letting it decay to market resolution."
+        )
+        try:
+            from activity import log_activity
+            log_activity(
+                "SELL", level="INFO", position_id=pid,
+                message=(
+                    f"exit skipped -- price decayed below recoverable "
+                    f"threshold (limit=${limit_price:.4f} < "
+                    f"${_MIN_EXIT_LIMIT:.4f}).  Letting position decay "
+                    f"to market resolution: {pos.get('city')} "
+                    f"{pos.get('date')} {contract_id[:12]}"
+                ),
+                contract_id=contract_id, side=side,
+                limit_price=limit_price, min_exit_limit=_MIN_EXIT_LIMIT,
+                shares=shares, exit_reason=exit_reason,
+            )
+        except Exception:
+            pass
+        return {
+            "status": "skip",
+            "reason": "below_recoverable_threshold",
+            "limit_price": limit_price,
+            "min_exit_limit": _MIN_EXIT_LIMIT,
+        }
+
+    # ---- "Dust shares" gate ----
+    # py_clob_client_v2 internally rounds order size to 4 decimal places
+    # when encoding to CLOB.  A residual position with shares < ~0.01
+    # rounds to 0 in that encoding, so the maker_amount = 0 and Polymarket
+    # rejects with "invalid amounts, maker and taker amount must be
+    # higher than 0".  More importantly, even if the encoding accepted
+    # tiny sizes, the recoverable USDC (shares * limit_price) would be
+    # below sensible minimums.
+    #
+    # Skip the exit when shares*limit_price < $0.05 (5 cents).  The
+    # orphan_db auto-close path will collect these dust positions on
+    # its next pass.  Tunable via env.
+    _MIN_EXIT_USDC = float(_os.getenv("MIN_EXIT_USDC", "0.05"))
+    _potential_proceeds = float(shares) * float(limit_price)
+    if _potential_proceeds < _MIN_EXIT_USDC:
+        logger.info(
+            f"execute_exit pid={pid}: skipping -- only "
+            f"{shares:.4f} shares left at limit ${limit_price:.4f} = "
+            f"${_potential_proceeds:.4f} potential proceeds < "
+            f"MIN_EXIT_USDC ${_MIN_EXIT_USDC:.4f}.  Dust position; "
+            f"letting orphan-db auto-close handle it."
+        )
+        try:
+            from activity import log_activity
+            log_activity(
+                "SELL", level="INFO", position_id=pid,
+                message=(
+                    f"exit skipped -- dust shares ({shares:.4f}) at "
+                    f"${limit_price:.4f} = ${_potential_proceeds:.4f} "
+                    f"< ${_MIN_EXIT_USDC:.4f} floor.  Auto-close will "
+                    f"collect: {pos.get('city')} {pos.get('date')} "
+                    f"{contract_id[:12]}"
+                ),
+                contract_id=contract_id, side=side,
+                shares=shares, limit_price=limit_price,
+                potential_proceeds=_potential_proceeds,
+                min_exit_usdc=_MIN_EXIT_USDC,
+                exit_reason=exit_reason,
+            )
+        except Exception:
+            pass
+        return {
+            "status": "skip",
+            "reason": "dust_shares",
+            "shares": shares,
+            "limit_price": limit_price,
+            "potential_proceeds": _potential_proceeds,
+            "min_exit_usdc": _MIN_EXIT_USDC,
+        }
 
     # Place CLOB sell
     try:
@@ -1716,13 +1837,26 @@ def execute_topup(
         LIQUIDITY_AWARE_SIZING,
         MAX_TAKE_PCT_OF_ASK_DEPTH,
         MIN_FILLABLE_USDC,
+        ENSURE_FILL_MIN_FILLABLE_USDC,
+        ENSURE_FILL_STRATEGIES,
     )
     sweepable_usdc_t = float(_topup_diag.get("sweepable_usdc", 0) or 0)
     final_add_usdc = add_amount_usdc
     cap_diag_t = ""
+
+    # Strategy-aware floor: ensure-fill positions (TKH) use a lower
+    # min-fillable floor so a thin book doesn't permanently halt the
+    # top-up loop's progress toward target_size_usdc.  Same rationale
+    # as the matching block in execute_signal.
+    pos_strategy = (pos.get("strategy") or ACTIVE_STRATEGY or "").strip()
+    is_ensure_fill_t = pos_strategy in ENSURE_FILL_STRATEGIES
+    effective_min_fillable_t = (
+        ENSURE_FILL_MIN_FILLABLE_USDC if is_ensure_fill_t else MIN_FILLABLE_USDC
+    )
+
     if LIQUIDITY_AWARE_SIZING and sweepable_usdc_t > 0:
         max_take_t = sweepable_usdc_t * MAX_TAKE_PCT_OF_ASK_DEPTH
-        if max_take_t < MIN_FILLABLE_USDC:
+        if max_take_t < effective_min_fillable_t:
             from activity import log_activity
             log_activity(
                 "TOPUP", level="WARN", position_id=pid,
@@ -1730,9 +1864,12 @@ def execute_topup(
                     f"top-up skipped (book too thin): pid={pid} "
                     f"+${add_amount_usdc:.2f} {contract_id[:12]} — "
                     f"acceptable ask depth ${sweepable_usdc_t:.2f}, "
-                    f"max take ${max_take_t:.2f} < floor ${MIN_FILLABLE_USDC:.2f}"
+                    f"max take ${max_take_t:.2f} < floor ${effective_min_fillable_t:.2f}"
+                    + (f" (ensure-fill {pos_strategy})" if is_ensure_fill_t else "")
                 ),
                 contract_id=contract_id, sweepable_usdc=sweepable_usdc_t,
+                max_take=max_take_t, min_floor=effective_min_fillable_t,
+                ensure_fill=is_ensure_fill_t, strategy=pos_strategy,
             )
             return {"status": "skip", "reason": "book_too_thin",
                     "sweepable_usdc": sweepable_usdc_t}
@@ -1742,6 +1879,8 @@ def execute_topup(
                 f" CAPPED: intended=${add_amount_usdc:.2f} → ${final_add_usdc:.2f} "
                 f"(ask_depth=${sweepable_usdc_t:.2f} × "
                 f"{MAX_TAKE_PCT_OF_ASK_DEPTH*100:.0f}%)"
+                + (" [ensure-fill: will retry next cycle]"
+                   if is_ensure_fill_t else "")
             )
     logger.info(
         f"[SWEEP TOPUP] pid={pid} {contract_id[:12]} "

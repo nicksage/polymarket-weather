@@ -2267,6 +2267,14 @@ with _tab_live:
     _live_open = _live_all[_live_all["status"] == "open"].copy() if not _live_all.empty else pd.DataFrame()
     if not _live_open.empty and "fill_status" in _live_open.columns:
         _live_open = _live_open[_live_open["fill_status"] != "cancelled"]
+        # Hide fully-unfilled pending rows — they already appear in the
+        # In-Flight Orders > Pending Buys table above with full lifecycle
+        # detail.  A partial fill (shares > 0) keeps the row in Open since
+        # it represents real on-chain exposure.
+        _shares_col = pd.to_numeric(_live_open.get("shares"), errors="coerce").fillna(0)
+        _live_open = _live_open[
+            (_live_open["fill_status"] != "pending") | (_shares_col > 0)
+        ]
     _live_closed = _live_all[_live_all["status"] == "closed"].copy() if not _live_all.empty else pd.DataFrame()
     if not _live_closed.empty and "fill_status" in _live_closed.columns:
         _live_closed = _live_closed[_live_closed["fill_status"] != "cancelled"]
