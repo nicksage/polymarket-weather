@@ -250,6 +250,40 @@ def get_clob_client() -> ClobClient | None:
     return client
 
 
+def _compute_rank_for_position(position: dict) -> int:
+    """Derive the TKH bin rank for an existing position by comparing its
+    target_size_usdc against open siblings in the same event.  Rank 0 = the
+    largest target in the event (typically a $14 bin under a $20 budget),
+    rank 1 = the next largest, etc.
+
+    Used by execute_topup to look up the right walk_cents from
+    TKH_RANK_WALK_CENTS — top-ups should match the per-rank execution
+    aggressiveness used at initial entry (see execute_signal).
+
+    Returns 0 on missing event_id, missing target, or DB error so that the
+    caller falls back to the most aggressive (rank 0) walk_cents — safer
+    than skipping the top-up entirely.
+    """
+    event_id = position.get("event_id")
+    target   = float(position.get("target_size_usdc") or 0)
+    if not event_id or target <= 0:
+        return 0
+    try:
+        from db import _get_conn
+        with _get_conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM positions "
+                "WHERE strategy = 'top_k_hedged' "
+                "  AND event_id = ? "
+                "  AND COALESCE(is_paper, 0) = 0 "
+                "  AND target_size_usdc > ?",
+                (event_id, target),
+            ).fetchone()
+        return int(row["n"]) if row else 0
+    except Exception:
+        return 0
+
+
 def execute_signal(signal: dict, client: ClobClient | None = None) -> dict:
     """
     Execute a trade signal on Polymarket, or simulate it in paper trading mode.
@@ -409,17 +443,40 @@ def execute_signal(signal: dict, client: ClobClient | None = None) -> dict:
     # up to (best_ask + ORDERBOOK_WALK_CENTS) capped at MPV_MAX_PRICE.
     # Polymarket matches against asks ≤ limit cheapest-first and rests
     # the unfilled portion at our limit on the book.
-    from config import ORDERBOOK_WALK_CENTS
+    from config import ORDERBOOK_WALK_CENTS, TKH_RANK_WALK_CENTS
     try:
         from strategies.market_price_value import MPV_MAX_PRICE as _MAX_BUY_PRICE
     except Exception:
         _MAX_BUY_PRICE = 0.99   # fallback when MPV strategy isn't loaded
+
+    # Per-rank execution aggressiveness for TKH.
+    # TKH bins of different ranks live in books of very different depth:
+    #   rank 0 ($14 with $20 budget): deep book; aggressive sweep is fine
+    #   rank 1 ($5):                  medium; at-the-ask limit is enough
+    #   rank 2 ($3):                  thin; passive limit catches better
+    #                                       prices, repricer escalates if
+    #                                       no fill within ~5 min
+    # Non-TKH strategies (TBV/MPV) use ORDERBOOK_WALK_CENTS as before.
+    sig_strategy_for_walk = (signal.get("strategy") or "").strip()
+    if sig_strategy_for_walk == "top_k_hedged":
+        sig_rank = int(signal.get("tkh_bin_rank") or 0)
+        # Look up walk_cents for this rank; fall back to last value when
+        # rank exceeds the configured list (e.g., extras from
+        # fill_missing_bins).
+        if TKH_RANK_WALK_CENTS:
+            idx = min(sig_rank, len(TKH_RANK_WALK_CENTS) - 1)
+            walk_cents = TKH_RANK_WALK_CENTS[idx]
+        else:
+            walk_cents = ORDERBOOK_WALK_CENTS
+    else:
+        walk_cents = ORDERBOOK_WALK_CENTS
+
     limit_price, _sweep_diag = compute_sweep_limit(
         client       = client,
         token_id     = token_id,
         intended_price = entry_price,
         max_cap      = _MAX_BUY_PRICE,
-        walk_cents   = ORDERBOOK_WALK_CENTS,
+        walk_cents   = walk_cents,
     )
     # Cap by ask-side depth at acceptable prices (replaces the old
     # "% of Gamma's total liquidity" rule which used a wrong basis).
@@ -850,6 +907,26 @@ def compute_sweep_limit(
         return fallback, {"source": "fallback_no_asks", "best_bid": snap["best_bid"]}
 
     raw_limit = best_ask + walk_cents / 100.0
+
+    # Passive-mode handling: when walk_cents < 0, the caller wants to
+    # rest BELOW the best_ask (between bid and ask) instead of crossing
+    # the spread.  We must:
+    #   (a) cap below best_ask - 1 tick so we don't accidentally cross
+    #   (b) clamp ABOVE best_bid + 1 tick so we beat existing bids on
+    #       price-time priority and become the new best_bid (if no bid
+    #       exists, just use raw_limit).
+    # Result: a passive limit that rests at the top of the bid stack,
+    # waiting for a seller to hit us.  If unfilled within ~5 min the
+    # stale-entry repricer will cancel + re-place at best_ask + 1c.
+    if walk_cents < 0:
+        best_bid = snap.get("best_bid")
+        if best_bid is not None:
+            raw_limit = max(raw_limit, best_bid + 0.001)
+        # Defensive: keep our passive limit strictly below the ask so
+        # we don't accidentally become marketable when walk_cents = -1
+        # rounds up to the ask.
+        raw_limit = min(raw_limit, best_ask - 0.001)
+
     capped    = min(raw_limit, max_cap)
     # Round to Polymarket's tick size (0.01 most markets — we round to
     # 4dp to be safe for fractional-cent ticks).
@@ -860,10 +937,17 @@ def compute_sweep_limit(
         p * s for (p, s) in snap["asks_sorted_asc"] if p <= limit + 1e-9
     )
 
+    if walk_cents < 0:
+        source = "passive"
+    elif raw_limit <= max_cap:
+        source = "sweep"
+    else:
+        source = "fallback_capped_at_max"
+
     return limit, {
-        "source":         ("sweep" if raw_limit <= max_cap else "fallback_capped_at_max"),
+        "source":         source,
         "best_ask":       best_ask,
-        "best_bid":       snap["best_bid"],
+        "best_bid":       snap.get("best_bid"),
         "spread_cents":   snap["spread_cents"],
         "sweepable_usdc": round(sweepable, 4),
     }
@@ -1819,17 +1903,33 @@ def execute_topup(
 
     # Same orderbook-aware sweep as execute_signal — capture cheap asks first,
     # rest the remainder at our limit.  See compute_sweep_limit's docstring.
-    from config import ORDERBOOK_WALK_CENTS
+    from config import ORDERBOOK_WALK_CENTS, TKH_RANK_WALK_CENTS
     try:
         from strategies.market_price_value import MPV_MAX_PRICE as _MAX_BUY_PRICE
     except Exception:
         _MAX_BUY_PRICE = 0.99
+
+    # Per-rank execution aggressiveness — mirror execute_signal so top-ups
+    # use the same passive-vs-aggressive choice the initial buy used.
+    # The signal dict that carried tkh_bin_rank is long gone by top-up
+    # time, so derive rank from the position's siblings in the DB.
+    pos_strategy_for_walk = (position.get("strategy") or "").strip()
+    if pos_strategy_for_walk == "top_k_hedged":
+        pos_rank = _compute_rank_for_position(position)
+        if TKH_RANK_WALK_CENTS:
+            idx = min(pos_rank, len(TKH_RANK_WALK_CENTS) - 1)
+            walk_cents = TKH_RANK_WALK_CENTS[idx]
+        else:
+            walk_cents = ORDERBOOK_WALK_CENTS
+    else:
+        walk_cents = ORDERBOOK_WALK_CENTS
+
     limit_price, _topup_diag = compute_sweep_limit(
         client       = client,
         token_id     = token_id,
         intended_price = entry_price,
         max_cap      = _MAX_BUY_PRICE,
-        walk_cents   = ORDERBOOK_WALK_CENTS,
+        walk_cents   = walk_cents,
     )
     # Same ask-depth cap as execute_signal — uses the fresh orderbook
     # snapshot from compute_sweep_limit above.

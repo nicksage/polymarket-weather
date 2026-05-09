@@ -425,6 +425,32 @@ ENSURE_FILL_MIN_FILLABLE_USDC: float = _float(
 )
 ENSURE_FILL_STRATEGIES: set[str] = {"top_k_hedged"}
 
+# Per-rank execution aggressiveness for TKH bins.  Format: colon-
+# separated walk_cents (relative to best_ask) for ranks 0, 1, 2, ...
+# Positive = above best_ask (aggressive, marketable); 0 = at the ask
+# (marketable but no premium); negative = below best_ask (passive,
+# rests between bid and ask, fills only when seller hits us).
+#
+# Default "1:0:-3" = rank 0 aggressive (current behaviour, +1c above
+# ask for fast fills on the largest bin), rank 1 at-the-ask (still
+# marketable but doesn't pay the spread premium), rank 2+ passive
+# (-3c below ask) so smaller thin-book bins try to catch sellers
+# at a better price first; if not filled within ~5 min the stale-
+# entry repricer escalates to aggressive automatically.
+#
+# Set to "1:1:1" to revert to the legacy "+1c for everything" behaviour.
+def _parse_rank_walks(raw: str | None) -> list[int]:
+    if not raw:
+        return [1, 0, -3]
+    try:
+        out = [int(x.strip()) for x in raw.split(":") if x.strip()]
+        return out if out else [1, 0, -3]
+    except (ValueError, AttributeError):
+        return [1, 0, -3]
+TKH_RANK_WALK_CENTS: list[int] = _parse_rank_walks(
+    os.getenv("TKH_RANK_WALK_CENTS")
+)
+
 # Drift auto-healing.  When True, the monitor's on-chain reconciliation
 # does not just LOG share_drift -- it AUTOMATICALLY syncs the position
 # row to chain truth (shares + entry_price + size_usdc).  Without this,
