@@ -464,6 +464,21 @@ header .meta { font-family: monospace; font-size: 11px; color: #9ca3af; }
 .filters label { font-weight: 600; color: #374151; margin-right: 4px; }
 .filters select, .filters input { padding: 3px 6px; font-size: 12px; }
 .filters .count { color: #6b7280; font-family: monospace; margin-left: auto; }
+.sizing { background: #1f2937; color: #f3f4f6; padding: 10px 18px;
+          display: flex; gap: 22px; flex-wrap: wrap; align-items: center;
+          font-size: 12px; border-bottom: 1px solid #374151; }
+.sizing label { font-weight: 600; color: #d1d5db; margin-right: 4px; }
+.sizing .mode { display: inline-flex; border: 1px solid #4b5563; border-radius: 4px;
+                overflow: hidden; }
+.sizing .mode button { background: #374151; color: #d1d5db; border: none;
+                       padding: 3px 10px; font-size: 11px; cursor: pointer; }
+.sizing .mode button.active { background: #4338ca; color: white; }
+.sizing input[type=number] { width: 70px; padding: 3px 6px; background: #374151;
+                              border: 1px solid #4b5563; color: white;
+                              border-radius: 3px; }
+.sizing .result { color: #fbbf24; font-family: monospace; font-weight: 600; }
+.sizing .result.neg { color: #f87171; }
+.sizing .hint { color: #9ca3af; font-size: 11px; }
 table { width: calc(100% - 36px); margin: 0 18px 18px; background: white;
         border-collapse: collapse; box-shadow: 0 1px 3px rgba(0,0,0,0.06);
         border-radius: 6px; overflow: hidden; font-size: 12px; }
@@ -672,6 +687,29 @@ def render_dashboard(trades: list[dict], coverage: dict, args) -> str:
     <div class='val'>{len(skipped_priced):,}</div></div>
 </div>
 
+<div class='sizing'>
+  <div><label>Stake mode</label>
+    <span class='mode'>
+      <button id='m-fixed' class='active'>Fixed $/trade</button>
+      <button id='m-kelly'>Fractional Kelly</button>
+      <button id='m-compound'>Compound (start bankroll)</button>
+    </span>
+  </div>
+  <div id='input-fixed'><label>$ per trade</label>
+    <input id='stake-fixed' type='number' value='20' min='1' step='5'></div>
+  <div id='input-kelly' style='display:none'><label>Bankroll $</label>
+    <input id='stake-bank' type='number' value='1000' min='10' step='100'>
+    <label style='margin-left:8px'>Kelly fraction</label>
+    <input id='kelly-frac' type='number' value='0.25' min='0.05' max='1' step='0.05'>
+    <span class='hint'>(0.25 = quarter-Kelly, safer; 1.0 = full Kelly, aggressive)</span></div>
+  <div id='input-compound' style='display:none'><label>Start bankroll $</label>
+    <input id='stake-start' type='number' value='1000' min='10' step='100'>
+    <label style='margin-left:8px'>% of bankroll/trade</label>
+    <input id='stake-pct' type='number' value='5' min='0.5' max='50' step='0.5'></div>
+  <div class='result' id='sizing-result'>—</div>
+  <div class='hint'>(applies to the currently-filtered BUY_YES trades)</div>
+</div>
+
 <div class='charts'>
   <div class='chart-card'><h3>Entry price distribution (green % = win rate)</h3>
     {price_hist_svg}</div>
@@ -798,7 +836,129 @@ document.querySelectorAll('th').forEach(th => {{
 }});
 ['f-status','f-city','f-min','f-max'].forEach(id =>
   $(id).addEventListener('input', render));
+
+// ===== Sizing controls =====
+let SIZING_MODE = 'fixed';   // 'fixed' | 'kelly' | 'compound'
+
+function setSizingMode(m) {{
+  SIZING_MODE = m;
+  ['fixed','kelly','compound'].forEach(x => {{
+    $('m-'+x).classList.toggle('active', x === m);
+    $('input-'+x).style.display = (x === m) ? '' : 'none';
+  }});
+  updateSizing();
+}}
+['fixed','kelly','compound'].forEach(m =>
+  $('m-'+m).addEventListener('click', () => setSizingMode(m)));
+
+// Compute sizing on the currently-filtered BUY_YES trades only
+function getBuyTrades() {{
+  const status = $('f-status').value;
+  const city = $('f-city').value;
+  const lo = parseFloat($('f-min').value);
+  const hi = parseFloat($('f-max').value);
+  return TRADES.filter(t => {{
+    if (t.action !== 'BUY_YES') return false;
+    if (city && t.city !== city) return false;
+    if (!isNaN(lo) && t.entry_price < lo) return false;
+    if (!isNaN(hi) && t.entry_price > hi) return false;
+    // Honor "Wins/Losses only" so user can see "what if I only had the wins"
+    if (status === 'WIN'  && !t.won) return false;
+    if (status === 'LOSS' &&  t.won) return false;
+    return true;
+  }});
+}}
+
+function updateSizing() {{
+  const trades = getBuyTrades();
+  const n = trades.length;
+  if (n === 0) {{ $('sizing-result').textContent = 'no trades match filters'; return; }}
+
+  let out = '';
+  if (SIZING_MODE === 'fixed') {{
+    const stake = parseFloat($('stake-fixed').value) || 0;
+    const totalCost = n * stake;
+    const totalPnl  = trades.reduce((s, t) => s + (t.pnl * stake), 0);
+    const wins      = trades.filter(t => t.won).length;
+    out = `${{n}} trades × $${{stake.toFixed(0)}} = `
+        + `$${{totalCost.toLocaleString()}} deployed · `
+        + `P&L $${{totalPnl >= 0 ? '+' : ''}}${{totalPnl.toFixed(2)}} · `
+        + `ROI ${{(100*totalPnl/totalCost).toFixed(1)}}% · `
+        + `${{wins}}W/${{n-wins}}L`;
+    if (totalPnl < 0) $('sizing-result').classList.add('neg');
+    else $('sizing-result').classList.remove('neg');
+  }} else if (SIZING_MODE === 'kelly') {{
+    const bank    = parseFloat($('stake-bank').value) || 0;
+    const frac    = parseFloat($('kelly-frac').value) || 0;
+    // Kelly per trade requires p(win); we use the BUCKET'S empirical win rate
+    // (so trades near same entry price share the same p estimate).
+    const buckets = [[0,0.2],[0.2,0.4],[0.4,0.6],[0.6,0.8],[0.8,1.01]];
+    const bWins = {{}}, bN = {{}};
+    for (const t of trades) {{
+      for (const [lo,hi] of buckets) {{
+        if (t.entry_price >= lo && t.entry_price < hi) {{
+          const k = lo+'-'+hi;
+          bN[k] = (bN[k]||0) + 1;
+          if (t.won) bWins[k] = (bWins[k]||0) + 1;
+          break;
+        }}
+      }}
+    }}
+    let totalCost = 0, totalPnl = 0, wins = 0;
+    for (const t of trades) {{
+      for (const [lo,hi] of buckets) {{
+        if (t.entry_price >= lo && t.entry_price < hi) {{
+          const k = lo+'-'+hi;
+          const p = (bWins[k]||0) / Math.max(1, bN[k]);
+          const B = (1/t.entry_price) - 1;   // payout odds
+          const fStar = (p*B - (1-p)) / B;   // full-Kelly fraction
+          const stake = Math.max(0, bank * frac * fStar);
+          if (stake <= 0) break;
+          totalCost += stake;
+          totalPnl  += t.pnl * stake;
+          if (t.won) wins++;
+          break;
+        }}
+      }}
+    }}
+    out = `bankroll $${{bank.toLocaleString()}} × ${{frac.toFixed(2)}}-Kelly · `
+        + `$${{totalCost.toFixed(0)}} deployed across ${{n}} trades · `
+        + `P&L $${{totalPnl >= 0 ? '+' : ''}}${{totalPnl.toFixed(2)}} · `
+        + `${{wins}}W/${{n-wins}}L`;
+    if (totalPnl < 0) $('sizing-result').classList.add('neg');
+    else $('sizing-result').classList.remove('neg');
+  }} else {{
+    // Compound: % of CURRENT bankroll on each trade, chronologically
+    const start = parseFloat($('stake-start').value) || 0;
+    const pct   = parseFloat($('stake-pct').value)/100 || 0;
+    let bank = start;
+    const sorted = trades.slice().sort((a,b) => a.date.localeCompare(b.date));
+    let wins = 0;
+    for (const t of sorted) {{
+      const stake = bank * pct;
+      bank += t.pnl * stake;
+      if (t.won) wins++;
+    }}
+    const ret = (bank/start - 1) * 100;
+    out = `start $${{start.toLocaleString()}} → end $${{bank.toFixed(2)}} `
+        + `(${{ret >= 0 ? '+' : ''}}${{ret.toFixed(1)}}%) · `
+        + `${{n}} trades @ ${{(pct*100).toFixed(1)}}% bankroll/trade · `
+        + `${{wins}}W/${{n-wins}}L`;
+    if (bank < start) $('sizing-result').classList.add('neg');
+    else $('sizing-result').classList.remove('neg');
+  }}
+  $('sizing-result').textContent = out;
+}}
+
+['stake-fixed','stake-bank','kelly-frac','stake-start','stake-pct'].forEach(id =>
+  $(id).addEventListener('input', updateSizing));
+
+// Re-run sizing whenever filters change too (wrap existing handlers)
+['f-status','f-city','f-min','f-max'].forEach(id =>
+  $(id).addEventListener('input', updateSizing));
+
 render();
+updateSizing();
 </script>
 </body></html>"""
 
