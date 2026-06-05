@@ -73,6 +73,19 @@ from config       import DB_PATH        # type: ignore
 
 STATION_DB = os.path.join(_BOT_DIR, "data", "station_obs.db")
 
+# Default path to the user's standalone price collector DB on the VPS.
+# Override with --price-db.  The collector schema is:
+#   events           (event_id, city, date, event_title, n_bins, ...)
+#   bins             (id, event_id, contract_id, question,
+#                     range_low, range_high, unit, yes_token_id, no_token_id)
+#   price_snapshots  (id, event_id, contract_id, yes_price,
+#                     volume_usd, liquidity_usd, recorded_at)
+#   resolutions      (event_id, city, date, winning_contract_id,
+#                     winning_range_low, winning_range_high, resolved_at)
+DEFAULT_COLLECTOR_DB = os.path.expanduser(
+    "~/apps/weather-data/backtest-collector/data/prices.db"
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-7s | %(message)s",
@@ -81,62 +94,86 @@ log = logging.getLogger("backtest")
 
 
 # ---------------------------------------------------------------------------
-# Bin metadata resolution
+# Collector-DB loaders
+# (schema confirmed from VPS: ~/apps/weather-data/backtest-collector/data/prices.db)
 # ---------------------------------------------------------------------------
 
-def load_bin_metadata(conn) -> dict[str, dict]:
-    """Return {contract_id: {range_low, range_high, unit, city, date}}.
-    Tries temp_outcomes first (covers all bins the bot ever saw), falls
-    back to positions (only traded bins) for anything missing."""
-    out: dict[str, dict] = {}
+def _open_ro(path: str) -> sqlite3.Connection:
+    """Read-only, lock-tolerant connection to a DB the collector may be
+    actively writing to.  Returns a row-factory connection."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"prices.db not found at {path}")
+    conn = sqlite3.connect(
+        f"file:{path}?mode=ro",
+        uri=True,
+        timeout=60,
+        check_same_thread=False,
+    )
+    conn.row_factory = sqlite3.Row
+    return conn
 
-    # temp_outcomes is the richest source.  Schema differs slightly across
-    # bot versions; guard with try/except.
-    try:
-        rows = conn.execute(
-            """
-            SELECT DISTINCT
-                o.contract_id, o.range_low, o.range_high, o.unit,
-                e.city, e.date
-            FROM temp_outcomes o
-            JOIN temp_events  e ON o.event_row_id = e.id
-            WHERE o.contract_id IS NOT NULL
-              AND o.range_low IS NOT NULL OR o.range_high IS NOT NULL
-            """
-        ).fetchall()
-        for r in rows:
-            cid = r[0]
-            if cid and cid not in out:
-                out[cid] = {
-                    "range_low":  r[1], "range_high": r[2],
-                    "unit":       r[3] or "celsius",
-                    "city":       r[4], "date": r[5],
-                }
-    except sqlite3.OperationalError as e:
-        log.debug(f"temp_outcomes lookup failed: {e}")
 
-    # Fill gaps from positions table
-    try:
-        rows = conn.execute(
-            """
-            SELECT DISTINCT contract_id, range_low, range_high, unit, city, date
-            FROM positions
-            WHERE contract_id IS NOT NULL
-              AND (range_low IS NOT NULL OR range_high IS NOT NULL)
-            """
-        ).fetchall()
-        for r in rows:
-            cid = r[0]
-            if cid and cid not in out:
-                out[cid] = {
-                    "range_low":  r[1], "range_high": r[2],
-                    "unit":       r[3] or "celsius",
-                    "city":       r[4], "date": r[5],
-                }
-    except sqlite3.OperationalError as e:
-        log.debug(f"positions lookup failed: {e}")
+def load_resolved_events(conn, start: str, end: str,
+                          cities: list[str]) -> list[dict]:
+    """Return list of {event_id, city, date} for events whose `date` is
+    in [start, end] AND that have settled (resolved=1)."""
+    placeholders = ",".join("?" * len(cities))
+    rows = conn.execute(
+        f"""
+        SELECT event_id, city, date, event_title, n_bins
+        FROM events
+        WHERE date BETWEEN ? AND ?
+          AND resolved = 1
+          AND city IN ({placeholders})
+        ORDER BY date, city
+        """,
+        (start, end, *cities),
+    ).fetchall()
+    return [dict(r) for r in rows]
 
+
+def load_bins_for_event(conn, event_id: str) -> list[dict]:
+    """All bins belonging to an event."""
+    rows = conn.execute(
+        """
+        SELECT contract_id, range_low, range_high, unit
+        FROM bins WHERE event_id = ?
+        """,
+        (event_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def load_snapshots_for_event(conn, event_id: str
+                              ) -> dict[str, list[tuple[str, float]]]:
+    """Returns {contract_id: [(recorded_at_iso_utc, yes_price), ...]}
+    sorted by time.  Uses idx_price_snap_event for instant lookup."""
+    out: dict[str, list[tuple[str, float]]] = defaultdict(list)
+    rows = conn.execute(
+        """
+        SELECT contract_id, recorded_at, yes_price
+        FROM price_snapshots
+        WHERE event_id = ? AND yes_price IS NOT NULL
+        ORDER BY recorded_at
+        """,
+        (event_id,),
+    ).fetchall()
+    for r in rows:
+        out[r["contract_id"]].append((r["recorded_at"], r["yes_price"]))
     return out
+
+
+def load_resolution(conn, event_id: str) -> dict | None:
+    """The authoritative settlement record for an event, or None if none."""
+    r = conn.execute(
+        """
+        SELECT winning_contract_id, winning_range_low, winning_range_high,
+               resolved_at
+        FROM resolutions WHERE event_id = ?
+        """,
+        (event_id,),
+    ).fetchone()
+    return dict(r) if r else None
 
 
 # ---------------------------------------------------------------------------
@@ -171,40 +208,81 @@ def _bin_label(low, high, unit: str) -> str:
 # Simulation per (city, date)
 # ---------------------------------------------------------------------------
 
-def simulate_day(city: str, date_str: str,
+def simulate_day(city: str, date_str: str, tz: str,
                   hourly_temps: list[tuple[int, float]],
                   bins_meta: list[dict],
                   bin_price_history: dict[str, list[tuple[str, float]]],
+                  resolution: dict | None,
                   threshold: float, hours_after_peak: int) -> dict | None:
     """Returns trade dict if strategy would have fired, else None.
 
-    hourly_temps:    [(hour_local, temp_c), ...]  for this day
-    bins_meta:       [{contract_id, range_low, range_high, unit}, ...]
-                     for this city-date (sourced from temp_outcomes/positions)
-    bin_price_history: {contract_id: [(recorded_at_iso, yes_price), ...]}
-                     for this city-date (sourced from bin_price_history table)
+    hourly_temps:      [(hour_local, temp_c), ...]
+    bins_meta:         [{contract_id, range_low, range_high, unit}, ...]
+    bin_price_history: {contract_id: [(recorded_at_iso_utc, yes_price), ...]}
+    resolution:        authoritative settlement record (or None) — when
+                       present, we use it to determine win/loss instead
+                       of inferring the winning bin from the day's max
+    tz:                station IANA timezone (e.g. 'Europe/Madrid')
     """
     if len(hourly_temps) < 18:
         return None
 
+    from zoneinfo import ZoneInfo
+    station_tz = ZoneInfo(tz)
+
     day_max = max(t for _, t in hourly_temps)
-    actual_winning = next(
-        (b for b in bins_meta
-         if _bin_contains(b["range_low"], b["range_high"],
-                          b.get("unit", "celsius"), day_max)),
-        None,
-    )
-    actual_winning_label = (_bin_label(actual_winning["range_low"],
-                                         actual_winning["range_high"],
-                                         actual_winning.get("unit", "celsius"))
-                             if actual_winning else "?")
 
-    by_hour = {h: t for h, t in hourly_temps}
+    # Authoritative winner from resolutions table, if available;
+    # otherwise infer from day_max + bin boundaries.
+    if resolution:
+        winning_contract_id = resolution["winning_contract_id"]
+        winning_label = _bin_label(resolution["winning_range_low"],
+                                     resolution["winning_range_high"],
+                                     "celsius")
+    else:
+        inferred = next(
+            (b for b in bins_meta
+             if _bin_contains(b["range_low"], b["range_high"],
+                              b.get("unit", "celsius"), day_max)),
+            None,
+        )
+        winning_contract_id = inferred["contract_id"] if inferred else None
+        winning_label = (_bin_label(inferred["range_low"],
+                                      inferred["range_high"],
+                                      inferred.get("unit", "celsius"))
+                         if inferred else "?")
 
-    # Walk forward through the day from 13:00 (one hour after our 12:00
-    # after_hour floor) and look for the first trigger.
+    # Pre-parse snapshot timestamps into LOCAL hours for trigger matching.
+    # Each snapshot's recorded_at is ISO UTC; convert to local datetime once.
+    snapshots_by_local_hour: dict[str, dict[int, tuple[str, float]]] = {}
+    for cid, series in bin_price_history.items():
+        per_hour: dict[int, tuple[str, float]] = {}
+        for ts, yp in series:
+            try:
+                snap_utc = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            snap_local = snap_utc.astimezone(station_tz)
+            # Only snapshots on the SAME LOCAL DATE as the market
+            if snap_local.strftime("%Y-%m-%d") != date_str:
+                continue
+            # Keep the snapshot nearest the END of each local hour
+            # (i.e. closest to the next top-of-hour boundary)
+            h = snap_local.hour
+            existing = per_hour.get(h)
+            if existing is None:
+                per_hour[h] = (ts, yp)
+            else:
+                # Prefer the one closer to hour:55
+                existing_min = datetime.fromisoformat(
+                    existing[0].replace("Z", "+00:00")
+                ).astimezone(station_tz).minute
+                if abs(snap_local.minute - 55) < abs(existing_min - 55):
+                    per_hour[h] = (ts, yp)
+        snapshots_by_local_hour[cid] = per_hour
+
+    # Walk forward through the day from 13:00 local; look for first trigger.
     for trigger_h in range(13, 24):
-        # Observations available up to and including trigger_h
         obs_so_far = [(h, t) for (h, t) in hourly_temps if h <= trigger_h]
         if len(obs_so_far) < 6:
             continue
@@ -213,12 +291,11 @@ def simulate_day(city: str, date_str: str,
         observed_peak_hour  = max(h for h, t in obs_so_far
                                    if abs(t - observed_max_so_far) < 1e-6)
 
-        # Stability gate: peak must be hours_after_peak ago or older,
-        # i.e. we've seen at least N hours of temps without exceeding it.
+        # Stability gate: peak must be hours_after_peak ago or older
         if trigger_h < observed_peak_hour + hours_after_peak:
             continue
 
-        # Match the observed max to a bin
+        # Match observed max to a bin
         target = next(
             (b for b in bins_meta
              if _bin_contains(b["range_low"], b["range_high"],
@@ -228,31 +305,21 @@ def simulate_day(city: str, date_str: str,
         if target is None:
             continue
         cid = target["contract_id"]
-        price_series = bin_price_history.get(cid, [])
-        if not price_series:
-            continue
+        per_hour = snapshots_by_local_hour.get(cid, {})
 
-        # Find the price snapshot nearest to trigger_h local time.
-        # Snapshots are stored with UTC recorded_at; we approximate by
-        # using just the hour-of-day match — for backtest purposes this
-        # is fine since snapshots are every ~2 min.  More robust: filter
-        # by date_local + hour_local in UTC equivalent, but the
-        # approximation is good enough here.
-        target_hour = trigger_h
-        best_snapshot = None
-        best_diff = 1e9
-        for ts, yp in price_series:
-            try:
-                snap_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            except ValueError:
-                continue
-            diff = abs(snap_dt.hour - target_hour)
-            if diff < best_diff:
-                best_diff = diff
-                best_snapshot = (ts, yp)
-        if best_snapshot is None:
+        # Find the snapshot for this trigger hour, or the nearest prior one
+        snapshot = None
+        for h in range(trigger_h, -1, -1):
+            if h in per_hour:
+                snapshot = per_hour[h]; break
+        if snapshot is None:
             continue
-        _, entry_price = best_snapshot
+        _, entry_price = snapshot
+
+        target_label = _bin_label(target["range_low"], target["range_high"],
+                                    target.get("unit", "celsius"))
+        won = winning_contract_id is not None and \
+              target["contract_id"] == winning_contract_id
 
         # Safety gates
         if entry_price < 0.05:
@@ -260,12 +327,10 @@ def simulate_day(city: str, date_str: str,
                 "city": city, "date": date_str,
                 "fired_at_hour": trigger_h,
                 "observed_max":  round(observed_max_so_far, 2),
-                "target_bin":    _bin_label(target["range_low"],
-                                              target["range_high"],
-                                              target.get("unit", "celsius")),
+                "target_bin":    target_label,
                 "entry_price":   round(entry_price, 4),
                 "day_max":       round(day_max, 2),
-                "winning_bin":   actual_winning_label,
+                "winning_bin":   winning_label,
                 "won":           False,
                 "pnl":           None,
                 "action":        "SKIP_MARKET_DISAGREES",
@@ -275,28 +340,23 @@ def simulate_day(city: str, date_str: str,
                 "city": city, "date": date_str,
                 "fired_at_hour": trigger_h,
                 "observed_max":  round(observed_max_so_far, 2),
-                "target_bin":    _bin_label(target["range_low"],
-                                              target["range_high"],
-                                              target.get("unit", "celsius")),
+                "target_bin":    target_label,
                 "entry_price":   round(entry_price, 4),
                 "day_max":       round(day_max, 2),
-                "winning_bin":   actual_winning_label,
-                "won":           actual_winning is not None and target["contract_id"] == actual_winning["contract_id"],
+                "winning_bin":   winning_label,
+                "won":           won,
                 "pnl":           None,
                 "action":        "SKIP_PRICED_IN",
             }
 
-        won = actual_winning is not None and target["contract_id"] == actual_winning["contract_id"]
         return {
             "city": city, "date": date_str,
             "fired_at_hour": trigger_h,
             "observed_max":  round(observed_max_so_far, 2),
-            "target_bin":    _bin_label(target["range_low"],
-                                          target["range_high"],
-                                          target.get("unit", "celsius")),
+            "target_bin":    target_label,
             "entry_price":   round(entry_price, 4),
             "day_max":       round(day_max, 2),
-            "winning_bin":   actual_winning_label,
+            "winning_bin":   winning_label,
             "won":           won,
             "pnl":           round((1.0 if won else 0.0) - entry_price, 4),
             "action":        "BUY_YES",
@@ -328,25 +388,6 @@ def load_station_temps(station_db: str, cities: list[str], start: str, end: str
         ).fetchall()
     for r in rows:
         out[(r["city"], r["date_local"])].append((r["hour_local"], r["temp_c"]))
-    return out
-
-
-def load_price_history(conn, start: str, end: str
-                        ) -> dict[tuple[str, str, str], list[tuple[str, float]]]:
-    """Returns {(city, date, contract_id): [(recorded_at, yes_price), ...]}"""
-    out: dict[tuple[str, str, str], list[tuple[str, float]]] = defaultdict(list)
-    rows = conn.execute(
-        """
-        SELECT city, date, contract_id, recorded_at, yes_price
-        FROM bin_price_history
-        WHERE date BETWEEN ? AND ?
-          AND yes_price IS NOT NULL
-        ORDER BY recorded_at
-        """,
-        (start, end),
-    ).fetchall()
-    for r in rows:
-        out[(r[0], r[1], r[2])].append((r[3], float(r[4])))
     return out
 
 
@@ -774,8 +815,9 @@ def main() -> int:
                    help="Restrict to specific cities (default: all mapped)")
     p.add_argument("--station-db", default=STATION_DB,
                    help=f"Station obs DB (default: {STATION_DB})")
-    p.add_argument("--db", default=DB_PATH,
-                   help=f"Main bot DB with bin_price_history (default: {DB_PATH})")
+    p.add_argument("--price-db", default=DEFAULT_COLLECTOR_DB,
+                   help=f"Collector DB with price_snapshots + bins + events + "
+                        f"resolutions (default: {DEFAULT_COLLECTOR_DB})")
     p.add_argument("--csv", help="Write per-trade rows to this CSV path")
     p.add_argument("--html", default=os.path.join(_BOT_DIR, "data",
                                                     "strategy1_dashboard.html"),
@@ -802,7 +844,8 @@ def main() -> int:
 
     cities = list(args.city) if args.city else list(CITY_STATIONS.keys())
     log.info(f"Backtest window: {start} → {end}  ({(end_d - start_d).days + 1} days)")
-    log.info(f"Cities: {len(cities)}  | station_db={args.station_db}  | bot_db={args.db}")
+    log.info(f"Cities: {len(cities)}  | station_db={args.station_db}")
+    log.info(f"Price collector DB: {args.price_db}")
 
     # 1. Station temps
     if not os.path.exists(args.station_db):
@@ -812,51 +855,56 @@ def main() -> int:
     station_temps = load_station_temps(args.station_db, cities, start, end)
     log.info(f"Loaded station temps for {len(station_temps):,} city-days")
 
-    # 2. Bin metadata + price history from bot DB
-    with sqlite3.connect(args.db) as conn:
-        bin_meta = load_bin_metadata(conn)
-        log.info(f"Loaded {len(bin_meta):,} bin metadata records")
-        price_history = load_price_history(conn, start, end)
-        log.info(f"Loaded price-history for {len(price_history):,} bin-days")
+    if not os.path.exists(args.price_db):
+        log.error(f"Price collector DB not found: {args.price_db}")
+        log.error(f"Pass --price-db /path/to/prices.db")
+        return 1
 
-    # Pre-group bins by (city, date) for fast lookup
-    bins_by_event: dict[tuple[str, str], list[dict]] = defaultdict(list)
-    prices_by_event: dict[tuple[str, str], dict[str, list]] = defaultdict(dict)
-    for cid, meta in bin_meta.items():
-        if meta.get("city") and meta.get("date"):
-            bins_by_event[(meta["city"], meta["date"])].append({
-                "contract_id": cid, **meta,
-            })
-    for (city, date_str, cid), series in price_history.items():
-        prices_by_event[(city, date_str)][cid] = series
+    # 2. Walk events from collector DB; one event at a time keeps memory flat
+    price_conn = _open_ro(args.price_db)
+    events = load_resolved_events(price_conn, start, end, cities)
+    log.info(f"Found {len(events):,} resolved events in window")
 
-    # 3. Run simulation
     trades: list[dict] = []
     no_bin_meta = 0
     no_prices   = 0
     no_obs      = 0
+    n_processed = 0
 
-    for (city, date_str), temps in station_temps.items():
-        if city not in cities:
+    for ev in events:
+        city, date_str, event_id = ev["city"], ev["date"], ev["event_id"]
+        s = CITY_STATIONS.get(city)
+        if not s:
+            continue   # silently skip cities outside our station map
+        tz = s[2]
+
+        temps = station_temps.get((city, date_str))
+        if not temps or len(temps) < 18:
+            no_obs += 1
             continue
-        bins  = bins_by_event.get((city, date_str), [])
+
+        bins = load_bins_for_event(price_conn, event_id)
         if not bins:
             no_bin_meta += 1
             continue
-        prices = prices_by_event.get((city, date_str), {})
-        if not prices:
-            no_prices += 1
-            continue
-        # Filter bins to those with price history
-        bins_with_prices = [b for b in bins if b["contract_id"] in prices]
-        if not bins_with_prices:
+
+        snapshots = load_snapshots_for_event(price_conn, event_id)
+        if not snapshots:
             no_prices += 1
             continue
 
-        result = simulate_day(city, date_str, temps, bins_with_prices,
-                              prices, args.threshold, args.hours_after_peak)
+        resolution = load_resolution(price_conn, event_id)
+
+        result = simulate_day(city, date_str, tz, temps, bins, snapshots,
+                              resolution, args.threshold, args.hours_after_peak)
         if result:
             trades.append(result)
+        n_processed += 1
+        if n_processed % 100 == 0:
+            log.info(f"  processed {n_processed}/{len(events)} events ...")
+    price_conn.close()
+    log.info(f"Simulation complete: {n_processed}/{len(events)} events processed, "
+             f"{len(trades)} reached a decision")
 
     # 4. Summary
     bought = [t for t in trades if t["action"] == "BUY_YES"]
