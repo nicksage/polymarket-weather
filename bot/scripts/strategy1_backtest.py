@@ -232,13 +232,31 @@ def simulate_day(city: str, date_str: str, tz: str,
 
     day_max = max(t for _, t in hourly_temps)
 
-    # Authoritative winner from resolutions table, if available;
-    # otherwise infer from day_max + bin boundaries.
+    # Sanity check — should never happen since obs_so_far ⊆ hourly_temps.
+    # If it does, the station_obs data is corrupted for this city-date.
+    obs_check = max((t for _, t in hourly_temps), default=None)
+    if obs_check is not None and obs_check != day_max:
+        pass  # impossible; placeholder
+
+    # Determine the market's unit for this event (all bins of one event
+    # share the same unit — F for US markets, C for everyone else).
+    market_unit = (bins_meta[0].get("unit") or "celsius") if bins_meta else "celsius"
+
+    # Authoritative winner from resolutions table, if available; otherwise
+    # infer from day_max + bin boundaries.
     if resolution:
         winning_contract_id = resolution["winning_contract_id"]
+        # Look up the winning bin in our bins_meta to get its unit.  The
+        # resolutions table doesn't store unit, but bins_meta does.
+        winning_bin_obj = next(
+            (b for b in bins_meta if b["contract_id"] == winning_contract_id),
+            None,
+        )
+        winning_unit = ((winning_bin_obj or {}).get("unit")
+                         or market_unit)
         winning_label = _bin_label(resolution["winning_range_low"],
                                      resolution["winning_range_high"],
-                                     "celsius")
+                                     winning_unit)
     else:
         inferred = next(
             (b for b in bins_meta
@@ -321,16 +339,29 @@ def simulate_day(city: str, date_str: str, tz: str,
         won = winning_contract_id is not None and \
               target["contract_id"] == winning_contract_id
 
+        # Display values in market unit (set up once for all return paths)
+        if market_unit.lower() == "fahrenheit":
+            _obs_disp = observed_max_so_far * 9 / 5 + 32
+            _day_disp = day_max            * 9 / 5 + 32
+            _unit     = "°F"
+        else:
+            _obs_disp = observed_max_so_far
+            _day_disp = day_max
+            _unit     = "°C"
+
         # Safety gates
         if entry_price < 0.05:
             return {
                 "city": city, "date": date_str,
                 "fired_at_hour": trigger_h,
-                "observed_max":  round(observed_max_so_far, 2),
+                "observed_max":  round(_obs_disp, 2),
+                "observed_max_c": round(observed_max_so_far, 2),
                 "target_bin":    target_label,
                 "entry_price":   round(entry_price, 4),
-                "day_max":       round(day_max, 2),
+                "day_max":       round(_day_disp, 2),
+                "day_max_c":     round(day_max, 2),
                 "winning_bin":   winning_label,
+                "unit":          _unit,
                 "won":           False,
                 "pnl":           None,
                 "action":        "SKIP_MARKET_DISAGREES",
@@ -339,11 +370,14 @@ def simulate_day(city: str, date_str: str, tz: str,
             return {
                 "city": city, "date": date_str,
                 "fired_at_hour": trigger_h,
-                "observed_max":  round(observed_max_so_far, 2),
+                "observed_max":  round(_obs_disp, 2),
+                "observed_max_c": round(observed_max_so_far, 2),
                 "target_bin":    target_label,
                 "entry_price":   round(entry_price, 4),
-                "day_max":       round(day_max, 2),
+                "day_max":       round(_day_disp, 2),
+                "day_max_c":     round(day_max, 2),
                 "winning_bin":   winning_label,
+                "unit":          _unit,
                 "won":           won,
                 "pnl":           None,
                 "action":        "SKIP_PRICED_IN",
@@ -352,11 +386,14 @@ def simulate_day(city: str, date_str: str, tz: str,
         return {
             "city": city, "date": date_str,
             "fired_at_hour": trigger_h,
-            "observed_max":  round(observed_max_so_far, 2),
+            "observed_max":  round(_obs_disp, 2),
+            "observed_max_c": round(observed_max_so_far, 2),
             "target_bin":    target_label,
             "entry_price":   round(entry_price, 4),
-            "day_max":       round(day_max, 2),
+            "day_max":       round(_day_disp, 2),
+            "day_max_c":     round(day_max, 2),
             "winning_bin":   winning_label,
+            "unit":          _unit,
             "won":           won,
             "pnl":           round((1.0 if won else 0.0) - entry_price, 4),
             "action":        "BUY_YES",
@@ -703,14 +740,15 @@ function row(t) {{
   const st = statusLabel(t);
   const fmt = (v, d=3) => v == null ? '' : (typeof v === 'number' ? v.toFixed(d) : v);
   const pnl = t.pnl == null ? '' : (t.pnl >= 0 ? '+' : '') + t.pnl.toFixed(3);
+  const u = t.unit || '°';
   return `<tr class='${{st}}'>
     <td>${{t.date}}</td>
     <td>${{t.city}}</td>
     <td class='num'>${{t.fired_at_hour}}</td>
-    <td class='num'>${{fmt(t.observed_max, 1)}}°</td>
+    <td class='num'>${{fmt(t.observed_max, 1)}}${{u}}</td>
     <td>${{t.target_bin}}</td>
     <td class='num'>${{fmt(t.entry_price, 3)}}</td>
-    <td class='num'>${{fmt(t.day_max, 1)}}°</td>
+    <td class='num'>${{fmt(t.day_max, 1)}}${{u}}</td>
     <td>${{t.winning_bin}}</td>
     <td><span class='pill ${{st}}'>${{st}}</span></td>
     <td class='num'>${{pnl}}</td>
@@ -790,11 +828,21 @@ def serve_html(path: str, port: int) -> None:
     print("  Press Ctrl-C to stop.")
     print("=" * 78)
 
-    with socketserver.TCPServer(("0.0.0.0", port), handler) as httpd:
-        try:
+    class ReusableTCPServer(socketserver.TCPServer):
+        allow_reuse_address = True   # avoid "Address already in use" on quick reruns
+    try:
+        httpd = ReusableTCPServer(("0.0.0.0", port), handler)
+    except OSError as e:
+        print(f"\n  Could not bind port {port}: {e}")
+        print(f"  Another process is using it.  Find it with:")
+        print(f"      ss -tlnp | grep ':{port}'")
+        print(f"  Or just pick a different port: --serve {port + 1}")
+        return
+    try:
+        with httpd:
             httpd.serve_forever()
-        except KeyboardInterrupt:
-            print("\nStopped.")
+    except KeyboardInterrupt:
+        print("\nStopped.")
 
 
 # ---------------------------------------------------------------------------
@@ -968,9 +1016,11 @@ def main() -> int:
 
     if args.csv and trades:
         os.makedirs(os.path.dirname(args.csv) or ".", exist_ok=True)
-        fields = ["city", "date", "action", "fired_at_hour", "observed_max",
-                  "target_bin", "entry_price", "day_max", "winning_bin",
-                  "won", "pnl"]
+        fields = ["city", "date", "action", "fired_at_hour",
+                  "observed_max", "observed_max_c", "unit",
+                  "target_bin", "entry_price",
+                  "day_max", "day_max_c",
+                  "winning_bin", "won", "pnl"]
         with open(args.csv, "w", newline="", encoding="utf-8") as fh:
             w = csv.DictWriter(fh, fieldnames=fields)
             w.writeheader()
