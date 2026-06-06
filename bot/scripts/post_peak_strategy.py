@@ -151,7 +151,11 @@ def fetch_station_obs_today(city: str, target_date: str
         timeout=60,
     )
     r.raise_for_status()
-    by_hour: dict[int, tuple[int, float, datetime]] = {}
+    # For each local hour, keep the MAX temperature across all observations
+    # (routine METARs + SPECIs).  Polymarket settles on the actual peak —
+    # not the closest-to-top-of-hour reading.  Picking by minute would
+    # silently drop sub-hour spikes and cause us to misclassify the bin.
+    by_hour: dict[int, tuple[float, datetime]] = {}
     for line in r.text.splitlines()[1:]:
         parts = line.split(",")
         if len(parts) < 3:
@@ -166,14 +170,10 @@ def fetch_station_obs_today(city: str, target_date: str
             continue
         if dt.strftime("%Y-%m-%d") != target_date:
             continue
-        # Some METARs report at :50/:55, others at :00.  Prefer the one
-        # nearer the top of the hour for each local hour.
-        prefer_at = 55 if dt.minute >= 30 else 0
-        offset = abs(dt.minute - prefer_at)
         existing = by_hour.get(dt.hour)
-        if existing is None or offset < existing[0]:
-            by_hour[dt.hour] = (offset, t, dt)
-    return sorted(((h, t, dt) for h, (_, t, dt) in by_hour.items()))
+        if existing is None or t > existing[0]:
+            by_hour[dt.hour] = (t, dt)
+    return sorted(((h, t, dt) for h, (t, dt) in by_hour.items()))
 
 
 # ---------------------------------------------------------------------------

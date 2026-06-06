@@ -213,7 +213,8 @@ def simulate_day(city: str, date_str: str, tz: str,
                   bins_meta: list[dict],
                   bin_price_history: dict[str, list[tuple[str, float]]],
                   resolution: dict | None,
-                  threshold: float, hours_after_peak: int) -> dict | None:
+                  threshold: float, hours_after_peak: int,
+                  market_disagree_floor: float = 0.05) -> dict | None:
     """Returns trade dict if strategy would have fired, else None.
 
     hourly_temps:      [(hour_local, temp_c), ...]
@@ -350,7 +351,7 @@ def simulate_day(city: str, date_str: str, tz: str,
             _unit     = "°C"
 
         # Safety gates
-        if entry_price < 0.05:
+        if entry_price < market_disagree_floor:
             return {
                 "city": city, "date": date_str,
                 "fired_at_hour": trigger_h,
@@ -1019,6 +1020,12 @@ def main() -> int:
                    help="Max yes_price for a BUY (default: 0.90)")
     p.add_argument("--hours-after-peak", type=int, default=1,
                    help="Wait N hours after observed peak before firing (default: 1)")
+    p.add_argument("--market-disagree-floor", type=float, default=0.05,
+                   help="Skip trade if target bin YES price is below this. "
+                        "The market knowing the bin is unlikely (e.g. <5%%) "
+                        "suggests it has fresher data than our Mesonet feed; "
+                        "tighten (e.g. 0.10) for more safety, loosen (e.g. 0.02) "
+                        "for more aggressive entries (default: 0.05)")
     p.add_argument("--city", nargs="*",
                    help="Restrict to specific cities (default: all mapped)")
     p.add_argument("--station-db", default=STATION_DB,
@@ -1104,7 +1111,8 @@ def main() -> int:
         resolution = load_resolution(price_conn, event_id)
 
         result = simulate_day(city, date_str, tz, temps, bins, snapshots,
-                              resolution, args.threshold, args.hours_after_peak)
+                              resolution, args.threshold, args.hours_after_peak,
+                              market_disagree_floor=args.market_disagree_floor)
         if result:
             trades.append(result)
         n_processed += 1

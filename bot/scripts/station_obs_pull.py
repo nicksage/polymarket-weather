@@ -168,14 +168,17 @@ def _fetch_csv(station: str, network: str, timezone: str,
 
 
 def _parse_and_upsert(conn, city: str, station: str, csv_text: str) -> int:
-    """Parse Mesonet CSV (station,valid,tmpc), reduce to one row per UTC
-    hour (closest-to-:00 observation wins), upsert into station_obs."""
+    """Parse Mesonet CSV (station,valid,tmpc).  For each local hour, keep
+    the MAXIMUM temperature across all METARs and SPECIs that hour — this
+    is what Polymarket settles on (the actual peak), not the top-of-hour
+    routine.  Picking by minute-of-hour silently discarded sub-hour spikes
+    and caused our day_max to disagree with the market.
+    """
     lines = csv_text.splitlines()
     if not lines or not lines[0].lower().startswith("station"):
         return 0
-    # Expected header: station,valid,tmpc
-    by_hour: dict[str, tuple[float, float]] = {}
-    # value = (offset_from_top_of_hour_seconds, temp_c)
+    # Per-hour MAX across all observations (routine METARs + SPECIs)
+    by_hour: dict[str, float] = {}
     for line in lines[1:]:
         parts = line.split(",")
         if len(parts) < 3:
@@ -188,22 +191,15 @@ def _parse_and_upsert(conn, city: str, station: str, csv_text: str) -> int:
             t  = float(tmpc)
         except ValueError:
             continue
-        # Wunderground / Polymarket uses the top-of-hour-ish METAR; we
-        # keep whichever observation is closest to :00 each hour.
         hour_key = dt.strftime("%Y-%m-%d %H:00")
-        offset   = abs(dt.minute - 0)
-        # Prefer the obs nearest the top of the hour (handles :50/:55
-        # METAR convention some stations use).
-        prefer_minute = 55 if dt.minute >= 30 else 0
-        offset = abs(dt.minute - prefer_minute)
         existing = by_hour.get(hour_key)
-        if existing is None or offset < existing[0]:
-            by_hour[hour_key] = (offset, t)
+        if existing is None or t > existing:
+            by_hour[hour_key] = t
 
     if not by_hour:
         return 0
     rows = [(city, station, ts, ts[:10], int(ts[11:13]), temp)
-            for ts, (_, temp) in by_hour.items()]
+            for ts, temp in by_hour.items()]
     conn.executemany(
         """
         INSERT OR REPLACE INTO station_obs
