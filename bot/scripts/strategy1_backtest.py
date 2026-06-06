@@ -214,7 +214,8 @@ def simulate_day(city: str, date_str: str, tz: str,
                   bin_price_history: dict[str, list[tuple[str, float]]],
                   resolution: dict | None,
                   threshold: float, hours_after_peak: int,
-                  market_disagree_floor: float = 0.05) -> dict | None:
+                  market_disagree_floor: float = 0.05,
+                  min_trigger_hour: int = 13) -> dict | None:
     """Returns trade dict if strategy would have fired, else None.
 
     hourly_temps:      [(hour_local, temp_c), ...]
@@ -300,8 +301,10 @@ def simulate_day(city: str, date_str: str, tz: str,
                     per_hour[h] = (ts, yp)
         snapshots_by_local_hour[cid] = per_hour
 
-    # Walk forward through the day from 13:00 local; look for first trigger.
-    for trigger_h in range(13, 24):
+    # Walk forward through the day; look for the first trigger.
+    # Floor at `min_trigger_hour` since temp_drop analysis shows early
+    # triggers (13:00–15:00) have weak hold rates due to plateau-then-rise.
+    for trigger_h in range(min_trigger_hour, 24):
         obs_so_far = [(h, t) for (h, t) in hourly_temps if h <= trigger_h]
         if len(obs_so_far) < 6:
             continue
@@ -1026,6 +1029,12 @@ def main() -> int:
                         "suggests it has fresher data than our Mesonet feed; "
                         "tighten (e.g. 0.10) for more safety, loosen (e.g. 0.02) "
                         "for more aggressive entries (default: 0.05)")
+    p.add_argument("--min-trigger-hour", type=int, default=13,
+                   help="Earliest local hour the strategy can fire. "
+                        "Empirical hold rates: 13:00=63%%, 15:00=84%%, "
+                        "17:00=98%%.  Raise this (e.g. 17) to avoid early "
+                        "false-peak triggers like the Wuhan plateau-then-rise "
+                        "case (default: 13)")
     p.add_argument("--city", nargs="*",
                    help="Restrict to specific cities (default: all mapped)")
     p.add_argument("--station-db", default=STATION_DB,
@@ -1112,7 +1121,8 @@ def main() -> int:
 
         result = simulate_day(city, date_str, tz, temps, bins, snapshots,
                               resolution, args.threshold, args.hours_after_peak,
-                              market_disagree_floor=args.market_disagree_floor)
+                              market_disagree_floor=args.market_disagree_floor,
+                              min_trigger_hour=args.min_trigger_hour)
         if result:
             trades.append(result)
         n_processed += 1
