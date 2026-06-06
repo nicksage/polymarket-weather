@@ -91,6 +91,7 @@ def _init_db(path: str) -> None:
                 date_local   TEXT NOT NULL,
                 hour_local   INTEGER NOT NULL,
                 temp_c       REAL,
+                wind_dir_deg REAL,
                 PRIMARY KEY (sid, ts_local)
             );
             CREATE INDEX IF NOT EXISTS idx_nobs_sid_date
@@ -105,6 +106,15 @@ def _init_db(path: str) -> None:
                 PRIMARY KEY (sid, date_local)
             );
         """)
+        # Migrate older DBs to include wind_dir_deg
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(neighbor_obs)").fetchall()]
+        if "wind_dir_deg" not in cols:
+            try:
+                conn.execute("ALTER TABLE neighbor_obs ADD COLUMN wind_dir_deg REAL")
+                conn.commit()
+                log.info("migrated neighbor_obs: added wind_dir_deg column")
+            except sqlite3.OperationalError:
+                pass
 
 
 def upsert_meta(conn, rows: list[dict]) -> None:
@@ -134,7 +144,7 @@ def fetch_csv(sid: str, network: str, tz: str, start: str, end: str,
     params = {
         "station":     sid,
         "network":     network,
-        "data":        "tmpc",
+        "data":        ["tmpc", "drct"],   # temp + wind direction
         "year1":       d0.year, "month1": d0.month, "day1": d0.day,
         "year2":       d1.year, "month2": d1.month, "day2": d1.day,
         "tz":          tz,
@@ -159,16 +169,18 @@ def fetch_csv(sid: str, network: str, tz: str, start: str, end: str,
 
 def parse_and_upsert(conn, sid: str, csv_text: str) -> int:
     """Same max-per-hour logic as the settlement-station puller — captures
-    the peak across all METARs/SPECIs that hour."""
+    the peak temp across all METARs/SPECIs that hour, plus the wind
+    direction sampled at that peak.
+    """
     lines = csv_text.splitlines()
     if not lines or not lines[0].lower().startswith("station"):
         return 0
-    by_hour: dict[str, float] = {}
+    by_hour: dict[str, tuple[float, float | None]] = {}
     for line in lines[1:]:
         parts = line.split(",")
-        if len(parts) < 3:
+        if len(parts) < 4:
             continue
-        _, valid, tmpc = parts[0], parts[1], parts[2]
+        _, valid, tmpc, drct = parts[0], parts[1], parts[2], parts[3]
         if not valid or tmpc in ("M", "", "T"):
             continue
         try:
@@ -176,19 +188,23 @@ def parse_and_upsert(conn, sid: str, csv_text: str) -> int:
             t  = float(tmpc)
         except ValueError:
             continue
+        try:
+            wd = float(drct) if drct not in ("M", "", "T") else None
+        except ValueError:
+            wd = None
         hour_key = dt.strftime("%Y-%m-%d %H:00")
         existing = by_hour.get(hour_key)
-        if existing is None or t > existing:
-            by_hour[hour_key] = t
+        if existing is None or t > existing[0]:
+            by_hour[hour_key] = (t, wd)
     if not by_hour:
         return 0
-    rows = [(sid, ts, ts[:10], int(ts[11:13]), temp)
-            for ts, temp in by_hour.items()]
+    rows = [(sid, ts, ts[:10], int(ts[11:13]), temp, wd)
+            for ts, (temp, wd) in by_hour.items()]
     conn.executemany(
         """
         INSERT OR REPLACE INTO neighbor_obs
-            (sid, ts_local, date_local, hour_local, temp_c)
-        VALUES (?, ?, ?, ?, ?)
+            (sid, ts_local, date_local, hour_local, temp_c, wind_dir_deg)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
@@ -259,11 +275,19 @@ def is_cached(conn, sid: str, start: str, end: str,
 # Driver
 # ---------------------------------------------------------------------------
 
-def build_neighbor_list(cities: list[str], neighbors_per_city: int,
+def build_neighbor_list(cities: list[str], neighbors_per_city: int | None,
                           include_awos: bool, include_rwis: bool,
-                          radius_mi: float) -> list[dict]:
-    """For each city, find nearby stations and return up to N candidates
-    after filtering to the requested network types."""
+                          radius_mi: float,
+                          per_quadrant: int | None = None) -> list[dict]:
+    """For each city, find nearby stations within `radius_mi` after
+    filtering to the requested network types.
+
+    If neighbors_per_city is None, return ALL matching neighbors within
+    radius (recommended — ensures full-direction coverage).
+    If per_quadrant is set, ensure at least that many stations per
+    octant (N/NE/E/SE/S/SW/W/NW) when available — useful when you want
+    even directional coverage rather than just the closest.
+    """
     network_cache: dict = {}
     all_rows: list[dict] = []
     for city in cities:
@@ -283,13 +307,35 @@ def build_neighbor_list(cities: list[str], neighbors_per_city: int,
                 pass
             else:
                 continue
-            # Don't duplicate the settlement station
             if r["sid"] == pm_icao or r["sid"] == pm_icao.lstrip("K"):
                 continue
             keep.append(r)
-        # Sort by distance, take the top N
         keep.sort(key=lambda r: r["distance_mi"])
-        all_rows.extend(keep[:neighbors_per_city])
+
+        # If per_quadrant set: take top N from each octant first, then
+        # backfill with closest remaining up to neighbors_per_city.
+        if per_quadrant:
+            from collections import defaultdict as _dd
+            by_dir: dict = _dd(list)
+            for r in keep:
+                by_dir[r["direction"]].append(r)
+            picked = []
+            picked_sids = set()
+            for d in ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]:
+                for r in by_dir.get(d, [])[:per_quadrant]:
+                    picked.append(r); picked_sids.add(r["sid"])
+            # Backfill with closest remaining if under per-city cap
+            cap = neighbors_per_city or len(keep)
+            for r in keep:
+                if len(picked) >= cap: break
+                if r["sid"] not in picked_sids:
+                    picked.append(r); picked_sids.add(r["sid"])
+            all_rows.extend(picked)
+        elif neighbors_per_city is None:
+            # All within radius
+            all_rows.extend(keep)
+        else:
+            all_rows.extend(keep[:neighbors_per_city])
     return all_rows
 
 
@@ -299,12 +345,20 @@ def main() -> int:
                    help="History window in days (default: 60)")
     p.add_argument("--start", help="Start YYYY-MM-DD (overrides --days)")
     p.add_argument("--end",   help="End YYYY-MM-DD (default: today)")
-    p.add_argument("--neighbors-per-city", type=int, default=5,
-                   help="Max ASOS neighbors per city to pull (default: 5)")
-    p.add_argument("--radius-mi", type=float, default=25,
-                   help="Search radius when finding neighbors (default: 25)")
-    p.add_argument("--include-awos", action="store_true",
-                   help="Also pull AWOS (smaller airports)")
+    p.add_argument("--neighbors-per-city", type=int, default=None,
+                   help="Max neighbors per city (default: no cap = take ALL "
+                        "within --radius-mi)")
+    p.add_argument("--radius-mi", type=float, default=30,
+                   help="Search radius when finding neighbors (default: 30)")
+    p.add_argument("--per-quadrant", type=int, default=None,
+                   help="Ensure at least N stations per octant "
+                        "(N/NE/E/SE/S/SW/W/NW) when available, for even "
+                        "directional coverage.  e.g. --per-quadrant 2 "
+                        "guarantees up to 16 neighbors evenly distributed.")
+    p.add_argument("--include-awos", action="store_true", default=True,
+                   help="Also pull AWOS (smaller airports — default ON)")
+    p.add_argument("--no-awos", dest="include_awos", action="store_false",
+                   help="Exclude AWOS stations")
     p.add_argument("--include-rwis", action="store_true",
                    help="Also pull RWIS (road-weather sensors — noisy for air temp)")
     p.add_argument("--city", nargs="*",
@@ -328,14 +382,19 @@ def main() -> int:
         return 1
 
     log.info(f"Window: {start} → {end}  ({(end_d - start_d).days + 1} days)")
-    log.info(f"Cities: {len(cities)}  | top {args.neighbors_per_city} ASOS"
+    cap_str = f"top {args.neighbors_per_city}" if args.neighbors_per_city else "ALL"
+    if args.per_quadrant:
+        cap_str = f"≥{args.per_quadrant}/octant + closest backfill"
+    log.info(f"Cities: {len(cities)}  | {cap_str} ASOS"
              f"{' +AWOS' if args.include_awos else ''}"
-             f"{' +RWIS' if args.include_rwis else ''} neighbors each")
+             f"{' +RWIS' if args.include_rwis else ''}"
+             f" within {args.radius_mi} mi")
 
     log.info("Discovering neighbors via Mesonet network metadata ...")
     neighbors = build_neighbor_list(
         cities, args.neighbors_per_city,
         args.include_awos, args.include_rwis, args.radius_mi,
+        per_quadrant=args.per_quadrant,
     )
     log.info(f"Selected {len(neighbors)} unique (city, neighbor) pairs")
 

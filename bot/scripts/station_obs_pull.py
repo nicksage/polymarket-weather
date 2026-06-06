@@ -78,6 +78,8 @@ def _init_db(path: str) -> None:
         conn.executescript("""
             -- Local-time hourly observations.  Each row is one observation
             -- closest to the top of a local hour at the settlement station.
+            -- temp_c   = MAX temperature across all METARs/SPECIs for the hour
+            -- wind_dir_deg = wind direction (deg from N) at the same observation
             CREATE TABLE IF NOT EXISTS station_obs (
                 city          TEXT NOT NULL,
                 station       TEXT NOT NULL,
@@ -85,8 +87,11 @@ def _init_db(path: str) -> None:
                 date_local    TEXT NOT NULL,   -- 'YYYY-MM-DD' local
                 hour_local    INTEGER NOT NULL,
                 temp_c        REAL,
+                wind_dir_deg  REAL,
                 PRIMARY KEY (city, ts_local)
             );
+            -- ALTER for older DBs that pre-date wind_dir_deg
+            -- (SQLite IGNORE-on-duplicate via try/except in code below).
             CREATE INDEX IF NOT EXISTS idx_so_city_date
                 ON station_obs(city, date_local);
             CREATE INDEX IF NOT EXISTS idx_so_station_date
@@ -118,6 +123,7 @@ def _init_db(path: str) -> None:
                     city TEXT NOT NULL, station TEXT NOT NULL,
                     ts_local TEXT NOT NULL, date_local TEXT NOT NULL,
                     hour_local INTEGER NOT NULL, temp_c REAL,
+                    wind_dir_deg REAL,
                     PRIMARY KEY (city, ts_local)
                 );
                 CREATE TABLE station_daily_max (
@@ -129,6 +135,14 @@ def _init_db(path: str) -> None:
                 CREATE INDEX idx_so_city_date ON station_obs(city, date_local);
                 CREATE INDEX idx_so_station_date ON station_obs(station, date_local);
             """)
+        # Add wind_dir_deg column to existing tables that pre-date it.
+        if "wind_dir_deg" not in cols and "ts_local" in cols:
+            try:
+                conn.execute("ALTER TABLE station_obs ADD COLUMN wind_dir_deg REAL")
+                conn.commit()
+                log.info("migrated station_obs: added wind_dir_deg column")
+            except sqlite3.OperationalError:
+                pass   # already exists
 
 
 # ---------------------------------------------------------------------------
@@ -137,14 +151,14 @@ def _init_db(path: str) -> None:
 
 def _fetch_csv(station: str, network: str, timezone: str,
                 start: str, end: str, retries: int = 3) -> str:
-    """Pull hourly tmpc (°C) from Iowa State Mesonet as CSV, timestamped
-    in the station's LOCAL timezone."""
+    """Pull hourly tmpc (°C) + drct (wind direction in degrees) from Iowa
+    State Mesonet as CSV, timestamped in the station's LOCAL timezone."""
     d0 = datetime.strptime(start, "%Y-%m-%d")
     d1 = datetime.strptime(end,   "%Y-%m-%d")
     params = {
         "station":     station,
         "network":     network,
-        "data":        "tmpc",
+        "data":        ["tmpc", "drct"],   # temp + wind direction
         "year1":       d0.year,  "month1": d0.month, "day1": d0.day,
         "year2":       d1.year,  "month2": d1.month, "day2": d1.day,
         "tz":          timezone,
@@ -168,22 +182,22 @@ def _fetch_csv(station: str, network: str, timezone: str,
 
 
 def _parse_and_upsert(conn, city: str, station: str, csv_text: str) -> int:
-    """Parse Mesonet CSV (station,valid,tmpc).  For each local hour, keep
-    the MAXIMUM temperature across all METARs and SPECIs that hour — this
-    is what Polymarket settles on (the actual peak), not the top-of-hour
-    routine.  Picking by minute-of-hour silently discarded sub-hour spikes
-    and caused our day_max to disagree with the market.
+    """Parse Mesonet CSV (station,valid,tmpc,drct).  For each local hour,
+    keep the MAXIMUM temperature across all METARs and SPECIs that hour
+    (Polymarket settles on the peak, not the top-of-hour routine), and
+    record the wind direction sampled at the moment of that peak.
     """
     lines = csv_text.splitlines()
     if not lines or not lines[0].lower().startswith("station"):
         return 0
-    # Per-hour MAX across all observations (routine METARs + SPECIs)
-    by_hour: dict[str, float] = {}
+    # Per-hour: (max_temp, wind_dir_at_that_max).  drct may be 'M' even
+    # when temp is good; store None in that case.
+    by_hour: dict[str, tuple[float, float | None]] = {}
     for line in lines[1:]:
         parts = line.split(",")
-        if len(parts) < 3:
+        if len(parts) < 4:
             continue
-        _, valid, tmpc = parts[0], parts[1], parts[2]
+        _, valid, tmpc, drct = parts[0], parts[1], parts[2], parts[3]
         if not valid or tmpc in ("M", "", "T"):
             continue
         try:
@@ -191,20 +205,24 @@ def _parse_and_upsert(conn, city: str, station: str, csv_text: str) -> int:
             t  = float(tmpc)
         except ValueError:
             continue
+        try:
+            wd = float(drct) if drct not in ("M", "", "T") else None
+        except ValueError:
+            wd = None
         hour_key = dt.strftime("%Y-%m-%d %H:00")
         existing = by_hour.get(hour_key)
-        if existing is None or t > existing:
-            by_hour[hour_key] = t
+        if existing is None or t > existing[0]:
+            by_hour[hour_key] = (t, wd)
 
     if not by_hour:
         return 0
-    rows = [(city, station, ts, ts[:10], int(ts[11:13]), temp)
-            for ts, temp in by_hour.items()]
+    rows = [(city, station, ts, ts[:10], int(ts[11:13]), temp, wd)
+            for ts, (temp, wd) in by_hour.items()]
     conn.executemany(
         """
         INSERT OR REPLACE INTO station_obs
-            (city, station, ts_local, date_local, hour_local, temp_c)
-        VALUES (?, ?, ?, ?, ?, ?)
+            (city, station, ts_local, date_local, hour_local, temp_c, wind_dir_deg)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
