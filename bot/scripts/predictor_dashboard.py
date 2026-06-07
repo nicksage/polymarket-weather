@@ -149,27 +149,44 @@ td .pill { display: inline-block; padding: 2px 7px; border-radius: 10px;
 """
 
 
+def _ensure_tables(db: str) -> None:
+    """Create predictor tables if missing.  Idempotent — safe to call every
+    time.  Lets the dashboard run before the scheduler's first scan has
+    populated the schema."""
+    try:
+        from scheduled_predictor import ensure_schema  # type: ignore
+        ensure_schema()
+    except Exception as e:
+        log.debug(f"ensure_schema import failed (non-fatal): {e}")
+
+
 def load_signals(db: str, since_utc: datetime) -> list[dict]:
     if not os.path.exists(db):
         return []
+    _ensure_tables(db)
     with sqlite3.connect(db) as conn:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            """
-            SELECT id, scanned_at_utc, mode, city, settlement_station,
-                   event_date, event_id, contract_id, bin_label,
-                   our_prob, market_prob, edge, liquidity_usd,
-                   action, gate_blocked_by,
-                   recommended_stake_usd, recommended_limit_price,
-                   current_hour_local, observed_max_c, observed_peak_hour,
-                   forecast_high_c, forecast_peak_hour,
-                   mu_c, sigma_c, wind_octant
-            FROM paper_predictor_signals
-            WHERE scanned_at_utc >= ?
-            ORDER BY scanned_at_utc DESC
-            """,
-            (since_utc.isoformat(),),
-        ).fetchall()
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, scanned_at_utc, mode, city, settlement_station,
+                       event_date, event_id, contract_id, bin_label,
+                       our_prob, market_prob, edge, liquidity_usd,
+                       action, gate_blocked_by,
+                       recommended_stake_usd, recommended_limit_price,
+                       current_hour_local, observed_max_c, observed_peak_hour,
+                       forecast_high_c, forecast_peak_hour,
+                       mu_c, sigma_c, wind_octant
+                FROM paper_predictor_signals
+                WHERE scanned_at_utc >= ?
+                ORDER BY scanned_at_utc DESC
+                """,
+                (since_utc.isoformat(),),
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            log.warning(f"paper_predictor_signals not readable: {e} — "
+                         "treating as empty.  Bot probably hasn't run a scan yet.")
+            return []
     return [dict(r) for r in rows]
 
 
