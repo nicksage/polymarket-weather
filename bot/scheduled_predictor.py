@@ -82,6 +82,7 @@ MAX_TRIGGER_HOUR     = int  (os.getenv("PREDICTOR_MAX_HOUR",     "22"))
 MAX_MARKET_PRICE     = float(os.getenv("PREDICTOR_MAX_MKT_PRICE", "0.95"))
 MAX_DAILY_EXPOSURE   = float(os.getenv("PREDICTOR_MAX_DAILY_EXP", "200"))
 MAX_TRADES_PER_DAY   = int  (os.getenv("PREDICTOR_MAX_TRADES",   "25"))
+MAX_BINS_PER_EVENT   = int  (os.getenv("PREDICTOR_MAX_BINS_PER_EVENT", "1"))
 KELLY_FRACTION       = float(os.getenv("PREDICTOR_KELLY_FRAC",   "0.25"))
 MAX_PCT_PER_TRADE    = float(os.getenv("PREDICTOR_MAX_PCT",      "0.05"))
 MIN_STAKE_USD        = float(os.getenv("PREDICTOR_MIN_STAKE",    "2.00"))
@@ -233,46 +234,73 @@ def _today_utc_date_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-_BUY_ACTIONS = ("PAPER_BUY", "LIVE_BUY")
+def _action_for_mode(mode: str) -> str:
+    """Map mode → the action string written for a successful BUY."""
+    return "LIVE_BUY" if mode == "live" else "PAPER_BUY"
 
 
-def already_acted_today(conn, event_id: str, contract_id: str) -> bool:
+def already_acted_today(conn, event_id: str, contract_id: str,
+                          mode: str) -> bool:
+    """True if THIS exact (event,bin) was already bought today IN THIS MODE.
+    Paper and live are independent — a paper-bought bin can still be
+    live-bought (they're different 'pools')."""
     today = _today_utc_date_str()
     row = conn.execute(
-        f"""
+        """
         SELECT 1 FROM paper_predictor_signals
-        WHERE event_id = ? AND contract_id = ?
-          AND action IN ({','.join('?'*len(_BUY_ACTIONS))})
+        WHERE event_id = ? AND contract_id = ? AND action = ?
           AND substr(scanned_at_utc, 1, 10) = ?
         LIMIT 1
         """,
-        (event_id, contract_id, *_BUY_ACTIONS, today),
+        (event_id, contract_id, _action_for_mode(mode), today),
     ).fetchone()
     return row is not None
 
 
-def deployed_today_usd(conn) -> float:
+def event_has_buy_today(conn, event_id: str, mode: str) -> bool:
+    """True if ANY bin of this event was bought today in this mode.
+    Convenience wrapper around event_buys_today_count()."""
+    return event_buys_today_count(conn, event_id, mode) > 0
+
+
+def event_buys_today_count(conn, event_id: str, mode: str) -> int:
+    """Number of bins bought for this event today in this mode.  Used by
+    the MAX_BINS_PER_EVENT cap — when the count equals the cap, the
+    event is full and no more bins can be bought today."""
     today = _today_utc_date_str()
     row = conn.execute(
-        f"""
-        SELECT COALESCE(SUM(recommended_stake_usd), 0) FROM paper_predictor_signals
-        WHERE action IN ({','.join('?'*len(_BUY_ACTIONS))})
+        """
+        SELECT COUNT(*) FROM paper_predictor_signals
+        WHERE event_id = ? AND action = ?
           AND substr(scanned_at_utc, 1, 10) = ?
         """,
-        (*_BUY_ACTIONS, today),
+        (event_id, _action_for_mode(mode), today),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def deployed_today_usd(conn, mode: str) -> float:
+    """Sum of stakes for today, IN THIS MODE only."""
+    today = _today_utc_date_str()
+    row = conn.execute(
+        """
+        SELECT COALESCE(SUM(recommended_stake_usd), 0) FROM paper_predictor_signals
+        WHERE action = ? AND substr(scanned_at_utc, 1, 10) = ?
+        """,
+        (_action_for_mode(mode), today),
     ).fetchone()
     return float(row[0]) if row else 0.0
 
 
-def trades_today(conn) -> int:
+def trades_today(conn, mode: str) -> int:
+    """Count of today's buys IN THIS MODE only."""
     today = _today_utc_date_str()
     row = conn.execute(
-        f"""
+        """
         SELECT COUNT(*) FROM paper_predictor_signals
-        WHERE action IN ({','.join('?'*len(_BUY_ACTIONS))})
-          AND substr(scanned_at_utc, 1, 10) = ?
+        WHERE action = ? AND substr(scanned_at_utc, 1, 10) = ?
         """,
-        (*_BUY_ACTIONS, today),
+        (_action_for_mode(mode), today),
     ).fetchone()
     return int(row[0]) if row else 0
 
@@ -447,9 +475,16 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
     n_bins_evaluated = 0
 
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    n_events_skipped_not_today = 0
+    n_events_skipped_already_bought = 0
     try:
-        deployed = deployed_today_usd(conn)
-        n_trades = trades_today(conn)
+        deployed = deployed_today_usd(conn, PREDICTOR_MODE)
+        n_trades = trades_today(conn, PREDICTOR_MODE)
+
+        # Track how many bins were bought for each event IN THIS SCAN.
+        # Combined with event_buys_today_count() (DB-level, prior scans),
+        # this gates the MAX_BINS_PER_EVENT cap end-to-end.
+        events_bought_this_scan: dict[str, int] = {}
 
         for city in us_cities:
             events = events_by_city.get(city, [])
@@ -459,7 +494,15 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
             icao, _net, tz_str, lat, lon = s
             tz = ZoneInfo(tz_str)
             now_local = datetime.now(tz)
-            today_str = now_local.date().isoformat()
+            today_str_local = now_local.date().isoformat()
+
+            # Filter to TODAY's events only (using the city's LOCAL date,
+            # so Tokyo's "today" is its own calendar day, not UTC's).
+            todays_events = [e for e in events
+                              if e.get("date") == today_str_local]
+            n_events_skipped_not_today += len(events) - len(todays_events)
+            if not todays_events:
+                continue
 
             nws_obs   = fetch_nws_today_obs(icao, tz_str)
             forecast  = fetch_openmeteo_today(lat, lon, tz_str)
@@ -471,15 +514,43 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                                 and r["wind_dir_deg"] is not None]
             wind_mean = vector_mean_dir(afternoon_winds)
             wind_octant = deg_to_cardinal(wind_mean) if wind_mean is not None else None
-            nbr_signal = compute_neighbor_signal(city, today_str, wind_octant)
+            nbr_signal = compute_neighbor_signal(city, today_str_local, wind_octant)
 
-            for ev in events:
+            for ev in todays_events:
+                event_id = ev.get("event_id") or ""
+
+                # Skip if this event has already hit its MAX_BINS_PER_EVENT
+                # cap today in this mode.  Avoids the NWS/Open-Meteo cost.
+                buys_already = (event_buys_today_count(conn, event_id, PREDICTOR_MODE)
+                                  if event_id else 0)
+                if buys_already >= MAX_BINS_PER_EVENT:
+                    n_events_skipped_already_bought += 1
+                    continue
+
                 pred = predict_bins(ev, nws_obs, forecast, nbr_signal,
                                      now_local.hour, city=city)
                 if not pred.get("bins"):
                     continue
 
-                for b in pred["bins"]:
+                # NEW: rank bins by OUR PROBABILITY descending.  The top
+                # MAX_BINS_PER_EVENT are eligible candidates.  Lower-P bins
+                # are explicitly excluded — the user's rule is "never buy a
+                # bin if a higher-P bin exists in the same event."  Within
+                # the top-N, we evaluate in P-rank order: if the #1 bin
+                # fails gates, the whole event is aborted (we never fall
+                # through to less-confident bins).
+                bins_by_p = sorted(pred["bins"], key=lambda x: -x["our_prob"])
+                slots_remaining = MAX_BINS_PER_EVENT - buys_already
+                top_candidates  = bins_by_p[:slots_remaining]
+                non_candidates  = bins_by_p[slots_remaining:]
+
+                # Track whether the event was aborted (top-P bin failed
+                # gates).  Any remaining top-candidates that haven't been
+                # processed yet will inherit this reason.
+                event_aborted = False
+
+                # Process top candidates in P-rank order
+                for rank_idx, b in enumerate(top_candidates):
                     n_bins_evaluated += 1
                     edge       = b["edge"]
                     market_p   = b["market_prob"]
@@ -488,18 +559,29 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                     contract_id  = b["contract_id"]
                     yes_token_id = b["yes_token_id"]
 
-                    # Dedup check
-                    acted = already_acted_today(conn, ev.get("event_id") or "", contract_id)
-
-                    ok, reason = evaluate_gates(
-                        current_hour    = now_local.hour,
-                        edge            = edge,
-                        market_p        = market_p,
-                        liquidity       = liquidity,
-                        deployed_today  = deployed,
-                        trades_today    = n_trades,
-                        already_acted   = acted,
-                    )
+                    if event_aborted:
+                        ok = False
+                        reason = "event_aborted (higher-P bin failed gates)"
+                    else:
+                        acted = already_acted_today(conn, event_id, contract_id,
+                                                      PREDICTOR_MODE)
+                        ok, reason = evaluate_gates(
+                            current_hour    = now_local.hour,
+                            edge            = edge,
+                            market_p        = market_p,
+                            liquidity       = liquidity,
+                            deployed_today  = deployed,
+                            trades_today    = n_trades,
+                            already_acted   = acted,
+                        )
+                        # NEW: enforce per-scan cap (covers race within scan)
+                        if ok and events_bought_this_scan.get(event_id, 0) >= MAX_BINS_PER_EVENT - buys_already:
+                            ok = False
+                            reason = "event_cap_reached_this_scan"
+                        # NEW: if top-P (rank 0) bin fails gates, abort
+                        # the rest of this event per the strict rule.
+                        if not ok and rank_idx == 0:
+                            event_aborted = True
 
                     if ok:
                         stake = compute_stake(edge, market_p, PAPER_BANKROLL_USD)
@@ -514,6 +596,9 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                         deployed  += stake
                         limit_px   = marketable_limit(market_p)
                         gate_blocked_by = None
+                        events_bought_this_scan[event_id] = (
+                            events_bought_this_scan.get(event_id, 0) + 1
+                        )
                     else:
                         action = "AVOID" if edge <= -0.20 else "SKIP"
                         stake = 0.0
@@ -562,24 +647,73 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                             and not dry_run):
                             execute_live(conn, signal_id, city, ev, b,
                                           stake, limit_px)
+
+                # Write SKIP rows for non-candidate bins (those with lower
+                # our_p than the top MAX_BINS_PER_EVENT).  We still want
+                # them in the dashboard for visibility — operators want to
+                # see what the model thought of every bin, not just the
+                # ones we considered buying.
+                for b in non_candidates:
+                    n_bins_evaluated += 1
+                    reason = "not_top_p_in_event"
+                    skips_by_reason[reason] = skips_by_reason.get(reason, 0) + 1
+                    sig_row = {
+                        "scanned_at_utc":         scan_start.isoformat(),
+                        "mode":                   PREDICTOR_MODE,
+                        "city":                   city,
+                        "settlement_station":     icao,
+                        "event_date":             ev.get("date"),
+                        "event_id":               event_id,
+                        "contract_id":            b["contract_id"],
+                        "yes_token_id":           b["yes_token_id"],
+                        "bin_label":              b["label"],
+                        "bin_range_low":          b["range_low"],
+                        "bin_range_high":         b["range_high"],
+                        "unit":                   b["unit"],
+                        "our_prob":               b["our_prob"],
+                        "market_prob":            b["market_prob"],
+                        "edge":                   b["edge"],
+                        "liquidity_usd":          b["liquidity_usd"],
+                        "action":                 "SKIP",
+                        "gate_blocked_by":        reason,
+                        "recommended_stake_usd":  0.0,
+                        "recommended_limit_price": None,
+                        "current_hour_local":     now_local.hour,
+                        "observed_max_c":         pred["observed_max_c"],
+                        "observed_peak_hour":     pred["observed_peak_hour"],
+                        "forecast_high_c":        pred["forecast_high"],
+                        "forecast_peak_hour":     pred["forecast_peak_hour"],
+                        "mu_c":                   pred["mu"],
+                        "sigma_c":                pred["sigma"],
+                        "wind_octant":            wind_octant,
+                        "upwind_signal_strength": nbr_signal.get("signal_strength"),
+                    }
+                    if not dry_run:
+                        write_signal(conn, sig_row)
     finally:
         conn.close()
 
+    action_label = "live_buys" if PREDICTOR_MODE == "live" else "paper_buys"
     summary = {
         "scanned_at_utc":    scan_start.isoformat(),
         "mode":              PREDICTOR_MODE,
         "n_cities":          len(us_cities),
         "n_events":          sum(len(v) for v in events_by_city.values()),
+        "events_skipped_not_today":         n_events_skipped_not_today,
+        "events_skipped_already_bought":    n_events_skipped_already_bought,
         "n_bins_evaluated":  n_bins_evaluated,
-        "n_paper_buys":      paper_buys,
-        "deployed_today":    round(deployed, 2),
-        "trades_today":      n_trades,
+        f"n_{action_label}":                paper_buys,
+        f"deployed_today_{PREDICTOR_MODE}": round(deployed, 2),
+        f"trades_today_{PREDICTOR_MODE}":   n_trades,
         "skips_by_reason":   skips_by_reason,
         "elapsed_sec":       (datetime.now(timezone.utc) - scan_start).total_seconds(),
     }
-    log.info(f"intraday_scan done: {summary['n_paper_buys']} PAPER_BUY · "
-             f"{summary['n_bins_evaluated']} bins · "
-             f"deployed today ${summary['deployed_today']:.0f} · "
+    buy_label = "LIVE_BUY" if PREDICTOR_MODE == "live" else "PAPER_BUY"
+    log.info(f"intraday_scan done: {paper_buys} {buy_label} · "
+             f"{n_bins_evaluated} bins · "
+             f"{n_events_skipped_not_today} non-today events skipped · "
+             f"{n_events_skipped_already_bought} events already bought · "
+             f"deployed today ${deployed:.0f} ({PREDICTOR_MODE}) · "
              f"{summary['elapsed_sec']:.1f}s")
     return summary
 

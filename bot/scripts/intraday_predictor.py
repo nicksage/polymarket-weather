@@ -77,9 +77,10 @@ NWS_BASE       = "https://api.weather.gov"
 NWS_USER_AGENT = "polymarket-weather-bot/1.0 (intraday-predictor)"
 OPENMETEO_URL  = "https://api.open-meteo.com/v1/forecast"
 
-# Forecast sigma — empirically Open-Meteo at airport coords runs ~1.5-2°C
-# RMSE day-ahead.  We start moderately wide and let observations narrow.
-DEFAULT_FORECAST_SIGMA_C = 2.0
+# Forecast sigma — fallback used when a city isn't in the per-city
+# calibration file (data/forecast_calibration.json).  Overridable via
+# the PREDICTOR_DEFAULT_SIGMA_C env var in .env.
+DEFAULT_FORECAST_SIGMA_C = float(os.getenv("PREDICTOR_DEFAULT_SIGMA_C", "2.0"))
 
 # Per-city σ calibration — loaded from data/forecast_calibration.json
 # (produced by scripts.forecast_rmse_calibration).  Falls back to the

@@ -13,8 +13,10 @@
 #     REPO_ROOT=/path/to/repo    # repo root (default: detected from script dir)
 #     VENV_PYTHON=/path/python   # venv python path (default: detected)
 #     ENV_FILE=/path/.env        # env file (default: $REPO_ROOT/.env if exists)
-#     PREDICTOR_MODE=paper|live  # what mode to run in (default: paper)
 #     MEMORY_MAX=512M            # systemd MemoryMax (default: 512M)
+#
+# All predictor tuning (PREDICTOR_MODE, _FLAT_STAKE_USD, _MIN_EDGE, …)
+# lives in .env — see the "Intraday Predictor" section there.
 #
 # What it does:
 #   1. Detects paths
@@ -44,7 +46,6 @@ RUN_USER="${RUN_USER:-${SUDO_USER:-$(whoami)}}"
 RUN_GROUP="$(id -gn "${RUN_USER}")"
 
 SERVICE_NAME="${SERVICE_NAME:-weather_bot}"
-PREDICTOR_MODE="${PREDICTOR_MODE:-paper}"
 MEMORY_MAX="${MEMORY_MAX:-512M}"
 
 # Find venv python — try repo/venv first, then common alternatives
@@ -96,8 +97,7 @@ echo "  unit path:      ${UNIT_PATH}"
 echo "  run user/group: ${RUN_USER}/${RUN_GROUP}"
 echo "  working dir:    ${WORK_DIR}"
 echo "  venv python:    ${VENV_PYTHON}"
-echo "  env file:       ${ENV_FILE} $( [[ -f ${ENV_FILE} ]] && echo '(found)' || echo '(MISSING — service will start without it)' )"
-echo "  PREDICTOR_MODE: ${PREDICTOR_MODE}"
+echo "  env file:       ${ENV_FILE} $( [[ -f ${ENV_FILE} ]] && echo '(found — all PREDICTOR_* settings come from here)' || echo '(MISSING — service will start without it)' )"
 echo "  MemoryMax:      ${MEMORY_MAX}"
 echo ""
 
@@ -127,9 +127,9 @@ Group=${RUN_GROUP}
 
 ${ENV_FILE_DIRECTIVE}
 
-# Predictor mode (paper logs only / live executes real orders).
-# Override per-instance by editing this file and 'systemctl daemon-reload'.
-Environment="PREDICTOR_MODE=${PREDICTOR_MODE}"
+# All predictor tunables (PREDICTOR_MODE, _FLAT_STAKE_USD, _MIN_EDGE, …)
+# come from .env so you can change them without re-running this installer.
+# After editing .env: sudo systemctl restart ${SERVICE_NAME}
 
 # Restart on crash; do not restart on clean shutdown.
 Restart=on-failure

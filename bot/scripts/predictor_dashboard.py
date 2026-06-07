@@ -206,7 +206,8 @@ def load_live_orders(db: str, since_utc: datetime) -> list[dict]:
 
 
 def build_dashboard(signals: list[dict], live_orders: list[dict],
-                     days: int, generated_at_utc: str) -> str:
+                     days: int, generated_at_utc: str,
+                     auto_refresh_sec: int | None = None) -> str:
     # Aggregate stats
     by_action: dict[str, int] = defaultdict(int)
     by_city_today: dict[str, dict] = defaultdict(lambda: {
@@ -276,7 +277,16 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
 
     sig_json = json.dumps(signals, default=str, separators=(",", ":"))
 
+    # Browser-side auto-refresh — pairs with --watch on the server side
+    # which regenerates the HTML file every N seconds.  When both are on,
+    # the dashboard shows fresh data without user interaction.
+    refresh_tag = (f'<meta http-equiv="refresh" content="{auto_refresh_sec}">'
+                    if auto_refresh_sec else "")
+    refresh_badge = (f'<span style="color:#94a3b8;font-size:10px">auto-refresh: {auto_refresh_sec}s</span>'
+                      if auto_refresh_sec else "")
+
     return f"""<!doctype html><html><head><meta charset="utf-8">
+{refresh_tag}
 <title>Predictor Signals Dashboard</title>
 <style>{DASHBOARD_CSS}</style></head><body>
 
@@ -287,7 +297,7 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
       Last {days}d · paper_predictor_signals + live_predictor_orders
     </div>
   </div>
-  <div class="meta">generated {generated_at_utc}<br>
+  <div class="meta">generated {generated_at_utc} {refresh_badge}<br>
     {n_signals:,} signals · {n_live_buy + n_paper_buy:,} BUYs
   </div>
 </header>
@@ -325,6 +335,8 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
 <div class="section-title">All signals — filter and sort</div>
 
 <div class="filters">
+  <div><label>Latest scan only</label>
+    <input id="f-latest" type="checkbox" checked title="Default: show only the most recent scan. Uncheck to see history."></div>
   <div><label>City</label><select id="f-city"><option value="">All</option>
     {"".join(f'<option>{c}</option>' for c in cities_in_data)}</select></div>
   <div><label>Date</label><select id="f-date"><option value="">All</option>
@@ -360,6 +372,14 @@ const SIGNALS = {sig_json};
 const $ = id => document.getElementById(id);
 let SORT_KEY = "scanned_at_utc", SORT_DIR = -1;
 
+// Most recent scan timestamp — every scan writes a batch of rows with
+// the same scanned_at_utc value, so filtering by max(scanned_at_utc)
+// gives us exactly one scan's worth of rows.
+const LATEST_SCAN_TS = SIGNALS.length
+  ? SIGNALS.reduce((m, s) => s.scanned_at_utc > m ? s.scanned_at_utc : m,
+                    SIGNALS[0].scanned_at_utc)
+  : "";
+
 function row(s) {{
   const eClass = s.edge >= 0 ? "pos" : "neg";
   const eStr = (s.edge >= 0 ? "+" : "") + (s.edge*100).toFixed(1) + "%";
@@ -381,13 +401,15 @@ function row(s) {{
 }}
 
 function render() {{
+  const latest = $("f-latest").checked;
   const city = $("f-city").value;
   const date = $("f-date").value;
   const act  = $("f-action").value;
   const me   = parseFloat($("f-edge").value);
   const buys = $("f-buys").checked;
   let rows = SIGNALS.filter(s =>
-    (!city || s.city === city)
+    (!latest || s.scanned_at_utc === LATEST_SCAN_TS)
+    && (!city || s.city === city)
     && (!date || (s.scanned_at_utc||'').startsWith(date))
     && (!act  || s.action === act)
     && (isNaN(me) || s.edge >= me)
@@ -417,7 +439,7 @@ document.querySelectorAll("th").forEach(th => {{
     render();
   }});
 }});
-["f-city","f-date","f-action","f-edge","f-buys"].forEach(id =>
+["f-latest","f-city","f-date","f-action","f-edge","f-buys"].forEach(id =>
   $(id).addEventListener("input", render));
 render();
 </script>
@@ -501,7 +523,11 @@ def render_live_order_row(o: dict) -> str:
     )
 
 
-def serve(path: str, port: int) -> None:
+def serve(path: str, port: int, regenerate_fn=None, watch_sec: int | None = None) -> None:
+    """Serve `path` over HTTP on `port`.  If regenerate_fn + watch_sec are
+    provided, runs the regenerator in a background thread every watch_sec
+    seconds — so the browser (with its own auto-refresh meta tag) always
+    sees fresh data."""
     serve_dir = os.path.dirname(os.path.abspath(path)) or "."
     fname = os.path.basename(path)
     os.chdir(serve_dir)
@@ -514,8 +540,21 @@ def serve(path: str, port: int) -> None:
     print(f"  Serving {path} on port {port}")
     print(f"  SSH tunnel:  ssh -L {port}:localhost:{port} <user>@<vps>")
     print(f"  Browser:     http://localhost:{port}/{fname}")
+    if regenerate_fn and watch_sec:
+        print(f"  Watch:       regenerating HTML every {watch_sec}s")
     print("  Ctrl-C to stop.")
     print("=" * 72)
+
+    if regenerate_fn and watch_sec:
+        import threading, time as _time
+        def _watcher():
+            while True:
+                _time.sleep(watch_sec)
+                try:
+                    regenerate_fn()
+                except Exception as e:
+                    log.warning(f"regenerate failed: {e}")
+        threading.Thread(target=_watcher, daemon=True).start()
 
     with Reusable(("0.0.0.0", port), http.server.SimpleHTTPRequestHandler) as httpd:
         try:
@@ -525,33 +564,56 @@ def serve(path: str, port: int) -> None:
 
 
 def main() -> int:
+    # Defaults from .env (no CLI flags needed for normal operation).
+    # CLI flags still work as overrides if you want ad-hoc behavior.
+    default_port  = int(os.getenv("DASHBOARD_PORT", "8082"))
+    default_watch = int(os.getenv("DASHBOARD_WATCH_SEC", "30"))
+    default_days  = int(os.getenv("DASHBOARD_DAYS", "1"))
+
     p = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    p.add_argument("--days", type=int, default=3,
-                   help="Lookback window in days (default: 3)")
+    p.add_argument("--days", type=int, default=default_days,
+                   help=f"Lookback window in days (default: {default_days} — "
+                         "set via DASHBOARD_DAYS in .env)")
     p.add_argument("--db", default=DB_PATH,
                    help=f"DB path (default: {DB_PATH})")
     p.add_argument("--html", default=os.path.join(_BOT_DIR, "data",
                                                     "predictor_dashboard.html"),
                    help="Output HTML path")
-    p.add_argument("--serve", type=int, metavar="PORT",
-                   help="After writing, start an HTTP server on PORT")
+    p.add_argument("--serve", type=int, metavar="PORT", default=default_port,
+                   nargs="?",
+                   help=f"Start HTTP server on PORT (default: {default_port} — "
+                         "set via DASHBOARD_PORT in .env)")
+    p.add_argument("--no-serve", action="store_true",
+                   help="Write HTML once and exit (don't start the server)")
+    p.add_argument("--watch", type=int, default=default_watch, metavar="SEC",
+                   help=f"Regenerate the HTML every SEC seconds "
+                         f"(default: {default_watch} — set via "
+                         "DASHBOARD_WATCH_SEC in .env, 0 disables).")
     args = p.parse_args()
+    if args.no_serve:
+        args.serve = None
 
-    since = datetime.now(timezone.utc) - timedelta(days=args.days)
-    signals = load_signals(args.db, since)
-    live_orders = load_live_orders(args.db, since)
-    log.info(f"loaded {len(signals)} signals + {len(live_orders)} live orders "
-             f"since {since.isoformat()}")
+    def regenerate() -> str:
+        since = datetime.now(timezone.utc) - timedelta(days=args.days)
+        signals = load_signals(args.db, since)
+        live_orders = load_live_orders(args.db, since)
+        log.info(f"regenerate: {len(signals)} signals + "
+                  f"{len(live_orders)} live orders since {since.isoformat()}")
+        generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        html = build_dashboard(signals, live_orders, args.days, generated_at,
+                                auto_refresh_sec=args.watch or None)
+        os.makedirs(os.path.dirname(args.html) or ".", exist_ok=True)
+        with open(args.html, "w", encoding="utf-8") as fh:
+            fh.write(html)
+        log.info(f"wrote {os.path.getsize(args.html)/1024:.0f} KB to {args.html}")
+        return args.html
 
-    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    html = build_dashboard(signals, live_orders, args.days, generated_at)
-    os.makedirs(os.path.dirname(args.html) or ".", exist_ok=True)
-    with open(args.html, "w", encoding="utf-8") as fh:
-        fh.write(html)
-    log.info(f"wrote {os.path.getsize(args.html)/1024:.0f} KB dashboard to {args.html}")
+    regenerate()
 
     if args.serve:
-        serve(args.html, args.serve)
+        serve(args.html, args.serve,
+              regenerate_fn=regenerate if args.watch else None,
+              watch_sec=args.watch or None)
     return 0
 
 
