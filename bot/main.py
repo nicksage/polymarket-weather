@@ -1250,6 +1250,16 @@ def main():
         coalesce=True,
     )
 
+    # Intraday bin predictor — scheduled scan (default: paper mode, every 15 min).
+    # Self-contained module; safe to register here.  Controlled by PREDICTOR_MODE
+    # env var (defaults to 'paper').  Failures here MUST NOT crash the bot, so
+    # wrap in try/except.
+    try:
+        from scheduled_predictor import register_predictor_jobs
+        register_predictor_jobs(scheduler)
+    except Exception as e:
+        logger.warning(f"intraday_predictor scheduler registration failed (non-fatal): {e}")
+
     # Load all event tokens on startup so WebSocket captures all prices
     try:
         from price_ws import load_all_event_tokens
