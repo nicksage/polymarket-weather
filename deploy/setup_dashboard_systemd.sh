@@ -54,8 +54,11 @@ if [[ -z "${VENV_PYTHON:-}" || ! -x "${VENV_PYTHON}" ]]; then
 fi
 
 ENV_FILE="${ENV_FILE:-${REPO_ROOT}/.env}"
-ENV_DIRECTIVE=""
-[[ -f "${ENV_FILE}" ]] && ENV_DIRECTIVE="EnvironmentFile=${ENV_FILE}"
+# NOTE: we deliberately do NOT use systemd's EnvironmentFile= for the
+# dashboard.  Some systemd versions don't strip inline comments in .env
+# files, which corrupts values like 'MAX_OPEN_POSITIONS=0  # cap'.
+# The Python script calls load_dotenv() itself (which strips comments
+# correctly) so .env values still get loaded — just via Python, not systemd.
 
 WORK_DIR="${REPO_ROOT}/bot"
 if [[ ! -f "${WORK_DIR}/scripts/predictor_dashboard.py" ]]; then
@@ -82,7 +85,7 @@ echo "  unit path:      ${UNIT_PATH}"
 echo "  run user/group: ${RUN_USER}/${RUN_GROUP}"
 echo "  working dir:    ${WORK_DIR}"
 echo "  venv python:    ${VENV_PYTHON}"
-echo "  env file:       ${ENV_FILE} $( [[ -f ${ENV_FILE} ]] && echo '(found)' || echo '(missing)' )"
+echo "  env file:       ${ENV_FILE} $( [[ -f ${ENV_FILE} ]] && echo '(loaded by Python, not systemd)' || echo '(missing)' )"
 echo "  dashboard port: ${DASH_PORT}"
 [[ -n "${TAILSCALE_IP}" ]] && echo "  tailscale IP:   ${TAILSCALE_IP}"
 echo ""
@@ -109,10 +112,10 @@ ExecStart=${VENV_PYTHON} -m scripts.predictor_dashboard
 User=${RUN_USER}
 Group=${RUN_GROUP}
 
-${ENV_DIRECTIVE}
-
 # All settings come from .env (DASHBOARD_PORT, DASHBOARD_WATCH_SEC,
-# DASHBOARD_DAYS).  Edit those and restart this service to apply.
+# DASHBOARD_DAYS).  The script loads .env via python-dotenv itself
+# (NOT via systemd's EnvironmentFile=) to avoid inline-comment parsing
+# bugs in some systemd versions.  Edit .env and restart this service.
 
 Restart=on-failure
 RestartSec=15s

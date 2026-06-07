@@ -38,8 +38,21 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 _BOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_REPO_ROOT = os.path.dirname(_BOT_DIR)
 if _BOT_DIR not in sys.path:
     sys.path.insert(0, _BOT_DIR)
+
+# Force python-dotenv to load .env BEFORE config.py imports.  This
+# matters when run via systemd, whose EnvironmentFile= parser does NOT
+# strip inline comments — so a line like "MAX_OPEN_POSITIONS=0  # cap"
+# arrives as the literal string '0  # cap' and int() chokes.  Loading
+# with override=True via python-dotenv (which DOES strip comments)
+# rewrites the polluted vars before config.py touches them.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(_REPO_ROOT, ".env"), override=True)
+except ImportError:
+    pass
 
 from config import DB_PATH  # type: ignore
 try:

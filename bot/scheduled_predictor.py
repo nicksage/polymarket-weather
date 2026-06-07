@@ -39,8 +39,18 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_HERE)
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
+
+# Force python-dotenv to load .env with comment-stripping BEFORE
+# importing config.  Some systemd versions don't strip inline comments
+# in EnvironmentFile, polluting values like "0  # comment" → int() fails.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(_REPO_ROOT, ".env"), override=True)
+except ImportError:
+    pass
 
 from station_meta import CITY_STATIONS  # type: ignore
 from polymarket  import search_temp_high_events  # type: ignore
