@@ -548,30 +548,40 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
             for ev in todays_events:
                 event_id = ev.get("event_id") or ""
 
-                # Skip if this event has already hit its MAX_BINS_PER_EVENT
-                # cap today in this mode.  Avoids the NWS/Open-Meteo cost.
+                # IMPORTANT: we always re-evaluate every event (even if it's
+                # already at the buy cap) so the dashboard sees fresh
+                # market_prob values every scan.  Previously we short-
+                # circuited cap-reached events to save the NWS call, but
+                # that froze the dashboard's market data and P&L.  The
+                # cap is now enforced as a per-bin gate below (every bin
+                # gets a SKIP row with reason "event_at_cap"), so prices
+                # stay live.
                 buys_already = (event_buys_today_count(conn, event_id, PREDICTOR_MODE)
                                   if event_id else 0)
-                if buys_already >= MAX_BINS_PER_EVENT:
-                    n_events_skipped_already_bought += 1
-                    continue
+                event_at_cap = buys_already >= MAX_BINS_PER_EVENT
+                if event_at_cap:
+                    n_events_skipped_already_bought += 1   # for the summary
 
                 pred = predict_bins(ev, nws_obs, forecast, nbr_signal,
                                      now_local.hour, city=city)
                 if not pred.get("bins"):
                     continue
 
-                # NEW: rank bins by OUR PROBABILITY descending.  The top
-                # MAX_BINS_PER_EVENT are eligible candidates.  Lower-P bins
-                # are explicitly excluded — the user's rule is "never buy a
-                # bin if a higher-P bin exists in the same event."  Within
-                # the top-N, we evaluate in P-rank order: if the #1 bin
-                # fails gates, the whole event is aborted (we never fall
-                # through to less-confident bins).
+                # Rank bins by OUR PROBABILITY descending.  The top
+                # MAX_BINS_PER_EVENT are eligible candidates IF the event
+                # still has buy slots available; otherwise ALL bins are
+                # non_candidates and get SKIP rows (preserves fresh
+                # market_prob for the dashboard).
                 bins_by_p = sorted(pred["bins"], key=lambda x: -x["our_prob"])
-                slots_remaining = MAX_BINS_PER_EVENT - buys_already
-                top_candidates  = bins_by_p[:slots_remaining]
-                non_candidates  = bins_by_p[slots_remaining:]
+                if event_at_cap:
+                    top_candidates  = []                # no new buys allowed
+                    non_candidates  = bins_by_p
+                    non_candidate_reason = "event_at_cap_today"
+                else:
+                    slots_remaining = MAX_BINS_PER_EVENT - buys_already
+                    top_candidates  = bins_by_p[:slots_remaining]
+                    non_candidates  = bins_by_p[slots_remaining:]
+                    non_candidate_reason = "not_top_p_in_event"
 
                 # Track whether the event was aborted (top-P bin failed
                 # gates).  Any remaining top-candidates that haven't been
@@ -677,14 +687,16 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                             execute_live(conn, signal_id, city, ev, b,
                                           stake, limit_px)
 
-                # Write SKIP rows for non-candidate bins (those with lower
-                # our_p than the top MAX_BINS_PER_EVENT).  We still want
-                # them in the dashboard for visibility — operators want to
-                # see what the model thought of every bin, not just the
-                # ones we considered buying.
+                # Write SKIP rows for non-candidate bins.  Two cases:
+                #   1. event at cap → ALL bins land here, reason = event_at_cap_today
+                #   2. event has slots → only lower-P bins land here,
+                #      reason = not_top_p_in_event
+                # Either way, this guarantees we write fresh market_prob
+                # rows for every bin every scan, keeping the dashboard
+                # data live even for events we've already bought.
                 for b in non_candidates:
                     n_bins_evaluated += 1
-                    reason = "not_top_p_in_event"
+                    reason = non_candidate_reason
                     skips_by_reason[reason] = skips_by_reason.get(reason, 0) + 1
                     sig_row = {
                         "scanned_at_utc":         scan_start.isoformat(),
