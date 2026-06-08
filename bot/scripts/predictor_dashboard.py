@@ -131,6 +131,17 @@ def load_live_orders(db: str, since_utc: datetime) -> list[dict]:
 # Static city list (US only — what the predictor trades)
 # ---------------------------------------------------------------------------
 
+_TZ_SHORT = {
+    "America/New_York":    "ET",
+    "America/Chicago":     "CT",
+    "America/Denver":      "MT",
+    "America/Phoenix":     "MST",   # AZ — no DST
+    "America/Los_Angeles": "PT",
+    "America/Anchorage":   "AKT",
+    "Pacific/Honolulu":    "HT",
+}
+
+
 def _us_cities() -> list[dict]:
     us = (list(US_CITY_STATES.keys()) if US_CITY_STATES
            else [c for c, m in CITY_STATIONS.items() if m[0].startswith("K")])
@@ -140,7 +151,7 @@ def _us_cities() -> list[dict]:
         if not s:
             continue
         icao, _net, tz, _lat, _lon = s
-        tz_label = tz.split("/")[-1].replace("_", " ")
+        tz_label = _TZ_SHORT.get(tz, tz.split("/")[-1].replace("_", " "))
         out.append({"city": city, "station": icao, "tz_label": tz_label})
     return out
 
@@ -519,10 +530,25 @@ function buildCitySnapshot(cityMeta) {{
     eventGroups[eid].rows.push(r);
   }}
 
-  // For each event group, sort bins by our_p desc and build display rows
+  // For each event group: figure out which bin has the highest our_p
+  // (that's the ★ marker), then sort bins by TEMPERATURE for display
+  // (lowest temp → highest temp, with ≤ first and ≥ last).
   const events = Object.values(eventGroups).map(eg => {{
-    eg.rows.sort((a, b) => b.our_prob - a.our_prob);
-    const bins = eg.rows.map((r, i) => {{
+    // Find the top-P bin's contract_id BEFORE sorting
+    const topPRow = eg.rows.reduce((best, r) =>
+      r.our_prob > best.our_prob ? r : best, eg.rows[0]);
+    const topPContract = topPRow.contract_id;
+    // Sort by temperature.  Use bin_range_low; treat null as -Infinity
+    // so "≤X" bins sort first, and bins with no upper bound (≥X) get
+    // their high range_low which puts them last naturally.
+    eg.rows.sort((a, b) => {{
+      const aLo = (a.bin_range_low === null || a.bin_range_low === undefined)
+                    ? -Infinity : a.bin_range_low;
+      const bLo = (b.bin_range_low === null || b.bin_range_low === undefined)
+                    ? -Infinity : b.bin_range_low;
+      return aLo - bLo;
+    }});
+    const bins = eg.rows.map(r => {{
       const buy = buyByContract[r.contract_id];
       let entry_price = null, stake_usd = null, pnl_usd = null;
       if (buy) {{
@@ -541,7 +567,8 @@ function buildCitySnapshot(cityMeta) {{
         entry_price:  entry_price,
         stake_usd:    stake_usd,
         pnl_usd:      pnl_usd,
-        is_top_p:     i === 0,
+        // ★ marks the bin with the highest our_p (the one we'd buy first)
+        is_top_p:     r.contract_id === topPContract,
       }};
     }});
     return {{

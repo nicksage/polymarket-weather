@@ -474,11 +474,22 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
         log.error(f"event discovery failed: {e}")
         return {"error": str(e), "scanned_at_utc": scan_start.isoformat()}
 
+    # City-name normalization: Polymarket's parser title-cases city tokens
+    # ("nyc" → "Nyc"), but acronyms in our CITY_STATIONS stay uppercase
+    # ("NYC").  Build a case-insensitive lookup from us_cities so we can
+    # canonicalize whatever Polymarket gives us.
+    us_cities_ci = {c.lower(): c for c in us_cities}
+
     events_by_city: dict[str, list[dict]] = {}
     for e in all_events:
-        c = e.get("city")
-        if c in us_cities:
-            events_by_city.setdefault(c, []).append(e)
+        raw_city = e.get("city") or ""
+        canonical = us_cities_ci.get(raw_city.lower())
+        if canonical is not None:
+            # Rewrite the event in place so downstream code (write_signal,
+            # dashboard) sees the canonical name and rows aren't fragmented
+            # between "Nyc" and "NYC".
+            e["city"] = canonical
+            events_by_city.setdefault(canonical, []).append(e)
 
     paper_buys = 0
     skips_by_reason: dict[str, int] = {}
