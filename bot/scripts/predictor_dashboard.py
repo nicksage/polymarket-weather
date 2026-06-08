@@ -129,6 +129,56 @@ def load_live_orders(db: str, since_utc: datetime) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Polymarket data API — authoritative LIVE positions / P&L
+# ---------------------------------------------------------------------------
+
+POLYMARKET_DATA_API = "https://data-api.polymarket.com"
+
+
+def _get_proxy_address() -> str | None:
+    """Find the wallet/proxy address that holds our Polymarket positions."""
+    for var in ("POLYMARKET_FUNDER_ADDRESS", "POLYMARKET_PROXY_ADDRESS",
+                 "POLY_PROXY", "BROWSER_ADDRESS", "PROXY_ADDRESS",
+                 "WALLET_ADDRESS"):
+        v = os.getenv(var)
+        if v and isinstance(v, str) and v.lower().startswith("0x") and len(v) == 42:
+            return v
+    return None
+
+
+def fetch_live_positions() -> list[dict]:
+    """Hit Polymarket's data API for our current positions (the authoritative
+    source for LIVE P&L).  Returns list of dicts with at minimum:
+        asset      — token ID (matches paper_predictor_signals.yes_token_id)
+        size       — current shares held
+        avgPrice   — average entry price (actual fills, not market_prob)
+        curPrice   — current market mid-price
+        cashPnl    — dollar P&L per Polymarket's own calculation
+        percentPnl — % P&L
+
+    Empty list on failure (network, missing wallet address, etc.) so the
+    JS falls back to the formula-based PAPER P&L estimate.
+    """
+    addr = _get_proxy_address()
+    if not addr:
+        log.debug("no proxy address in env — skipping live positions fetch")
+        return []
+    try:
+        import urllib.request, urllib.parse
+        params = {"user": addr, "sizeThreshold": "0.01",
+                   "limit": "500", "sortBy": "CURRENT"}
+        url = f"{POLYMARKET_DATA_API}/positions?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url, headers={"User-Agent": "polymarket-weather/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.load(resp)
+        log.info(f"fetched {len(data)} live positions from Polymarket data API")
+        return data
+    except Exception as e:
+        log.warning(f"Polymarket positions API failed: {e} — JS will fall back to formula")
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Static city list (US only — what the predictor trades)
 # ---------------------------------------------------------------------------
 
@@ -329,13 +379,16 @@ table.live-orders th { background: #0f172a; color: #94a3b8; font-weight: 600;
 
 def build_dashboard(signals: list[dict], live_orders: list[dict],
                      generated_at_utc: str,
-                     auto_refresh_sec: int | None = None) -> str:
+                     auto_refresh_sec: int | None = None,
+                     live_positions: list[dict] | None = None) -> str:
     """Build the full HTML page.  All data filtering / aggregation happens
     in JS so the mode toggle is instant and reuses one data blob."""
     cities_meta = _us_cities()
     sig_json    = json.dumps(signals, default=str, separators=(",", ":"))
     live_json   = json.dumps(live_orders, default=str, separators=(",", ":"))
     cities_json = json.dumps(cities_meta, default=str, separators=(",", ":"))
+    positions_json = json.dumps(live_positions or [], default=str,
+                                  separators=(",", ":"))
 
     # No meta refresh — the JS does a silent fetch + re-render every
     # auto_refresh_sec, preserving sort order, filter state, and scroll
@@ -428,7 +481,12 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
 // Mutable so the silent-refresh fetch can swap them in place
 let SIGNALS = {sig_json};
 let LIVE_ORDERS = {live_json};
+let LIVE_POSITIONS = {positions_json};   // from Polymarket data API
 const CITIES = {cities_json};
+
+// Index live positions by asset (token_id) for O(1) lookup when computing
+// LIVE-trade P&L.  Rebuilt on every silent-refresh via recomputeDerived().
+let LIVE_POS_BY_TOKEN = {{}};
 const REFRESH_SEC = {refresh_sec_js};
 const $ = id => document.getElementById(id);
 
@@ -454,6 +512,13 @@ function todayUtcStr() {{
 
 function recomputeDerived() {{
   if (!SELECTED_DATE) SELECTED_DATE = todayUtcStr();
+  // Rebuild the live-positions lookup table (keyed by token_id).  Used
+  // by buildCitySnapshot to attach authoritative LIVE P&L per bin.
+  LIVE_POS_BY_TOKEN = {{}};
+  for (const p of (LIVE_POSITIONS || [])) {{
+    const tok = p.asset || p.token_id || p.tokenId;
+    if (tok) LIVE_POS_BY_TOKEN[String(tok)] = p;
+  }}
   // CHANGED: filter by event_date (the resolution day of the Polymarket
   // market), not by scanned_at_utc.  This is semantically what the user
   // means by "show me data for this day" — events resolving that day,
@@ -532,31 +597,63 @@ function buildCitySnapshot(cityMeta) {{
   }}
 
   // For each event group: figure out which bin has the highest our_p
-  // (that's the ★ marker), then sort bins by TEMPERATURE for display
-  // (lowest temp → highest temp, with ≤ first and ≥ last).
+  // (that's the ★ marker), then sort bins by TEMPERATURE for display.
+  //
+  // Sort by parsing the bin label directly — works regardless of whether
+  // bin_range_low is populated, and gives unambiguous order:
+  //   "≤69°F"   → -Infinity  (always first — colder than anything)
+  //   "76-77°F" → 76         (numeric low end)
+  //   "≥88°F"  → Infinity   (always last — hotter than anything)
+  function binSortKey(label) {{
+    if (!label) return 0;
+    if (label.indexOf('≤') === 0 || label.indexOf('<') === 0) return -Infinity;
+    if (label.indexOf('≥') === 0 || label.indexOf('>') === 0) return Infinity;
+    const m = label.match(/-?\\d+(?:\\.\\d+)?/);
+    return m ? parseFloat(m[0]) : 0;
+  }}
+
   const events = Object.values(eventGroups).map(eg => {{
-    // Find the top-P bin's contract_id BEFORE sorting
+    // Find the top-P bin's contract_id BEFORE sorting (so the ★ marker
+    // can be placed at its natural temperature position post-sort).
     const topPRow = eg.rows.reduce((best, r) =>
       r.our_prob > best.our_prob ? r : best, eg.rows[0]);
     const topPContract = topPRow.contract_id;
-    // Sort by temperature.  Use bin_range_low; treat null as -Infinity
-    // so "≤X" bins sort first, and bins with no upper bound (≥X) get
-    // their high range_low which puts them last naturally.
-    eg.rows.sort((a, b) => {{
-      const aLo = (a.bin_range_low === null || a.bin_range_low === undefined)
-                    ? -Infinity : a.bin_range_low;
-      const bLo = (b.bin_range_low === null || b.bin_range_low === undefined)
-                    ? -Infinity : b.bin_range_low;
-      return aLo - bLo;
-    }});
+    // Sort by temperature: cold → hot, ≤ first, ≥ last
+    eg.rows.sort((a, b) => binSortKey(a.bin_label) - binSortKey(b.bin_label));
     const bins = eg.rows.map(r => {{
       const buy = buyByContract[r.contract_id];
       let entry_price = null, stake_usd = null, pnl_usd = null;
+      let pnl_source = null;     // 'api' (Polymarket) or 'formula' (paper)
       if (buy) {{
-        entry_price = buy.market_prob;
-        stake_usd   = buy.recommended_stake_usd || 0;
-        if (entry_price > 0) {{
-          pnl_usd = stake_usd * ((r.market_prob / entry_price) - 1);
+        stake_usd = buy.recommended_stake_usd || 0;
+        // For LIVE trades, prefer Polymarket's authoritative numbers:
+        //   - actual avg_fill_price (not market_prob at signal time)
+        //   - cashPnl computed by Polymarket
+        // Falls back to formula if API data unavailable for this token.
+        const livePos = (buy.action === 'LIVE_BUY' && r.yes_token_id)
+                          ? LIVE_POS_BY_TOKEN[String(r.yes_token_id)]
+                          : null;
+        if (livePos) {{
+          entry_price = parseFloat(livePos.avgPrice ?? livePos.avg_price ?? buy.market_prob);
+          const cashPnl = parseFloat(livePos.cashPnl ?? livePos.cash_pnl ?? NaN);
+          if (!isNaN(cashPnl)) {{
+            pnl_usd = cashPnl;
+            pnl_source = 'api';
+          }} else if (entry_price > 0) {{
+            // API gave us avgPrice but no cashPnl — derive it
+            const curPx = parseFloat(livePos.curPrice ?? livePos.cur_price ?? r.market_prob);
+            const size  = parseFloat(livePos.size ?? 0);
+            pnl_usd = size * (curPx - entry_price);
+            pnl_source = 'api';
+          }}
+        }}
+        // PAPER trades, or LIVE trades with no API data → formula
+        if (pnl_usd === null) {{
+          entry_price = buy.market_prob;
+          if (entry_price > 0) {{
+            pnl_usd = stake_usd * ((r.market_prob / entry_price) - 1);
+            pnl_source = 'formula';
+          }}
         }}
       }}
       return {{
@@ -568,6 +665,7 @@ function buildCitySnapshot(cityMeta) {{
         entry_price:  entry_price,
         stake_usd:    stake_usd,
         pnl_usd:      pnl_usd,
+        pnl_source:   pnl_source,
         // ★ marks the bin with the highest our_p (the one we'd buy first)
         is_top_p:     r.contract_id === topPContract,
       }};
@@ -658,7 +756,7 @@ function renderBinRow(b) {{
     : '<span class="pill idle">—</span>';
   const entry = b.entry_price !== null ? '$' + b.entry_price.toFixed(3) : '';
   const pnl = b.pnl_usd !== null
-    ? `<span class="pnl ${{b.pnl_usd >= 0 ? 'pos' : 'neg'}}">${{b.pnl_usd >= 0 ? '+' : ''}}$${{b.pnl_usd.toFixed(2)}}</span>`
+    ? `<span class="pnl ${{b.pnl_usd >= 0 ? 'pos' : 'neg'}}" title="${{b.pnl_source === 'api' ? 'from Polymarket API' : 'paper formula: stake × (current/entry − 1)'}}">${{b.pnl_usd >= 0 ? '+' : ''}}$${{b.pnl_usd.toFixed(2)}}${{b.pnl_source === 'api' ? '<sup style="font-size:8px;opacity:0.7">API</sup>' : ''}}</span>`
     : '';
   let rowCls = '';
   if (b.action === 'LIVE_BUY') rowCls = 'bought live';
@@ -1073,9 +1171,11 @@ async function silentRefresh() {{
     const text = await resp.text();
     const newSignals    = extractJsonBlob(text, "SIGNALS");
     const newLiveOrders = extractJsonBlob(text, "LIVE_ORDERS");
-    if (newSignals === null && newLiveOrders === null) return;
+    const newLivePos    = extractJsonBlob(text, "LIVE_POSITIONS");
+    if (newSignals === null && newLiveOrders === null && newLivePos === null) return;
     if (newSignals !== null)    SIGNALS = newSignals;
     if (newLiveOrders !== null) LIVE_ORDERS = newLiveOrders;
+    if (newLivePos !== null)    LIVE_POSITIONS = newLivePos;
     recomputeDerived();
     renderAll();
     // Update generated-at timestamp in header if present
@@ -1161,11 +1261,14 @@ def main() -> int:
         since = datetime.now(timezone.utc) - timedelta(days=args.days)
         signals = load_signals(args.db, since)
         live_orders = load_live_orders(args.db, since)
+        live_positions = fetch_live_positions()    # Polymarket data API
         log.info(f"regenerate: {len(signals)} signals + "
-                  f"{len(live_orders)} live orders since {since.isoformat()}")
+                  f"{len(live_orders)} live orders + "
+                  f"{len(live_positions)} live positions since {since.isoformat()}")
         generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         html = build_dashboard(signals, live_orders, generated_at,
-                                auto_refresh_sec=args.watch or None)
+                                auto_refresh_sec=args.watch or None,
+                                live_positions=live_positions)
         os.makedirs(os.path.dirname(args.html) or ".", exist_ok=True)
         with open(args.html, "w", encoding="utf-8") as fh:
             fh.write(html)
