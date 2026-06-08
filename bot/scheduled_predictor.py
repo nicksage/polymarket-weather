@@ -98,6 +98,15 @@ KELLY_FRACTION       = float(os.getenv("PREDICTOR_KELLY_FRAC",   "0.25"))
 MAX_PCT_PER_TRADE    = float(os.getenv("PREDICTOR_MAX_PCT",      "0.05"))
 MIN_STAKE_USD        = float(os.getenv("PREDICTOR_MIN_STAKE",    "2.00"))
 SCAN_INTERVAL_MIN    = int  (os.getenv("PREDICTOR_SCAN_MIN",     "15"))
+# Weather cache TTL — NWS forecast + observation calls cached for this
+# many seconds.  Polymarket prices are always refreshed every scan; only
+# weather data is cached.  Default: 300s (5 min).  Combined with
+# PREDICTOR_SCAN_MIN=2, this gives Polymarket polling every 2 min and
+# weather refresh every 5 min, matching real-world data-change rates.
+WEATHER_CACHE_SEC    = int  (os.getenv("PREDICTOR_WEATHER_CACHE_SEC", "300"))
+
+# In-memory weather cache per city: {city: (fetched_at_epoch, {obs, forecast, ...})}
+_WEATHER_CACHE: dict[str, tuple[float, dict]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -526,24 +535,43 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
             if not todays_events:
                 continue
 
-            nws_obs   = fetch_nws_today_obs(icao, tz_str)
-            # PRIMARY: NWS hourly forecast (same source as Wunderground →
-            # the Polymarket settlement feed).  Fallback to Open-Meteo only
-            # if NWS is unreachable so we don't lose coverage on a transient
-            # outage.
-            forecast = fetch_nws_today_forecast(lat, lon, tz_str)
-            if not forecast:
-                log.warning(f"NWS forecast empty for {city} — falling back to Open-Meteo")
-                forecast = fetch_openmeteo_today(lat, lon, tz_str)
-            if not forecast:
-                continue
-
-            afternoon_winds = [r["wind_dir_deg"] for r in nws_obs
-                                if r["hour_local"] in range(11, 19)
-                                and r["wind_dir_deg"] is not None]
-            wind_mean = vector_mean_dir(afternoon_winds)
-            wind_octant = deg_to_cardinal(wind_mean) if wind_mean is not None else None
-            nbr_signal = compute_neighbor_signal(city, today_str_local, wind_octant)
+            # Weather cache check — refetch only if older than WEATHER_CACHE_SEC.
+            # Polymarket data was already pulled fresh at scan start (above);
+            # weather lags on a 5-min model cycle so caching it saves API
+            # calls without hurting decision quality.
+            import time as _time
+            now_epoch = _time.time()
+            cached = _WEATHER_CACHE.get(city)
+            cache_age = (now_epoch - cached[0]) if cached else None
+            if cached and cache_age < WEATHER_CACHE_SEC:
+                w = cached[1]
+                nws_obs     = w["nws_obs"]
+                forecast    = w["forecast"]
+                wind_octant = w["wind_octant"]
+                nbr_signal  = w["nbr_signal"]
+                log.debug(f"weather cache HIT for {city} (age={cache_age:.0f}s)")
+            else:
+                nws_obs = fetch_nws_today_obs(icao, tz_str)
+                # PRIMARY: NWS forecast.  Fallback to Open-Meteo only if NWS down.
+                forecast = fetch_nws_today_forecast(lat, lon, tz_str)
+                if not forecast:
+                    log.warning(f"NWS forecast empty for {city} — falling back to Open-Meteo")
+                    forecast = fetch_openmeteo_today(lat, lon, tz_str)
+                if not forecast:
+                    continue
+                afternoon_winds = [r["wind_dir_deg"] for r in nws_obs
+                                    if r["hour_local"] in range(11, 19)
+                                    and r["wind_dir_deg"] is not None]
+                wind_mean = vector_mean_dir(afternoon_winds)
+                wind_octant = deg_to_cardinal(wind_mean) if wind_mean is not None else None
+                nbr_signal = compute_neighbor_signal(city, today_str_local, wind_octant)
+                _WEATHER_CACHE[city] = (now_epoch, {
+                    "nws_obs":     nws_obs,
+                    "forecast":    forecast,
+                    "wind_octant": wind_octant,
+                    "nbr_signal":  nbr_signal,
+                })
+                log.debug(f"weather cache REFRESH for {city}")
 
             for ev in todays_events:
                 event_id = ev.get("event_id") or ""
