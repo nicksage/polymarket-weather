@@ -242,6 +242,13 @@ table.bins tr.top-p { box-shadow: inset 3px 0 0 #fbbf24; }
 .city-empty { padding: 24px; text-align: center; color: #64748b; font-size: 12px;
                font-style: italic; }
 
+/* Event sub-section header (only shown when a city has >1 event) */
+.event-header { display: flex; justify-content: space-between; align-items: center;
+                background: #273449; padding: 6px 14px; font-size: 11px;
+                color: #cbd5e1; border-top: 1px solid #334155; }
+.event-header .event-date { font-weight: 700; color: white; font-family: monospace; }
+.event-header .event-stats { color: #94a3b8; font-family: monospace; }
+
 /* === Signals table === */
 .filters { background: #1e293b; padding: 10px 24px; display: flex;
            gap: 16px; flex-wrap: wrap; align-items: center; font-size: 12px;
@@ -317,13 +324,14 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
     live_json   = json.dumps(live_orders, default=str, separators=(",", ":"))
     cities_json = json.dumps(cities_meta, default=str, separators=(",", ":"))
 
-    refresh_tag = (f'<meta http-equiv="refresh" content="{auto_refresh_sec}">'
-                    if auto_refresh_sec else "")
+    # No meta refresh — the JS does a silent fetch + re-render every
+    # auto_refresh_sec, preserving sort order, filter state, and scroll
+    # position.  No blank flash on update.
     refresh_badge = (f'<span style="color:#94a3b8;font-size:10px">auto-refresh: {auto_refresh_sec}s</span>'
                       if auto_refresh_sec else "")
+    refresh_sec_js = int(auto_refresh_sec or 0)
 
     return f"""<!doctype html><html><head><meta charset="utf-8">
-{refresh_tag}
 <title>Predictor Dashboard</title>
 <style>{DASHBOARD_CSS}</style></head><body>
 
@@ -383,26 +391,33 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
 </table>
 
 <script>
-const SIGNALS = {sig_json};
-const LIVE_ORDERS = {live_json};
+// Mutable so the silent-refresh fetch can swap them in place
+let SIGNALS = {sig_json};
+let LIVE_ORDERS = {live_json};
 const CITIES = {cities_json};
+const REFRESH_SEC = {refresh_sec_js};
 const $ = id => document.getElementById(id);
 
 // Active mode filter for the entire dashboard: 'paper' | 'live' | 'both'
 let MODE_FILTER = "paper";
 
-// UTC today's date string — used to filter signals to today only
-const today = new Date().toISOString().slice(0, 10);
-const TODAY_SIGNALS = SIGNALS.filter(s =>
-  s.scanned_at_utc && s.scanned_at_utc.slice(0, 10) === today);
-const TODAY_LIVE_ORDERS = LIVE_ORDERS.filter(o =>
-  o.placed_at_utc && o.placed_at_utc.slice(0, 10) === today);
+// Recomputed on every refresh
+let TODAY_SIGNALS = [];
+let TODAY_LIVE_ORDERS = [];
+let LATEST_SCAN_TS = "";
 
-// Most recent scan timestamp (for the "latest only" filter)
-const LATEST_SCAN_TS = TODAY_SIGNALS.length
-  ? TODAY_SIGNALS.reduce((m, s) => s.scanned_at_utc > m ? s.scanned_at_utc : m,
-                          TODAY_SIGNALS[0].scanned_at_utc)
-  : "";
+function recomputeDerived() {{
+  const today = new Date().toISOString().slice(0, 10);
+  TODAY_SIGNALS = SIGNALS.filter(s =>
+    s.scanned_at_utc && s.scanned_at_utc.slice(0, 10) === today);
+  TODAY_LIVE_ORDERS = LIVE_ORDERS.filter(o =>
+    o.placed_at_utc && o.placed_at_utc.slice(0, 10) === today);
+  LATEST_SCAN_TS = TODAY_SIGNALS.length
+    ? TODAY_SIGNALS.reduce((m, s) => s.scanned_at_utc > m ? s.scanned_at_utc : m,
+                            TODAY_SIGNALS[0].scanned_at_utc)
+    : "";
+}}
+recomputeDerived();
 
 // ===== Mode filter helpers =====
 function isBuy(s) {{ return s.action === "PAPER_BUY" || s.action === "LIVE_BUY"; }}
@@ -419,25 +434,21 @@ function matchesBuyMode(s) {{
 }}
 
 // ===== Per-city aggregation =====
-// For each city, build a "today snapshot": city meta + bins from the latest
-// scan + any BUYs (in the current mode) for those bins, with computed P&L.
+// Within a city, signals can belong to MULTIPLE events (Polymarket sometimes
+// has more than one "highest temp" market per city per day).  We group bins
+// by event_id and render each event as its own sub-table within the panel.
 function buildCitySnapshot(cityMeta) {{
   const city = cityMeta.city;
   const todayInCity = TODAY_SIGNALS.filter(s => s.city === city);
   if (todayInCity.length === 0) {{
     return {{...cityMeta, hasData: false}};
   }}
-  // Latest scan for this city
+  // Latest scan for this city (all events update together each scan)
   const latestTs = todayInCity.reduce((m, s) =>
     s.scanned_at_utc > m ? s.scanned_at_utc : m, todayInCity[0].scanned_at_utc);
   const latestRows = todayInCity.filter(s => s.scanned_at_utc === latestTs);
 
-  // Sort latest rows: top-our_p bin first, then descending
-  latestRows.sort((a, b) => b.our_prob - a.our_prob);
-
-  // Find BUY rows (in current mode filter) for these bins.  An event can
-  // have at most MAX_BINS_PER_EVENT buys today; we look up the earliest
-  // BUY row per (contract_id) for entry price.
+  // Map BUYs by contract_id for fast lookup (current mode only)
   const buyRows = todayInCity.filter(matchesBuyMode);
   const buyByContract = {{}};
   for (const b of buyRows) {{
@@ -447,52 +458,75 @@ function buildCitySnapshot(cityMeta) {{
     }}
   }}
 
-  // Build bin rows with P&L if bought
-  const bins = latestRows.map((r, i) => {{
-    const buy = buyByContract[r.contract_id];
-    let entry_price = null, stake_usd = null, pnl_usd = null, pnl_pct = null;
-    if (buy) {{
-      entry_price = buy.market_prob;
-      stake_usd   = buy.recommended_stake_usd || 0;
-      // Paper P&L (also used for live as a proxy when actual fill not tracked):
-      //   shares = stake / entry, P&L = shares * (current - entry)
-      //         = stake * (current/entry - 1)
-      if (entry_price > 0) {{
-        pnl_pct = (r.market_prob / entry_price) - 1;
-        pnl_usd = stake_usd * pnl_pct;
-      }}
+  // Group latest scan's rows by event_id
+  const eventGroups = {{}};
+  for (const r of latestRows) {{
+    const eid = r.event_id || 'unknown';
+    if (!eventGroups[eid]) {{
+      eventGroups[eid] = {{
+        event_id:   r.event_id,
+        event_date: r.event_date,
+        rows:       []
+      }};
     }}
+    eventGroups[eid].rows.push(r);
+  }}
+
+  // For each event group, sort bins by our_p desc and build display rows
+  const events = Object.values(eventGroups).map(eg => {{
+    eg.rows.sort((a, b) => b.our_prob - a.our_prob);
+    const bins = eg.rows.map((r, i) => {{
+      const buy = buyByContract[r.contract_id];
+      let entry_price = null, stake_usd = null, pnl_usd = null;
+      if (buy) {{
+        entry_price = buy.market_prob;
+        stake_usd   = buy.recommended_stake_usd || 0;
+        if (entry_price > 0) {{
+          pnl_usd = stake_usd * ((r.market_prob / entry_price) - 1);
+        }}
+      }}
+      return {{
+        bin:          r.bin_label,
+        our_prob:     r.our_prob,
+        market_prob:  r.market_prob,
+        edge:         r.edge,
+        action:       buy ? buy.action : null,
+        entry_price:  entry_price,
+        stake_usd:    stake_usd,
+        pnl_usd:      pnl_usd,
+        is_top_p:     i === 0,
+      }};
+    }});
     return {{
-      bin:          r.bin_label,
-      our_prob:     r.our_prob,
-      market_prob:  r.market_prob,
-      edge:         r.edge,
-      action:       buy ? buy.action : null,
-      entry_price:  entry_price,
-      stake_usd:    stake_usd,
-      pnl_usd:      pnl_usd,
-      pnl_pct:      pnl_pct,
-      is_top_p:     i === 0,    // highest our_p
+      event_id:      eg.event_id,
+      event_date:    eg.event_date,
+      bins:          bins,
+      nBuys:         bins.filter(b => b.action).length,
+      nLiveBuys:     bins.filter(b => b.action === "LIVE_BUY").length,
+      totalDeployed: bins.reduce((s, b) => s + (b.stake_usd || 0), 0),
+      totalPnl:      bins.reduce((s, b) => s + (b.pnl_usd || 0), 0),
     }};
   }});
 
-  // City-level "current" stats from the latest scan (any row will do)
+  // Sort events: today first, then by date
+  events.sort((a, b) => (a.event_date || '').localeCompare(b.event_date || ''));
+
+  // City-level rollups across all events
   const anyRow = latestRows[0];
   return {{
     ...cityMeta,
     hasData:          true,
-    eventDate:        anyRow.event_date,
+    events:           events,
+    eventCount:       events.length,
     observedMax:      anyRow.observed_max_c,
     observedPeakHour: anyRow.observed_peak_hour,
     forecastHigh:     anyRow.forecast_high_c,
     forecastPeakHour: anyRow.forecast_peak_hour,
     windOctant:       anyRow.wind_octant,
-    bins:             bins,
-    nBuys:            bins.filter(b => b.action).length,
-    nLiveBuys:        bins.filter(b => b.action === "LIVE_BUY").length,
-    totalDeployed:    bins.reduce((s, b) => s + (b.stake_usd || 0), 0),
-    totalPnl:         bins.reduce((s, b) => s + (b.pnl_usd || 0), 0),
-    latestScanLocalHr: anyRow.current_hour_local,
+    nBuys:            events.reduce((s, e) => s + e.nBuys, 0),
+    nLiveBuys:        events.reduce((s, e) => s + e.nLiveBuys, 0),
+    totalDeployed:    events.reduce((s, e) => s + e.totalDeployed, 0),
+    totalPnl:         events.reduce((s, e) => s + e.totalPnl, 0),
   }};
 }}
 
@@ -539,6 +573,54 @@ function renderKPIs() {{
 }}
 
 // ===== City panel rendering =====
+function cToF(c) {{ return c * 9/5 + 32; }}
+
+function renderBinRow(b) {{
+  const edgeClass = b.edge >= 0 ? "edge pos" : "edge neg";
+  const edgeStr = (b.edge >= 0 ? "+" : "") + (b.edge*100).toFixed(1) + "%";
+  const action = b.action
+    ? `<span class="pill ${{b.action}}">${{b.action === 'LIVE_BUY' ? 'LIVE' : 'PAPER'}}</span>`
+    : '<span class="pill idle">—</span>';
+  const entry = b.entry_price !== null ? '$' + b.entry_price.toFixed(3) : '';
+  const pnl = b.pnl_usd !== null
+    ? `<span class="pnl ${{b.pnl_usd >= 0 ? 'pos' : 'neg'}}">${{b.pnl_usd >= 0 ? '+' : ''}}$${{b.pnl_usd.toFixed(2)}}</span>`
+    : '';
+  let rowCls = '';
+  if (b.action === 'LIVE_BUY') rowCls = 'bought live';
+  else if (b.action === 'PAPER_BUY') rowCls = 'bought';
+  if (b.is_top_p) rowCls += ' top-p';
+  return `<tr class="${{rowCls}}">
+    <td class="bin-label ${{b.is_top_p ? 'top' : ''}}">${{b.is_top_p ? '★ ' : ''}}${{b.bin}}</td>
+    <td class="num">${{(b.our_prob*100).toFixed(1)}}%</td>
+    <td class="num">${{(b.market_prob*100).toFixed(1)}}%</td>
+    <td class="num ${{edgeClass}}">${{edgeStr}}</td>
+    <td class="action">${{action}}</td>
+    <td class="num">${{entry}}</td>
+    <td class="num">${{pnl}}</td>
+  </tr>`;
+}}
+
+function renderEventSection(ev, showHeader) {{
+  const binsHtml = ev.bins.map(renderBinRow).join('');
+  const header = showHeader
+    ? `<div class="event-header">
+         <span class="event-date">Event ${{ev.event_date}}</span>
+         <span class="event-stats">${{ev.bins.length}} bins
+           ${{ev.nBuys ? '· ' + ev.nBuys + ' buy' + (ev.nBuys === 1 ? '' : 's') : ''}}
+           ${{ev.totalDeployed > 0 ? '· $' + ev.totalDeployed.toFixed(2) + ' deployed' : ''}}
+           ${{ev.totalPnl !== 0 ? '· P&L ' + (ev.totalPnl >= 0 ? '+' : '') + '$' + ev.totalPnl.toFixed(2) : ''}}
+         </span>
+       </div>`
+    : '';
+  return `${{header}}<table class="bins">
+    <thead><tr>
+      <th>Bin</th><th>Our P</th><th>Mkt P</th><th>Edge</th>
+      <th>Action</th><th>Entry</th><th>P&L</th>
+    </tr></thead>
+    <tbody>${{binsHtml}}</tbody>
+  </table>`;
+}}
+
 function renderCityPanel(snap) {{
   if (!snap.hasData) {{
     return `<div class="city-panel no-data">
@@ -555,40 +637,28 @@ function renderCityPanel(snap) {{
   if (snap.nLiveBuys > 0) cls += " has-live";
   else if (snap.nBuys > 0) cls += " has-position";
 
-  const obsT = snap.observedMax !== null && snap.observedMax !== undefined
-    ? snap.observedMax.toFixed(1) + '°C @ ' + snap.observedPeakHour + ':00' : '—';
-  const fcstT = snap.forecastHigh !== null && snap.forecastHigh !== undefined
-    ? snap.forecastHigh.toFixed(1) + '°C @ ' + snap.forecastPeakHour + ':00' : '—';
   const obsClass = (snap.observedMax !== null && snap.forecastHigh !== null
                      && snap.observedMax >= snap.forecastHigh - 0.5) ? "hot" : "";
 
-  const binsRows = snap.bins.map(b => {{
-    const ourBar = Math.round(Math.max(0, Math.min(1, b.our_prob)) * 100);
-    const mktBar = Math.round(Math.max(0, Math.min(1, b.market_prob)) * 100);
-    const edgeClass = b.edge >= 0 ? "edge pos" : "edge neg";
-    const edgeStr = (b.edge >= 0 ? "+" : "") + (b.edge*100).toFixed(1) + "%";
-    const action = b.action
-      ? `<span class="pill ${{b.action}}">${{b.action === 'LIVE_BUY' ? 'LIVE' : 'PAPER'}}</span>`
-      : '<span class="pill idle">—</span>';
-    const entry = b.entry_price !== null
-      ? '$' + b.entry_price.toFixed(3) : '';
-    const pnl = b.pnl_usd !== null
-      ? `<span class="pnl ${{b.pnl_usd >= 0 ? 'pos' : 'neg'}}">${{b.pnl_usd >= 0 ? '+' : ''}}$${{b.pnl_usd.toFixed(2)}}</span>`
-      : '';
-    let rowCls = '';
-    if (b.action === 'LIVE_BUY') rowCls = 'bought live';
-    else if (b.action === 'PAPER_BUY') rowCls = 'bought';
-    if (b.is_top_p) rowCls += ' top-p';
-    return `<tr class="${{rowCls}}">
-      <td class="bin-label ${{b.is_top_p ? 'top' : ''}}">${{b.is_top_p ? '★ ' : ''}}${{b.bin}}</td>
-      <td class="num">${{(b.our_prob*100).toFixed(1)}}%</td>
-      <td class="num">${{(b.market_prob*100).toFixed(1)}}%</td>
-      <td class="num ${{edgeClass}}">${{edgeStr}}</td>
-      <td class="action">${{action}}</td>
-      <td class="num">${{entry}}</td>
-      <td class="num">${{pnl}}</td>
-    </tr>`;
-  }}).join('');
+  // Header temperature: show both °C and °F
+  let tempDisplay = '—';
+  if (snap.observedMax !== null && snap.observedMax !== undefined) {{
+    tempDisplay = `${{snap.observedMax.toFixed(1)}}°C
+      <span style="color:#94a3b8;font-size:11px">/ ${{cToF(snap.observedMax).toFixed(1)}}°F</span>`;
+  }}
+
+  // Forecast high — also show both units
+  let fcstDisplay = '—';
+  if (snap.forecastHigh !== null && snap.forecastHigh !== undefined) {{
+    fcstDisplay = `${{snap.forecastHigh.toFixed(1)}}°C /
+      ${{cToF(snap.forecastHigh).toFixed(1)}}°F @ ${{snap.forecastPeakHour}}:00`;
+  }}
+
+  // Render each event as its own sub-table.  Hide event headers if only one
+  // event (which is the common case — looks cleaner without them).
+  const showEventHeaders = snap.events.length > 1;
+  const eventSections = snap.events.map(ev =>
+    renderEventSection(ev, showEventHeaders)).join('');
 
   return `<div class="${{cls}}">
     <div class="city-header">
@@ -597,24 +667,19 @@ function renderCityPanel(snap) {{
         <div class="station">${{snap.station}} · ${{snap.tz_label}}${{snap.windOctant ? ' · wind ' + snap.windOctant : ''}}</div>
       </div>
       <div class="now">
-        <div class="temp ${{obsClass}}">${{snap.observedMax !== null ? snap.observedMax.toFixed(1) + '°C' : '—'}}</div>
+        <div class="temp ${{obsClass}}">${{tempDisplay}}</div>
         <div>observed @ ${{snap.observedPeakHour}}:00 local</div>
       </div>
     </div>
     <div class="city-stats">
-      <div>Forecast high: <span class="v">${{fcstT}}</span></div>
-      <div>Event date: <span class="v">${{snap.eventDate}}</span></div>
+      <div>Forecast high: <span class="v">${{fcstDisplay}}</span></div>
+      <div>Events: <span class="v">${{snap.eventCount}}</span></div>
       <div>Position(s): <span class="v">${{snap.nBuys || 0}}</span>
         ${{snap.totalDeployed > 0 ? '· $' + snap.totalDeployed.toFixed(2) + ' deployed' : ''}}
+        ${{snap.totalPnl !== 0 ? '· P&L <span class="' + (snap.totalPnl >= 0 ? 'pnl pos' : 'pnl neg') + '">' + (snap.totalPnl >= 0 ? '+' : '') + '$' + snap.totalPnl.toFixed(2) + '</span>' : ''}}
       </div>
     </div>
-    <table class="bins">
-      <thead><tr>
-        <th>Bin</th><th>Our P</th><th>Mkt P</th><th>Edge</th>
-        <th>Action</th><th>Entry</th><th>P&L</th>
-      </tr></thead>
-      <tbody>${{binsRows}}</tbody>
-    </table>
+    ${{eventSections}}
   </div>`;
 }}
 
@@ -758,6 +823,53 @@ function renderAll() {{
   renderSigTable();
 }}
 renderAll();
+
+// ===== Silent refresh (no blank page on update) =====
+// Re-fetch the same URL every REFRESH_SEC, extract the SIGNALS/LIVE_ORDERS
+// blobs from the new HTML, swap them in place, and re-render.  Preserves:
+//   * mode toggle state
+//   * sort order
+//   * all filter inputs
+//   * scroll position
+//   * dropdown open/closed state
+function extractJsonBlob(text, varName) {{
+  // Match: let VAR = [...]; or let VAR = {{...}};
+  // Use a tolerant pattern: capture everything between the assignment and
+  // the next ";\\n" at top-level.
+  const re = new RegExp('let\\\\s+' + varName + '\\\\s*=\\\\s*(\\\\[[\\\\s\\\\S]*?\\\\]);', 'm');
+  const m = text.match(re);
+  if (!m) return null;
+  try {{ return JSON.parse(m[1]); }} catch (e) {{ return null; }}
+}}
+
+async function silentRefresh() {{
+  try {{
+    const resp = await fetch(window.location.href, {{cache: "no-store"}});
+    if (!resp.ok) return;
+    const text = await resp.text();
+    const newSignals    = extractJsonBlob(text, "SIGNALS");
+    const newLiveOrders = extractJsonBlob(text, "LIVE_ORDERS");
+    if (newSignals === null && newLiveOrders === null) return;
+    if (newSignals !== null)    SIGNALS = newSignals;
+    if (newLiveOrders !== null) LIVE_ORDERS = newLiveOrders;
+    recomputeDerived();
+    renderAll();
+    // Update generated-at timestamp in header if present
+    const tsMatch = text.match(/generated ([0-9-]+ [0-9:]+ UTC)/);
+    if (tsMatch) {{
+      document.querySelectorAll("header .meta").forEach(el => {{
+        const html = el.innerHTML.replace(/generated [0-9-]+ [0-9:]+ UTC/, "generated " + tsMatch[1]);
+        if (html !== el.innerHTML) el.innerHTML = html;
+      }});
+    }}
+  }} catch (e) {{
+    console.error("silent refresh failed:", e);
+  }}
+}}
+
+if (REFRESH_SEC > 0) {{
+  setInterval(silentRefresh, REFRESH_SEC * 1000);
+}}
 </script>
 </body></html>"""
 
