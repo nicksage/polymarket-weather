@@ -67,14 +67,15 @@ if [[ -z "${VENV_PYTHON:-}" || ! -x "${VENV_PYTHON}" ]]; then
     exit 1
 fi
 
-# Env file — only set if it exists
+# Env file — we deliberately do NOT use systemd's EnvironmentFile=.
+# Some systemd versions don't strip inline comments in .env values,
+# corrupting things like "MAX_OPEN_POSITIONS=0  # cap".  The Python
+# scripts call load_dotenv() themselves (which strips comments
+# correctly), so .env still loads — just via Python, not systemd.
 ENV_FILE="${ENV_FILE:-${REPO_ROOT}/.env}"
-ENV_FILE_DIRECTIVE=""
-if [[ -f "${ENV_FILE}" ]]; then
-    ENV_FILE_DIRECTIVE="EnvironmentFile=${ENV_FILE}"
-else
-    echo "NOTE: no .env file at ${ENV_FILE} — service will run without one."
-    echo "      If you need POLYMARKET_PRIVATE_KEY etc., create it before going live."
+if [[ ! -f "${ENV_FILE}" ]]; then
+    echo "NOTE: no .env file at ${ENV_FILE} — service will start without one."
+    echo "      Create it before live trading (POLYMARKET_PRIVATE_KEY etc.)."
 fi
 
 # bot/ subdir
@@ -83,8 +84,18 @@ if [[ ! -d "${WORK_DIR}" ]]; then
     echo "ERROR: expected ${WORK_DIR} to exist" >&2
     exit 1
 fi
-if [[ ! -f "${WORK_DIR}/main.py" ]]; then
-    echo "ERROR: expected ${WORK_DIR}/main.py to exist" >&2
+# Pick which Python entry point to run.  Two options:
+#   1. main.py — the full bot (top_k_hedged + intraday predictor scheduler)
+#   2. predictor_runner.py — ONLY the intraday predictor, no main-loop trading
+#
+# Override with ENTRY_POINT=main.py or ENTRY_POINT=predictor_runner.py.
+# Default: predictor_runner.py (intraday predictor only) — this is what
+# you want when you've explicitly disabled top_k_hedged.
+ENTRY_POINT="${ENTRY_POINT:-predictor_runner.py}"
+if [[ ! -f "${WORK_DIR}/${ENTRY_POINT}" ]]; then
+    echo "ERROR: expected ${WORK_DIR}/${ENTRY_POINT} to exist" >&2
+    echo "       Set ENTRY_POINT=main.py to use the full bot, or" >&2
+    echo "       ENTRY_POINT=predictor_runner.py for predictor-only." >&2
     exit 1
 fi
 
@@ -97,6 +108,7 @@ echo "  unit path:      ${UNIT_PATH}"
 echo "  run user/group: ${RUN_USER}/${RUN_GROUP}"
 echo "  working dir:    ${WORK_DIR}"
 echo "  venv python:    ${VENV_PYTHON}"
+echo "  entry point:    ${ENTRY_POINT}"
 echo "  env file:       ${ENV_FILE} $( [[ -f ${ENV_FILE} ]] && echo '(found — all PREDICTOR_* settings come from here)' || echo '(MISSING — service will start without it)' )"
 echo "  MemoryMax:      ${MEMORY_MAX}"
 echo ""
@@ -121,15 +133,14 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=${WORK_DIR}
-ExecStart=${VENV_PYTHON} main.py
+ExecStart=${VENV_PYTHON} ${ENTRY_POINT}
 User=${RUN_USER}
 Group=${RUN_GROUP}
 
-${ENV_FILE_DIRECTIVE}
-
 # All predictor tunables (PREDICTOR_MODE, _FLAT_STAKE_USD, _MIN_EDGE, …)
-# come from .env so you can change them without re-running this installer.
-# After editing .env: sudo systemctl restart ${SERVICE_NAME}
+# come from .env, loaded by the Python script via python-dotenv (NOT by
+# systemd, which mishandles inline comments).  Edit .env then:
+#   sudo systemctl restart ${SERVICE_NAME}
 
 # Restart on crash; do not restart on clean shutdown.
 Restart=on-failure
