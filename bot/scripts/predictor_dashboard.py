@@ -170,6 +170,7 @@ header .meta { font-family: monospace; font-size: 11px; color: #94a3b8; text-ali
 .mode-toggle button.active.paper { background: #1e3a8a; color: #dbeafe; }
 .mode-toggle button.active.live  { background: #7f1d1d; color: #fef2f2; }
 .mode-toggle button.active.both  { background: #4338ca; color: white; }
+.mode-toggle button.active.view  { background: #475569; color: white; }
 
 /* KPI strip */
 .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
@@ -336,12 +337,16 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
 <style>{DASHBOARD_CSS}</style></head><body>
 
 <header>
-  <div style="display:flex;align-items:center;gap:18px">
+  <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap">
     <h1>Predictor Dashboard</h1>
     <div class="mode-toggle">
       <button id="mode-paper" class="active paper">Paper</button>
       <button id="mode-live">Live</button>
       <button id="mode-both">Both</button>
+    </div>
+    <div class="mode-toggle view-toggle">
+      <button id="view-signals" class="active view">Signals</button>
+      <button id="view-trades" class="view">Trades</button>
     </div>
   </div>
   <div class="meta">generated {generated_at_utc} {refresh_badge}<br>
@@ -351,14 +356,9 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
 
 <div class="kpis" id="kpis"></div>
 
-<div class="section-title">Per-city panels (today)</div>
-<div class="city-grid" id="city-grid"></div>
-
-<div class="section-title">Live order log (today)</div>
-<div id="live-orders-section"></div>
-
-<div class="section-title">All signals (today)</div>
+<div class="section-title" id="panels-title">Per-city panels</div>
 <div class="filters">
+  <div><label>Date</label><select id="f-date"></select></div>
   <div><label>City</label><select id="f-city"><option value="">All</option></select></div>
   <div><label>Action</label><select id="f-action">
     <option value="">All</option>
@@ -373,6 +373,9 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
     <input id="f-latest" type="checkbox" checked></div>
   <div class="count" id="count">—</div>
 </div>
+<div class="city-grid" id="city-grid"></div>
+
+<div class="section-title" id="signals-title">All signals</div>
 
 <table class="signals" id="sig-table">
   <thead><tr>
@@ -390,6 +393,25 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
   <tbody id="sig-tbody"></tbody>
 </table>
 
+<table class="signals" id="trades-table" style="display:none">
+  <thead><tr>
+    <th data-key="scanned_at_utc">Placed (UTC)</th>
+    <th data-key="city">City</th>
+    <th data-key="bin_label">Bin</th>
+    <th data-key="action">Mode</th>
+    <th data-key="entry_price">Entry</th>
+    <th data-key="current_price">Now</th>
+    <th data-key="stake">Stake</th>
+    <th data-key="shares">Shares</th>
+    <th data-key="current_value">Value</th>
+    <th data-key="pnl_usd">P&L $</th>
+    <th data-key="pnl_pct">P&L %</th>
+    <th data-key="live_status">Order status</th>
+    <th data-key="live_order_id">Order ID</th>
+  </tr></thead>
+  <tbody id="trades-tbody"></tbody>
+</table>
+
 <script>
 // Mutable so the silent-refresh fetch can swap them in place
 let SIGNALS = {sig_json};
@@ -400,21 +422,42 @@ const $ = id => document.getElementById(id);
 
 // Active mode filter for the entire dashboard: 'paper' | 'live' | 'both'
 let MODE_FILTER = "paper";
+// Right-side bottom table: 'signals' (all evaluations) or 'trades' (just BUYs
+// with entry, current, P&L, live status).
+let VIEW_MODE = "signals";
+
+// The "date" filter is the master — KPIs, panels, signals table all
+// respect it.  Defaults to today's UTC date but can be changed via the
+// dropdown to inspect historical data.
+let SELECTED_DATE = "";
 
 // Recomputed on every refresh
-let TODAY_SIGNALS = [];
-let TODAY_LIVE_ORDERS = [];
-let LATEST_SCAN_TS = "";
+let DATE_SIGNALS = [];      // signals matching SELECTED_DATE (scan side)
+let DATE_LIVE_ORDERS = [];  // live orders placed on SELECTED_DATE
+let LATEST_SCAN_TS = "";    // most-recent scan within SELECTED_DATE
+
+function todayUtcStr() {{
+  return new Date().toISOString().slice(0, 10);
+}}
 
 function recomputeDerived() {{
-  const today = new Date().toISOString().slice(0, 10);
-  TODAY_SIGNALS = SIGNALS.filter(s =>
-    s.scanned_at_utc && s.scanned_at_utc.slice(0, 10) === today);
-  TODAY_LIVE_ORDERS = LIVE_ORDERS.filter(o =>
-    o.placed_at_utc && o.placed_at_utc.slice(0, 10) === today);
-  LATEST_SCAN_TS = TODAY_SIGNALS.length
-    ? TODAY_SIGNALS.reduce((m, s) => s.scanned_at_utc > m ? s.scanned_at_utc : m,
-                            TODAY_SIGNALS[0].scanned_at_utc)
+  if (!SELECTED_DATE) SELECTED_DATE = todayUtcStr();
+  // CHANGED: filter by event_date (the resolution day of the Polymarket
+  // market), not by scanned_at_utc.  This is semantically what the user
+  // means by "show me data for this day" — events resolving that day,
+  // regardless of when our bot scanned them.  Also fixes the list-view
+  // duplicate-rows issue: when two events for different dates were both
+  // scanned today, the list previously showed bins from both.
+  DATE_SIGNALS = SIGNALS.filter(s => s.event_date === SELECTED_DATE);
+  // Live orders also have event_date, so filter the same way.  Fall
+  // back to placed_at_utc match if event_date is missing on the row.
+  DATE_LIVE_ORDERS = LIVE_ORDERS.filter(o =>
+    (o.event_date && o.event_date === SELECTED_DATE)
+    || (!o.event_date && o.placed_at_utc
+         && o.placed_at_utc.slice(0, 10) === SELECTED_DATE));
+  LATEST_SCAN_TS = DATE_SIGNALS.length
+    ? DATE_SIGNALS.reduce((m, s) => s.scanned_at_utc > m ? s.scanned_at_utc : m,
+                          DATE_SIGNALS[0].scanned_at_utc)
     : "";
 }}
 recomputeDerived();
@@ -439,7 +482,11 @@ function matchesBuyMode(s) {{
 // by event_id and render each event as its own sub-table within the panel.
 function buildCitySnapshot(cityMeta) {{
   const city = cityMeta.city;
-  const todayInCity = TODAY_SIGNALS.filter(s => s.city === city);
+  // Only signals where event_date matches the selected date — keeps
+  // panels strictly scoped to the day the user picked (no future-event
+  // bleed from older scans that evaluated tomorrow's markets).
+  const todayInCity = DATE_SIGNALS.filter(s =>
+    s.city === city && s.event_date === SELECTED_DATE);
   if (todayInCity.length === 0) {{
     return {{...cityMeta, hasData: false}};
   }}
@@ -532,7 +579,7 @@ function buildCitySnapshot(cityMeta) {{
 
 // ===== KPI rendering =====
 function renderKPIs() {{
-  const buys = TODAY_SIGNALS.filter(matchesBuyMode);
+  const buys = DATE_SIGNALS.filter(matchesBuyMode);
   const nBuys = buys.length;
   const deployed = buys.reduce((s, b) => s + (b.recommended_stake_usd || 0), 0);
 
@@ -544,7 +591,7 @@ function renderKPIs() {{
   }}
 
   const avgEdge = nBuys ? buys.reduce((s, b) => s + b.edge, 0) / nBuys : 0;
-  const nSkips  = TODAY_SIGNALS.filter(s => s.action === "SKIP" && matchesMode(s)).length;
+  const nSkips  = DATE_SIGNALS.filter(s => s.action === "SKIP" && matchesMode(s)).length;
 
   const pnlClass = totalPnl >= 0 ? "pos" : "neg";
   const pnlSign  = totalPnl >= 0 ? "+" : "";
@@ -565,8 +612,8 @@ function renderKPIs() {{
     <div class="kpi"><div class="label">Skipped today</div>
       <div class="val">${{nSkips.toLocaleString()}}</div></div>
     <div class="kpi"><div class="label">Scanned today</div>
-      <div class="val">${{TODAY_SIGNALS.filter(matchesMode).length.toLocaleString()}}</div>
-      <div class="sub">${{TODAY_SIGNALS.length ? 'last: ' + LATEST_SCAN_TS.slice(11,16) + 'Z' : ''}}</div></div>
+      <div class="val">${{DATE_SIGNALS.filter(matchesMode).length.toLocaleString()}}</div>
+      <div class="sub">${{DATE_SIGNALS.length ? 'last: ' + LATEST_SCAN_TS.slice(11,16) + 'Z' : ''}}</div></div>
   `;
   $("hdr-counts").textContent =
     `${{nBuys}} BUYs · $${{deployed.toFixed(0)}} dep · ${{pnlSign}}$${{totalPnl.toFixed(2)}} P&L`;
@@ -684,40 +731,17 @@ function renderCityPanel(snap) {{
 }}
 
 function renderCityPanels() {{
-  const html = CITIES.map(c => renderCityPanel(buildCitySnapshot(c))).join('');
-  $("city-grid").innerHTML = html || '<div class="empty">No cities configured</div>';
+  // City filter narrows which panels are shown.  Date filter (SELECTED_DATE)
+  // is applied inside buildCitySnapshot.
+  const cityFilter = $("f-city").value;
+  const cities = cityFilter ? CITIES.filter(c => c.city === cityFilter) : CITIES;
+  const html = cities.map(c => renderCityPanel(buildCitySnapshot(c))).join('');
+  $("city-grid").innerHTML = html ||
+    '<div class="empty">No matching cities — try changing the date or city filter</div>';
 }}
 
-// ===== Live orders table =====
-function renderLiveOrders() {{
-  const visible = TODAY_LIVE_ORDERS.filter(o => MODE_FILTER !== "paper");
-  if (visible.length === 0) {{
-    $("live-orders-section").innerHTML =
-      '<div class="empty" style="padding:6px 24px 16px">No live orders today</div>';
-    return;
-  }}
-  const rows = visible.slice(0, 50).map(o => {{
-    const status = (o.status || "?").toLowerCase();
-    const stake = '$' + (o.stake_usd || 0).toFixed(2);
-    const lim = o.limit_price ? o.limit_price.toFixed(4) : "—";
-    const oid = (o.order_id || "").slice(0, 18);
-    const err = (o.error || "").slice(0, 60);
-    return `<tr>
-      <td class="tstamp">${{(o.placed_at_utc || "").slice(0,19).replace("T"," ")}}</td>
-      <td><b>${{o.city || ""}}</b></td>
-      <td>${{o.bin_label || ""}}</td>
-      <td class="num">${{stake}}</td>
-      <td class="num">${{lim}}</td>
-      <td><span class="pill ${{status}}">${{status.toUpperCase()}}</span></td>
-      <td class="tstamp">${{oid}}</td>
-      <td style="color:#f87171;font-size:11px">${{err}}</td>
-    </tr>`;
-  }}).join("");
-  $("live-orders-section").innerHTML = `<table class="live-orders">
-    <thead><tr><th>Placed</th><th>City</th><th>Bin</th><th>Stake</th>
-      <th>Limit</th><th>Status</th><th>Order ID</th><th>Error</th></tr></thead>
-    <tbody>${{rows}}</tbody></table>`;
-}}
+// (renderLiveOrders removed — live order info now appears in the Trades
+//  view's Status / Order ID / Error columns.)
 
 // ===== Signals table =====
 let SORT_KEY = "scanned_at_utc", SORT_DIR = -1;
@@ -749,7 +773,7 @@ function renderSigTable() {{
   const me   = parseFloat($("f-edge").value);
   const buys = $("f-buys").checked;
   const latest = $("f-latest").checked;
-  let rows = TODAY_SIGNALS.filter(s =>
+  let rows = DATE_SIGNALS.filter(s =>
        matchesMode(s)
     && (!latest || s.scanned_at_utc === LATEST_SCAN_TS)
     && (!city || s.city === city)
@@ -763,7 +787,7 @@ function renderSigTable() {{
     return SORT_DIR * String(av || '').localeCompare(String(bv || ''));
   }});
   rows = rows.slice(0, 500);
-  $("count").textContent = rows.length + " / " + TODAY_SIGNALS.length;
+  $("count").textContent = rows.length + " / " + DATE_SIGNALS.length;
 
   // Add city-break visual divider when city changes between rows
   let html = '';
@@ -782,11 +806,38 @@ function renderSigTable() {{
   }});
 }}
 
-// Populate city dropdown
-const citiesInData = [...new Set(TODAY_SIGNALS.map(s => s.city).filter(Boolean))].sort();
-for (const c of citiesInData) {{
-  const o = document.createElement("option"); o.value = o.textContent = c;
-  $("f-city").appendChild(o);
+// ===== Date + city dropdown population (refreshed on every render) =====
+function refreshDateDropdown() {{
+  const dates = [...new Set(SIGNALS.map(s => s.event_date).filter(Boolean))]
+    .sort().reverse();
+  const sel = $("f-date");
+  const today = todayUtcStr();
+  // Preserve user's current selection if it's still in the new data
+  const currentVal = SELECTED_DATE;
+  const fallback = dates.includes(today) ? today : (dates[0] || today);
+  sel.innerHTML = dates.map(d =>
+    `<option value="${{d}}">${{d}}${{d === today ? ' (today)' : ''}}</option>`
+  ).join('') || `<option value="${{today}}">${{today}} (today, no data yet)</option>`;
+  const chosen = dates.includes(currentVal) ? currentVal : fallback;
+  sel.value = chosen;
+  SELECTED_DATE = chosen;
+}}
+
+function refreshCityDropdown() {{
+  // Cities available on the selected date (preserve current selection)
+  const citiesInData = [...new Set(DATE_SIGNALS.map(s => s.city).filter(Boolean))].sort();
+  const sel = $("f-city");
+  const currentVal = sel.value;
+  sel.innerHTML = '<option value="">All</option>'
+    + citiesInData.map(c => `<option>${{c}}</option>`).join('');
+  if (citiesInData.includes(currentVal)) sel.value = currentVal;
+}}
+
+function updateSectionTitles() {{
+  const dateLabel = SELECTED_DATE === todayUtcStr() ? '(today)' : `(${{SELECTED_DATE}})`;
+  $("panels-title").textContent = `Per-city panels ${{dateLabel}}`;
+  $("signals-title").textContent =
+    (VIEW_MODE === 'trades' ? 'Trades ' : 'All signals ') + dateLabel;
 }}
 
 // Sort handlers
@@ -798,7 +849,148 @@ document.querySelectorAll("th").forEach(th => {{
     renderSigTable();
   }});
 }});
-["f-city","f-action","f-edge","f-buys","f-latest"].forEach(id =>
+// ===== Trades view (paper + live BUYs with full lifecycle info) =====
+let TRADES_SORT_KEY = "scanned_at_utc", TRADES_SORT_DIR = -1;
+
+function buildTradesData() {{
+  // All BUY rows in the current date range
+  const buys = DATE_SIGNALS.filter(s =>
+    s.action === "PAPER_BUY" || s.action === "LIVE_BUY");
+  // Latest known market price per contract (any scan in this date)
+  const latestByContract = {{}};
+  for (const s of DATE_SIGNALS) {{
+    if (!latestByContract[s.contract_id]
+        || s.scanned_at_utc > latestByContract[s.contract_id].scanned_at_utc) {{
+      latestByContract[s.contract_id] = s;
+    }}
+  }}
+  // Live order info per contract (most-recent placed order for that bin)
+  const liveByContract = {{}};
+  for (const o of DATE_LIVE_ORDERS) {{
+    const k = o.contract_id;
+    if (!liveByContract[k]
+        || (o.placed_at_utc || "") > (liveByContract[k].placed_at_utc || "")) {{
+      liveByContract[k] = o;
+    }}
+  }}
+  return buys.map(b => {{
+    const latest = latestByContract[b.contract_id] || b;
+    const live   = b.action === "LIVE_BUY" ? liveByContract[b.contract_id] : null;
+    const entry  = b.market_prob;
+    const cur    = latest.market_prob;
+    const stake  = b.recommended_stake_usd || 0;
+    const shares = entry > 0 ? stake / entry : 0;
+    const value  = shares * cur;
+    const pnl    = value - stake;
+    const pct    = entry > 0 ? (cur / entry - 1) : 0;
+    return {{
+      scanned_at_utc: b.scanned_at_utc,
+      city:           b.city,
+      station:        b.settlement_station,
+      bin_label:      b.bin_label,
+      action:         b.action,
+      entry_price:    entry,
+      current_price:  cur,
+      stake:          stake,
+      shares:         shares,
+      current_value:  value,
+      pnl_usd:        pnl,
+      pnl_pct:        pct,
+      live_status:    live ? (live.status || "") : "",
+      live_order_id:  live ? (live.order_id || "") : "",
+      live_error:     live ? (live.error || "") : "",
+    }};
+  }});
+}}
+
+function tradeRow(t, addCityBreak) {{
+  const modeCls = t.action;
+  const modeLabel = t.action === "LIVE_BUY" ? "LIVE" : "PAPER";
+  const pnlCls = t.pnl_usd >= 0 ? "pos" : "neg";
+  const pnlSign = t.pnl_usd >= 0 ? "+" : "";
+  let cls = modeCls + (addCityBreak ? " city-break" : "");
+  return `<tr class="${{cls}}">
+    <td class="tstamp">${{(t.scanned_at_utc || "").slice(0,16).replace("T"," ")}}</td>
+    <td><b>${{t.city}}</b><br><span style="color:#64748b;font-size:10px">${{t.station || ""}}</span></td>
+    <td><b>${{t.bin_label || ""}}</b></td>
+    <td><span class="pill ${{modeCls}}">${{modeLabel}}</span></td>
+    <td class="num">$${{t.entry_price.toFixed(3)}}</td>
+    <td class="num">$${{t.current_price.toFixed(3)}}</td>
+    <td class="num">$${{t.stake.toFixed(2)}}</td>
+    <td class="num">${{t.shares.toFixed(2)}}</td>
+    <td class="num">$${{t.current_value.toFixed(2)}}</td>
+    <td class="num edge ${{pnlCls}}">${{pnlSign}}$${{t.pnl_usd.toFixed(2)}}</td>
+    <td class="num edge ${{pnlCls}}">${{pnlSign}}${{(t.pnl_pct*100).toFixed(1)}}%</td>
+    <td><span class="pill ${{(t.live_status || "").toLowerCase()}}">${{(t.live_status || "—").toUpperCase()}}</span></td>
+    <td class="tstamp">${{(t.live_order_id || "").slice(0,14)}}</td>
+  </tr>`;
+}}
+
+function renderTradesTable() {{
+  const cityFilter = $("f-city").value;
+  let trades = buildTradesData().filter(t =>
+    matchesBuyMode({{action: t.action, mode: t.action === "LIVE_BUY" ? "live" : "paper"}})
+    && (!cityFilter || t.city === cityFilter)
+  );
+  trades.sort((a, b) => {{
+    let av = a[TRADES_SORT_KEY], bv = b[TRADES_SORT_KEY];
+    if (typeof av === "number") return TRADES_SORT_DIR * (av - bv);
+    return TRADES_SORT_DIR * String(av || "").localeCompare(String(bv || ""));
+  }});
+  trades = trades.slice(0, 500);
+  $("count").textContent = trades.length + " trades";
+  let html = "";
+  let lastCity = null;
+  for (const t of trades) {{
+    const breakNow = lastCity !== null && lastCity !== t.city;
+    html += tradeRow(t, breakNow);
+    lastCity = t.city;
+  }}
+  $("trades-tbody").innerHTML = html ||
+    '<tr><td colspan="13" class="empty">No trades match filters</td></tr>';
+  // Update sort indicator on the trades table headers
+  document.querySelectorAll("#trades-table th").forEach(th => {{
+    th.classList.remove("sorted-asc","sorted-desc");
+    if (th.dataset.key === TRADES_SORT_KEY)
+      th.classList.add(TRADES_SORT_DIR > 0 ? "sorted-asc" : "sorted-desc");
+  }});
+}}
+
+// Wire trades-table column sort handlers (same pattern as signals table)
+document.querySelectorAll("#trades-table th").forEach(th => {{
+  th.addEventListener("click", () => {{
+    if (!th.dataset.key) return;
+    if (TRADES_SORT_KEY === th.dataset.key) TRADES_SORT_DIR = -TRADES_SORT_DIR;
+    else {{ TRADES_SORT_KEY = th.dataset.key; TRADES_SORT_DIR = 1; }}
+    renderTradesTable();
+  }});
+}});
+
+// ===== View toggle (Signals vs Trades) =====
+function setView(v) {{
+  VIEW_MODE = v;
+  ["signals", "trades"].forEach(x => {{
+    const btn = $("view-" + x);
+    btn.classList.toggle("active", x === v);
+  }});
+  // Show the right table, hide the other
+  $("sig-table").style.display    = (v === "signals" ? "" : "none");
+  $("trades-table").style.display = (v === "trades"  ? "" : "none");
+  renderAll();
+}}
+$("view-signals").addEventListener("click", () => setView("signals"));
+$("view-trades").addEventListener("click",  () => setView("trades"));
+
+// Date dropdown drives the whole dashboard
+$("f-date").addEventListener("change", () => {{
+  SELECTED_DATE = $("f-date").value;
+  recomputeDerived();
+  renderAll();
+}});
+// City filter affects panels too, so it triggers renderAll (not just table)
+$("f-city").addEventListener("change", () => renderAll());
+// These only affect the signals table
+["f-action","f-edge","f-buys","f-latest"].forEach(id =>
   $(id).addEventListener("input", renderSigTable));
 
 // Mode toggle handlers
@@ -817,10 +1009,14 @@ $("mode-live").addEventListener("click",  () => setMode("live"));
 $("mode-both").addEventListener("click",  () => setMode("both"));
 
 function renderAll() {{
+  refreshDateDropdown();   // SELECTED_DATE may shift if today rolled over
+  recomputeDerived();       // re-filter DATE_SIGNALS for new SELECTED_DATE
+  refreshCityDropdown();    // city options depend on SELECTED_DATE
+  updateSectionTitles();
   renderKPIs();
   renderCityPanels();
-  renderLiveOrders();
-  renderSigTable();
+  if (VIEW_MODE === 'trades') renderTradesTable();
+  else                          renderSigTable();
 }}
 renderAll();
 
