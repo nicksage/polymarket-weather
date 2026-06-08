@@ -212,7 +212,126 @@ def fetch_nws_today_obs(icao: str, tz_str: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Open-Meteo — forecast prior + sunset time
+# NWS — forecast prior (hourly grid forecast for the settlement station coords)
+# ---------------------------------------------------------------------------
+
+# Cache the points → grid resolution since it rarely changes per (lat,lon)
+_NWS_POINTS_CACHE: dict[tuple[float, float], str] = {}
+
+
+def _sunset_local_hour(d: date, lat: float, lon: float, tz_str: str) -> int:
+    """NOAA solar-position sunset calc.  No external API; accurate to ~5 min.
+    Used because NWS's forecast endpoint doesn't include sunset and we don't
+    want to call a second service just for that."""
+    doy = d.timetuple().tm_yday
+    gamma = 2 * math.pi * (doy - 1) / 365
+    # Solar declination (radians)
+    decl = (0.006918 - 0.399912*math.cos(gamma) + 0.070257*math.sin(gamma)
+            - 0.006758*math.cos(2*gamma) + 0.000907*math.sin(2*gamma)
+            - 0.002697*math.cos(3*gamma) + 0.00148*math.sin(3*gamma))
+    # Equation of time (minutes)
+    eot = 229.18 * (
+        0.000075 + 0.001868*math.cos(gamma) - 0.032077*math.sin(gamma)
+        - 0.014615*math.cos(2*gamma) - 0.040849*math.sin(2*gamma)
+    )
+    # Hour angle for sunset (zenith = 90.833° accounts for atmospheric refraction)
+    lat_r = math.radians(lat)
+    try:
+        cos_ha = ((math.cos(math.radians(90.833))
+                    - math.sin(lat_r) * math.sin(decl))
+                   / (math.cos(lat_r) * math.cos(decl)))
+    except ZeroDivisionError:
+        return 19
+    if cos_ha > 1:  return 0     # polar night
+    if cos_ha < -1: return 23    # polar day
+    ha_deg = math.degrees(math.acos(cos_ha))
+    # Sunset in minutes since UTC midnight
+    sunset_utc_min = 720 + 4 * (-lon) + ha_deg * 4 - eot
+    sunset_utc = (datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc)
+                   + timedelta(minutes=sunset_utc_min))
+    return sunset_utc.astimezone(ZoneInfo(tz_str)).hour
+
+
+def fetch_nws_today_forecast(lat: float, lon: float, tz_str: str) -> dict:
+    """Hourly forecast from the official NWS API for the given coords.
+
+    This is the SAME data source Wunderground uses for US settlement
+    stations, and matches what Polymarket's resolver reads.  Returns the
+    same shape as fetch_openmeteo_today() so the rest of the pipeline
+    doesn't change:
+
+        {hourly: [(hour_local, temp_c), ...],
+         forecast_high: float (C),
+         forecast_peak_hour: int (local),
+         sunset_hour: int (local)}
+
+    NWS gives forecast temps in Fahrenheit by default; we convert to C
+    since the rest of the model is metric.
+    """
+    headers = {"User-Agent": NWS_USER_AGENT, "Accept": "application/geo+json"}
+    cache_key = (round(lat, 4), round(lon, 4))
+
+    # Step 1 — points endpoint (gives us the gridpoint forecast URL)
+    forecast_url = _NWS_POINTS_CACHE.get(cache_key)
+    if not forecast_url:
+        try:
+            r = httpx.get(f"{NWS_BASE}/points/{lat:.4f},{lon:.4f}",
+                           headers=headers, timeout=30)
+            r.raise_for_status()
+            forecast_url = r.json()["properties"]["forecastHourly"]
+            _NWS_POINTS_CACHE[cache_key] = forecast_url
+        except Exception as e:
+            log.warning(f"NWS points lookup failed at ({lat:.3f},{lon:.3f}): {e}")
+            return {}
+
+    # Step 2 — hourly forecast
+    try:
+        r = httpx.get(forecast_url, headers=headers, timeout=30)
+        r.raise_for_status()
+        periods = (r.json().get("properties") or {}).get("periods") or []
+    except Exception as e:
+        log.warning(f"NWS hourly forecast failed at ({lat:.3f},{lon:.3f}): {e}")
+        return {}
+
+    # Convert + filter to today (in city local time)
+    tz = ZoneInfo(tz_str)
+    today_local = datetime.now(tz).date()
+    hourly: list[tuple[int, float]] = []
+    for p in periods:
+        ts_str = p.get("startTime")
+        temp = p.get("temperature")
+        unit = (p.get("temperatureUnit") or "F").upper()
+        if not ts_str or temp is None:
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_str)
+        except ValueError:
+            continue
+        ts_local = ts.astimezone(tz)
+        if ts_local.date() != today_local:
+            continue
+        temp_c = (float(temp) - 32) * 5/9 if unit == "F" else float(temp)
+        hourly.append((ts_local.hour, temp_c))
+
+    if not hourly:
+        return {}
+
+    forecast_peak_hour, forecast_high = max(hourly, key=lambda x: x[1])
+    sunset_hour = _sunset_local_hour(today_local, lat, lon, tz_str)
+
+    return {
+        "hourly":             hourly,
+        "forecast_high":      forecast_high,
+        "forecast_peak_hour": forecast_peak_hour,
+        "sunset_hour":        sunset_hour,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Open-Meteo — DEPRECATED forecast source.  Kept only as a fallback if NWS
+# is unreachable.  The main pipeline now calls fetch_nws_today_forecast()
+# above, which matches Polymarket's settlement source (NWS METAR feed
+# routed through Wunderground).
 # ---------------------------------------------------------------------------
 
 def fetch_openmeteo_today(lat: float, lon: float, tz_str: str) -> dict:
@@ -872,10 +991,15 @@ def main() -> int:
         now_local = datetime.now(tz)
         today_str = now_local.date().isoformat()
 
-        log.info(f"  {city:<14} {icao}  fetching NWS + Open-Meteo ...")
+        log.info(f"  {city:<14} {icao}  fetching NWS obs + forecast ...")
 
         nws_obs   = fetch_nws_today_obs(icao, tz_str)
-        forecast  = fetch_openmeteo_today(lat, lon, tz_str)
+        # NWS forecast first (matches Polymarket settlement source).  Fall
+        # back to Open-Meteo only if NWS is unreachable.
+        forecast  = fetch_nws_today_forecast(lat, lon, tz_str)
+        if not forecast:
+            log.warning(f"  {city:<14} NWS forecast empty — falling back to Open-Meteo")
+            forecast = fetch_openmeteo_today(lat, lon, tz_str)
 
         # Afternoon mean wind direction for neighbor-signal lookup
         afternoon_winds = [r["wind_dir_deg"] for r in nws_obs

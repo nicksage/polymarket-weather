@@ -59,7 +59,8 @@ from config      import DB_PATH  # type: ignore
 # Reuse the intraday predictor's plumbing instead of duplicating it
 from scripts.intraday_predictor import (  # type: ignore
     fetch_nws_today_obs,
-    fetch_openmeteo_today,
+    fetch_nws_today_forecast,
+    fetch_openmeteo_today,        # kept as fallback if NWS unreachable
     compute_neighbor_signal,
     predict_bins,
     vector_mean_dir,
@@ -526,7 +527,14 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                 continue
 
             nws_obs   = fetch_nws_today_obs(icao, tz_str)
-            forecast  = fetch_openmeteo_today(lat, lon, tz_str)
+            # PRIMARY: NWS hourly forecast (same source as Wunderground →
+            # the Polymarket settlement feed).  Fallback to Open-Meteo only
+            # if NWS is unreachable so we don't lose coverage on a transient
+            # outage.
+            forecast = fetch_nws_today_forecast(lat, lon, tz_str)
+            if not forecast:
+                log.warning(f"NWS forecast empty for {city} — falling back to Open-Meteo")
+                forecast = fetch_openmeteo_today(lat, lon, tz_str)
             if not forecast:
                 continue
 

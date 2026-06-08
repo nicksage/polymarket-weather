@@ -94,6 +94,7 @@ def load_signals(db: str, since_utc: datetime) -> list[dict]:
                 """
                 SELECT id, scanned_at_utc, mode, city, settlement_station,
                        event_date, event_id, contract_id, bin_label,
+                       bin_range_low, bin_range_high, unit,
                        our_prob, market_prob, edge, liquidity_usd,
                        action, gate_blocked_by,
                        recommended_stake_usd, recommended_limit_price,
