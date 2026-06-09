@@ -143,8 +143,11 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=${SERVICE_NAME}
 
-# The dashboard is read-only — small memory footprint.
-MemoryMax=256M
+# Read-only dashboard but serializing all today's signals to HTML can
+# spike — 121 bins × 11 cities × ~30 scans/hr = ~40K rows/day, each
+# row is ~600 bytes of JSON = ~24MB JSON blob alone, plus per-render
+# Python work.  1G is comfortable headroom; previous 256M OOM'd.
+MemoryMax=1G
 
 [Install]
 WantedBy=multi-user.target

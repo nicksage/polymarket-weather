@@ -83,15 +83,44 @@ def _ensure_tables(db: str) -> None:
         log.debug(f"ensure_schema import failed: {e}")
 
 
+# Hard cap on rows pulled into the dashboard per regenerate.  At ~121
+# rows/scan × 30 scans/hour, today alone hits ~87K rows.  The dashboard
+# filters by event_date=today in JS anyway, so we narrow at the SQL
+# layer — but cap as a safety net in case event_date is sloppy.
+DASHBOARD_ROW_HARD_CAP = int(os.getenv("DASHBOARD_ROW_HARD_CAP", "30000"))
+
+
 def load_signals(db: str, since_utc: datetime) -> list[dict]:
+    """Load signals into the dashboard.
+
+    Optimized: rather than pulling everything since `since_utc` (which
+    grew to 78K+ rows after the 'always re-evaluate' fix and started
+    OOM-ing the dashboard service), we:
+      1. Pull only rows whose event_date is in the lookback window.
+         The dashboard filters by event_date in JS anyway, so anything
+         outside this window is invisible to the user.
+      2. ORDER by scanned_at_utc DESC and LIMIT to a hard cap so a
+         runaway insert pattern can't blow up memory again.
+    """
     if not os.path.exists(db):
         return []
     _ensure_tables(db)
+    # Build a list of event_dates we want — today's UTC date plus
+    # however many days back the caller asked for.
+    since_date = since_utc.date()
+    today_date = datetime.now(timezone.utc).date()
+    dates_wanted = []
+    d = since_date
+    while d <= today_date:
+        dates_wanted.append(d.isoformat())
+        d = d + timedelta(days=1)
+    placeholders = ",".join("?" for _ in dates_wanted)
+
     with sqlite3.connect(db) as conn:
         conn.row_factory = sqlite3.Row
         try:
             rows = conn.execute(
-                """
+                f"""
                 SELECT id, scanned_at_utc, mode, city, settlement_station,
                        event_date, event_id, contract_id, bin_label,
                        bin_range_low, bin_range_high, unit,
@@ -102,14 +131,19 @@ def load_signals(db: str, since_utc: datetime) -> list[dict]:
                        forecast_high_c, forecast_peak_hour,
                        mu_c, sigma_c, wind_octant
                 FROM paper_predictor_signals
-                WHERE scanned_at_utc >= ?
+                WHERE event_date IN ({placeholders})
                 ORDER BY scanned_at_utc DESC
+                LIMIT ?
                 """,
-                (since_utc.isoformat(),),
+                (*dates_wanted, DASHBOARD_ROW_HARD_CAP),
             ).fetchall()
         except sqlite3.OperationalError as e:
             log.warning(f"paper_predictor_signals not readable: {e}")
             return []
+    if len(rows) >= DASHBOARD_ROW_HARD_CAP:
+        log.warning(f"hit row hard cap ({DASHBOARD_ROW_HARD_CAP}) — "
+                     f"older rows truncated.  Bump DASHBOARD_ROW_HARD_CAP "
+                     f"in .env or reduce DASHBOARD_DAYS.")
     return [dict(r) for r in rows]
 
 
