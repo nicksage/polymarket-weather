@@ -87,6 +87,15 @@ FLAT_STAKE_USD       = float(os.getenv("PREDICTOR_FLAT_STAKE_USD", "5"))
 USE_KELLY            = os.getenv("PREDICTOR_USE_KELLY", "0").strip() in ("1", "true", "yes")
 PAPER_BANKROLL_USD   = float(os.getenv("PAPER_BANKROLL_USD",     "1000"))
 MIN_EDGE             = float(os.getenv("PREDICTOR_MIN_EDGE",     "0.10"))
+# Tiered edge: when market is cheap (mkt_p < HIGH_MKT_THRESHOLD), accept a
+# smaller edge.  Rationale: the MIN_EDGE=0.10 gate is meant to filter out
+# bins that are already expensively priced — if mkt_p is low (say 0.4), a
+# small edge of 0.05 represents +12.5% expected return per dollar, which is
+# still a worthwhile bet.  At mkt_p=0.90 the same 0.05 edge is only +5.5%
+# expected return AND you lose your full stake on the (likely) wrong side,
+# so the stricter MIN_EDGE protects you there.
+MIN_EDGE_LOW_MKT     = float(os.getenv("PREDICTOR_MIN_EDGE_LOW_MKT", "0.05"))
+HIGH_MKT_THRESHOLD   = float(os.getenv("PREDICTOR_HIGH_MKT_THRESHOLD", "0.75"))
 MIN_LIQUIDITY_USD    = float(os.getenv("PREDICTOR_MIN_LIQUIDITY", "300"))
 MIN_TRIGGER_HOUR     = int  (os.getenv("PREDICTOR_MIN_HOUR",     "13"))
 MAX_TRIGGER_HOUR     = int  (os.getenv("PREDICTOR_MAX_HOUR",     "22"))
@@ -231,8 +240,15 @@ def evaluate_gates(*, current_hour: int, edge: float, market_p: float,
         return False, f"too_early (hour={current_hour} < {MIN_TRIGGER_HOUR})"
     if current_hour > MAX_TRIGGER_HOUR:
         return False, f"too_late (hour={current_hour} > {MAX_TRIGGER_HOUR})"
-    if edge < MIN_EDGE:
-        return False, f"low_edge ({edge:+.3f} < {MIN_EDGE:.2f})"
+    # Tiered edge gate: stricter when market_p is "expensive" (>= 0.75),
+    # looser when cheap (<0.75).  The original MIN_EDGE=0.10 was designed
+    # to filter out high-priced bins where we'd lose the full stake on the
+    # wrong side; for cheaper bins the same edge is more attractive on
+    # expected-value terms.
+    required_edge = MIN_EDGE if market_p >= HIGH_MKT_THRESHOLD else MIN_EDGE_LOW_MKT
+    if edge < required_edge:
+        return False, (f"low_edge ({edge:+.3f} < {required_edge:.2f}, "
+                       f"mkt_p={market_p:.2f})")
     if market_p >= MAX_MARKET_PRICE:
         return False, f"priced_in (mkt={market_p:.3f} ≥ {MAX_MARKET_PRICE:.2f})"
     if liquidity < MIN_LIQUIDITY_USD:
