@@ -490,11 +490,29 @@ let LIVE_POS_BY_TOKEN = {{}};
 const REFRESH_SEC = {refresh_sec_js};
 const $ = id => document.getElementById(id);
 
+// ===== Persistent UI state =====
+// All toggles + filter values save to localStorage so they survive page
+// reloads (manual F5, browser restart, etc.).  Date is NOT persisted —
+// always defaults to today so users don't get stuck on yesterday's view.
+const LS_KEY = "predictor_dashboard_state_v1";
+function loadState() {{
+  try {{ return JSON.parse(localStorage.getItem(LS_KEY) || "{{}}"); }}
+  catch (e) {{ return {{}}; }}
+}}
+function saveState(updates) {{
+  try {{
+    const cur = loadState();
+    localStorage.setItem(LS_KEY, JSON.stringify(Object.assign(cur, updates)));
+  }} catch (e) {{ /* localStorage may be disabled */ }}
+}}
+const STATE = loadState();
+
 // Active mode filter for the entire dashboard: 'paper' | 'live' | 'both'
-let MODE_FILTER = "paper";
+// Initialized from localStorage so the user's choice persists across reloads.
+let MODE_FILTER = STATE.mode || "paper";
 // Right-side bottom table: 'signals' (all evaluations) or 'trades' (just BUYs
 // with entry, current, P&L, live status).
-let VIEW_MODE = "signals";
+let VIEW_MODE = STATE.view || "signals";
 
 // The "date" filter is the master — KPIs, panels, signals table all
 // respect it.  Defaults to today's UTC date but can be changed via the
@@ -1095,6 +1113,7 @@ document.querySelectorAll("#trades-table th").forEach(th => {{
 // ===== View toggle (Signals vs Trades) =====
 function setView(v) {{
   VIEW_MODE = v;
+  saveState({{view: v}});
   ["signals", "trades"].forEach(x => {{
     const btn = $("view-" + x);
     btn.classList.toggle("active", x === v);
@@ -1122,6 +1141,7 @@ $("f-city").addEventListener("change", () => renderAll());
 // Mode toggle handlers
 function setMode(m) {{
   MODE_FILTER = m;
+  saveState({{mode: m}});
   ["paper","live","both"].forEach(x => {{
     const btn = $(`mode-${{x}}`);
     btn.classList.toggle("active", x === m);
@@ -1134,6 +1154,49 @@ $("mode-paper").addEventListener("click", () => setMode("paper"));
 $("mode-live").addEventListener("click",  () => setMode("live"));
 $("mode-both").addEventListener("click",  () => setMode("both"));
 
+// ===== Restore persisted UI state on page load =====
+// Mode + view buttons start with HTML-baked "paper" / "signals" active
+// classes, so if the user previously chose a different option we need
+// to update the button states (and re-render with the right filter).
+// The values themselves were already loaded into MODE_FILTER/VIEW_MODE
+// at the top of the script; here we just flip the UI to match.
+function restorePersistedUI() {{
+  // Mode toggle
+  if (MODE_FILTER !== "paper") setMode(MODE_FILTER);
+  else {{
+    // Even if "paper", ensure ONLY paper is highlighted (HTML default OK)
+  }}
+  // View toggle
+  if (VIEW_MODE !== "signals") setView(VIEW_MODE);
+  // Filter inputs — restore from STATE, but only those that exist in the
+  // current data (selects may have different options than last session).
+  const restoreInput = (id, key) => {{
+    if (STATE[key] === undefined || STATE[key] === null) return;
+    const el = $(id);
+    if (!el) return;
+    if (el.type === "checkbox") el.checked = !!STATE[key];
+    else el.value = STATE[key];
+  }};
+  restoreInput("f-city",   "city");
+  restoreInput("f-action", "action");
+  restoreInput("f-edge",   "edge");
+  restoreInput("f-buys",   "buys");
+  restoreInput("f-latest", "latest");
+}}
+
+// Persist filter changes too
+function saveFilterState() {{
+  saveState({{
+    city:   $("f-city").value,
+    action: $("f-action").value,
+    edge:   $("f-edge").value,
+    buys:   $("f-buys").checked,
+    latest: $("f-latest").checked,
+  }});
+}}
+["f-city","f-action","f-edge","f-buys","f-latest"].forEach(id =>
+  $(id).addEventListener("change", saveFilterState));
+
 function renderAll() {{
   refreshDateDropdown();   // SELECTED_DATE may shift if today rolled over
   recomputeDerived();       // re-filter DATE_SIGNALS for new SELECTED_DATE
@@ -1144,6 +1207,12 @@ function renderAll() {{
   if (VIEW_MODE === 'trades') renderTradesTable();
   else                          renderSigTable();
 }}
+
+// Initial render — must populate dropdowns BEFORE restoring filter
+// values (otherwise the city dropdown is empty and the saved choice
+// won't stick).
+renderAll();
+restorePersistedUI();
 renderAll();
 
 // ===== Silent refresh (no blank page on update) =====
