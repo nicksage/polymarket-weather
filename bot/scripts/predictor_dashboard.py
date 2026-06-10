@@ -688,22 +688,33 @@ function buildCitySnapshot(cityMeta) {{
       let entry_price = null, stake_usd = null, pnl_usd = null;
       let pnl_source = null;     // 'api' (Polymarket) or 'formula' (paper)
       if (buy) {{
+        // Default: use the intended stake from the signal row.
+        // For live trades, this gets OVERRIDDEN below with actual fill data.
         stake_usd = buy.recommended_stake_usd || 0;
         // For LIVE trades, prefer Polymarket's authoritative numbers:
-        //   - actual avg_fill_price (not market_prob at signal time)
+        //   - actual deployed = size * avgPrice (not intended stake)
+        //   - entry_price = avgPrice (actual weighted fill, not signal market_p)
         //   - cashPnl computed by Polymarket
         // Falls back to formula if API data unavailable for this token.
         const livePos = (buy.action === 'LIVE_BUY' && r.yes_token_id)
                           ? LIVE_POS_BY_TOKEN[String(r.yes_token_id)]
                           : null;
         if (livePos) {{
-          entry_price = parseFloat(livePos.avgPrice ?? livePos.avg_price ?? buy.market_prob);
+          const livSize = parseFloat(livePos.size ?? 0);
+          const livAvg  = parseFloat(livePos.avgPrice ?? livePos.avg_price ?? 0);
+          // ACTUAL deployed = shares × avgPrice (matches Polymarket "Traded")
+          if (livSize > 0 && livAvg > 0) {{
+            stake_usd   = livSize * livAvg;
+            entry_price = livAvg;
+          }} else {{
+            entry_price = parseFloat(livePos.avgPrice ?? livePos.avg_price ?? buy.market_prob);
+          }}
+          // P&L: prefer API cashPnl; fallback to size*(curPrice-avgPrice)
           const cashPnl = parseFloat(livePos.cashPnl ?? livePos.cash_pnl ?? NaN);
           if (!isNaN(cashPnl)) {{
             pnl_usd = cashPnl;
             pnl_source = 'api';
           }} else if (entry_price > 0) {{
-            // API gave us avgPrice but no cashPnl — derive it
             const curPx = parseFloat(livePos.curPrice ?? livePos.cur_price ?? r.market_prob);
             const size  = parseFloat(livePos.size ?? 0);
             pnl_usd = size * (curPx - entry_price);

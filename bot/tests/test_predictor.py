@@ -24,6 +24,13 @@ from scripts.intraday_predictor import (
     truncated_normal_prob,
     bin_temp_range,
     normal_cdf,
+    detect_cooling,
+    find_bin_containing_temp,
+    predict_bins,
+    _cooling_via_obs_trajectory,
+    _cooling_via_forecast_tracking,
+    _cooling_via_derivative,
+    STRONG_COOLING_THRESHOLD,
 )
 
 
@@ -400,6 +407,195 @@ def test_ensemble_with_few_stations_ignored():
         },
     )
     assert no_ens == sparse, "ensemble with <3 stations should be no-op"
+
+
+# ---------------------------------------------------------------------------
+# Cooling detection helpers
+# ---------------------------------------------------------------------------
+
+def _mkobs(hours_temps):
+    return [{"hour_local": h, "temp_c": t, "wind_dir_deg": None,
+              "timestamp_utc": ""} for h, t in hours_temps]
+
+
+def test_cooling_obs_trajectory_pre3pm_needs_2():
+    """Before 15:00 local: N=2 cooling obs required."""
+    obs = _mkobs([(10, 26), (11, 28), (12, 30), (13, 31), (14, 32),
+                   (15, 33), (16, 32)])   # only 1 cooling obs
+    # Wait, current_hour=14 is BEFORE 3pm but peak is hour 15 which is after current
+    # Let me use a scenario where current is before 3pm AND we have a peak
+    obs = _mkobs([(8, 24), (9, 26), (10, 28), (11, 30), (12, 31), (13, 30)])
+    # observed_max=31 at hour 12, current=13 (before 3pm), 1 cooling obs (hour 13)
+    conf, _ = _cooling_via_obs_trajectory(obs, observed_max=31, observed_peak_hour=12,
+                                            current_hour=13)
+    assert conf == 0.0, f"pre-3pm with only 1 cooling obs should be 0, got {conf}"
+
+
+def test_cooling_obs_trajectory_pre3pm_with_2_obs():
+    """Before 15:00 local: 2 cooling obs satisfies N=2."""
+    obs = _mkobs([(8, 24), (9, 26), (10, 28), (11, 30), (12, 31), (13, 30), (14, 29)])
+    conf, _ = _cooling_via_obs_trajectory(obs, observed_max=31, observed_peak_hour=12,
+                                            current_hour=14)
+    assert conf >= 0.5, f"pre-3pm with 2 cooling obs should be >= 0.5, got {conf}"
+
+
+def test_cooling_obs_trajectory_post3pm_needs_1():
+    """After 15:00 local: just 1 cooling obs is enough."""
+    obs = _mkobs([(13, 31), (14, 32), (15, 33), (16, 33), (17, 32)])
+    # observed_max=33 at hour 16, current=17, 1 cooling obs at hour 17
+    conf, _ = _cooling_via_obs_trajectory(obs, observed_max=33, observed_peak_hour=16,
+                                            current_hour=17)
+    assert conf >= 0.5, f"post-3pm with 1 cooling obs should be >= 0.5, got {conf}"
+
+
+def test_cooling_obs_no_obs_after_peak():
+    """Peak is the latest obs — no cooling signal yet."""
+    obs = _mkobs([(13, 31), (14, 32), (15, 33), (16, 33)])
+    conf, _ = _cooling_via_obs_trajectory(obs, observed_max=33, observed_peak_hour=16,
+                                            current_hour=17)
+    assert conf == 0.0
+
+
+def test_cooling_via_forecast_tracking_fires_when_cooling_forecast():
+    """Forecast shows clear cooling AND obs tracking → high confidence."""
+    obs = _mkobs([(13, 31), (14, 32), (15, 33), (16, 33)])
+    fcst = [(13, 31), (14, 32), (15, 33), (16, 33),
+            (17, 32), (18, 31), (19, 30)]   # cooling ahead
+    conf, _ = _cooling_via_forecast_tracking(obs, fcst, current_hour=16)
+    assert conf >= 0.5, f"matched obs + cooling forecast should be >= 0.5, got {conf}"
+
+
+def test_cooling_via_forecast_tracking_zero_when_no_forecast_cooling():
+    """Forecast shows warming continues → no cooling signal."""
+    obs = _mkobs([(13, 31), (14, 32), (15, 33)])
+    fcst = [(13, 31), (14, 32), (15, 33), (16, 34), (17, 35), (18, 35)]  # warming
+    conf, _ = _cooling_via_forecast_tracking(obs, fcst, current_hour=15)
+    assert conf == 0.0
+
+
+def test_cooling_via_derivative_negative_slope():
+    """Linear fit with negative slope → cooling signal."""
+    obs = _mkobs([(14, 33), (15, 33), (16, 32.5), (17, 32), (18, 31)])
+    conf, _ = _cooling_via_derivative(obs, current_hour=18)
+    assert conf > 0, f"negative slope should give >0 cooling signal, got {conf}"
+
+
+def test_cooling_via_derivative_positive_slope():
+    """Linear fit with positive slope → 0 cooling signal."""
+    obs = _mkobs([(10, 26), (11, 28), (12, 30), (13, 31)])
+    conf, _ = _cooling_via_derivative(obs, current_hour=13)
+    assert conf == 0.0
+
+
+def test_detect_cooling_combined_houston():
+    """The actual Houston scenario from 2026-06-10: bot bet on 92-93°F
+    when it should have been 90-91°F.  After cooling detection fires,
+    the combined confidence should be >= STRONG_COOLING_THRESHOLD (0.7)
+    so that bin-lock engages."""
+    # 5pm scan after 4pm peak.  17:00 obs published, shows day plateauing.
+    obs = _mkobs([(10, 28), (11, 29), (12, 30), (13, 31), (14, 32),
+                   (15, 33), (16, 33), (17, 32.5)])
+    fcst = [(10, 28), (11, 29), (12, 30), (13, 31), (14, 32),
+            (15, 32.5), (16, 32.8), (17, 32.8), (18, 32), (19, 30.5)]
+    conf, reason = detect_cooling(obs, fcst, observed_max=33.0,
+                                    observed_peak_hour=16, current_hour=17)
+    assert conf >= STRONG_COOLING_THRESHOLD, (
+        f"Houston-style scenario should trigger bin-lock "
+        f"(conf={conf:.2f}, need ≥ {STRONG_COOLING_THRESHOLD}, reason={reason})"
+    )
+
+
+def test_detect_cooling_still_warming():
+    """Pre-peak, day still warming → cooling confidence ≈ 0."""
+    obs = _mkobs([(8, 22), (9, 25), (10, 28), (11, 30), (12, 31)])
+    fcst = [(8, 22), (9, 25), (10, 28), (11, 30), (12, 31),
+            (13, 32), (14, 32.5), (15, 33), (16, 33)]
+    conf, _ = detect_cooling(obs, fcst, observed_max=31.0,
+                              observed_peak_hour=12, current_hour=12)
+    assert conf < 0.3, f"warming day should have low cooling confidence, got {conf}"
+
+
+# ---------------------------------------------------------------------------
+# find_bin_containing_temp
+# ---------------------------------------------------------------------------
+
+def test_find_bin_containing_temp_normal():
+    bins = [
+        {"range_low": 86, "range_high": 87, "unit": "fahrenheit"},
+        {"range_low": 88, "range_high": 89, "unit": "fahrenheit"},
+        {"range_low": 90, "range_high": 91, "unit": "fahrenheit"},
+        {"range_low": 92, "range_high": 93, "unit": "fahrenheit"},
+    ]
+    # 91.4°F → 90-91°F bin (since 91.4 < 91.5 = bin's upper bound in half-step)
+    found = find_bin_containing_temp(33.0, bins)   # 33.0°C = 91.4°F
+    assert found is not None and found["range_low"] == 90, (
+        f"33.0°C should land in 90-91°F bin, got {found}"
+    )
+
+
+def test_find_bin_containing_temp_above_all():
+    bins = [
+        {"range_low": 86, "range_high": 87, "unit": "fahrenheit"},
+        {"range_low": 88, "range_high": 89, "unit": "fahrenheit"},
+    ]
+    # 100°F is way above — should return None (or an open-ended bin if present)
+    found = find_bin_containing_temp(37.8, bins)   # 100°F
+    assert found is None
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: Houston scenario via predict_bins
+# ---------------------------------------------------------------------------
+
+def test_houston_scenario_bin_locks_correctly():
+    """Regression test for the 2026-06-10 Houston bug.
+    Day peaked at 33.0°C (91.4°F) at 4pm with one cooling obs at 5pm.
+    Cooling should be strongly detected → bin-lock → 90-91°F gets >50% probability."""
+    # Build Polymarket-style bins (full Houston bin set)
+    bins = [{"range_low": lo, "range_high": hi, "unit": "fahrenheit",
+              "contract_id": f"c{lo}", "yes_token_id": f"t{lo}",
+              "yes_price": mkt, "liquidity_usd": 500}
+             for lo, hi, mkt in [
+                 (None, 79, 0.001), (80, 81, 0.001), (82, 83, 0.001),
+                 (84, 85, 0.001), (86, 87, 0.001), (88, 89, 0.001),
+                 (90, 91, 0.89), (92, 93, 0.095), (94, 95, 0.008),
+                 (96, 97, 0.001), (98, None, 0.001),
+             ]]
+    event = {"outcomes": bins, "settlement_station": "KHOU"}
+    # Observations: morning warming, 4pm peak, 5pm slight cooling
+    obs = _mkobs([(10, 28), (11, 29), (12, 30), (13, 31), (14, 32),
+                   (15, 33), (16, 33), (17, 32.5)])
+    forecast = {
+        "forecast_high":      32.8,
+        "forecast_peak_hour": 17,
+        "sunset_hour":        20,
+        "hourly": [(10, 28), (11, 29), (12, 30), (13, 31), (14, 32),
+                    (15, 32.5), (16, 32.8), (17, 32.8), (18, 32), (19, 30.5)],
+    }
+    pred = predict_bins(event, obs, forecast, {}, current_hour=17, city="Houston")
+
+    # Find the 90-91°F bin in the result
+    bin_90 = next(b for b in pred["bins"] if b["range_low"] == 90)
+    bin_92 = next(b for b in pred["bins"] if b["range_low"] == 92)
+
+    print(f"\n  Houston test result:")
+    print(f"    cooling_confidence: {pred['cooling_confidence']:.3f}")
+    print(f"    bin_locked: {pred['bin_locked']}")
+    print(f"    mu: {pred['mu']}, sigma: {pred['sigma']}")
+    print(f"    90-91°F our_p: {bin_90['our_prob']:.3f}  (was wrong as 0.04)")
+    print(f"    92-93°F our_p: {bin_92['our_prob']:.3f}  (was wrong as 0.74)")
+
+    assert pred["bin_locked"], (
+        f"Houston scenario should bin-lock (cooling_conf={pred['cooling_confidence']})"
+    )
+    assert bin_90["our_prob"] > bin_92["our_prob"], (
+        f"90-91°F ({bin_90['our_prob']:.3f}) should be top-P, not "
+        f"92-93°F ({bin_92['our_prob']:.3f})"
+    )
+    assert bin_90["our_prob"] > 0.7, (
+        f"With bin-lock, 90-91°F should be very confident "
+        f"(got {bin_90['our_prob']:.3f})"
+    )
 
 
 # ---------------------------------------------------------------------------

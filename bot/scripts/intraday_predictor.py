@@ -509,12 +509,156 @@ def compute_neighbor_signal(city: str, today_str: str,
 # Predictor — combines all sources into bin probabilities
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Cooling-phase detection — combines 3 independent signals to determine
+# whether today's daily high has already been observed.
+# ---------------------------------------------------------------------------
+
+# Confidence threshold above which we engage "bin-lock" (mu locked to
+# the bin containing observed_max, sigma very narrow).
+STRONG_COOLING_THRESHOLD = float(os.getenv("PREDICTOR_STRONG_COOLING_THRESHOLD", "0.7"))
+
+
+def _cooling_via_obs_trajectory(obs_list: list[dict],
+                                  observed_max: float,
+                                  observed_peak_hour: int | None,
+                                  current_hour: int) -> tuple[float, str]:
+    """How many obs AFTER the observed peak have shown cooling?
+    N-rule: need 2 cooling obs before 3pm local, 1 after.
+    Returns (confidence ∈ [0,1], reasoning).
+    """
+    if observed_peak_hour is None or observed_peak_hour < 0:
+        return 0.0, "no_obs_peak"
+    obs_after_peak = [r for r in obs_list
+                       if r["hour_local"] > observed_peak_hour]
+    if not obs_after_peak:
+        return 0.0, "no_obs_after_peak"
+    # Cooling threshold: at least 0.3°C below peak (filters out noise)
+    cooling_obs = [r for r in obs_after_peak
+                    if r["temp_c"] < observed_max - 0.3]
+    n_required = 2 if current_hour < 15 else 1
+    if len(cooling_obs) < n_required:
+        return 0.0, (f"need_{n_required}_cooling_obs_have_{len(cooling_obs)}")
+    # Cap at 1.0; extra cooling obs don't add more confidence
+    confidence = min(1.0, len(cooling_obs) / max(n_required, 1))
+    return confidence, f"{len(cooling_obs)}_cooling_obs_after_peak"
+
+
+def _cooling_via_forecast_tracking(obs_list: list[dict],
+                                     forecast_hourly: list[tuple[int, float]],
+                                     current_hour: int) -> tuple[float, str]:
+    """Compare today's obs to NWS forecast trajectory.
+    If obs are tracking the forecast AND forecast predicts cooling
+    in the next 3hrs, we're in a high-confidence cooling phase.
+    Returns (confidence ∈ [0,1], reasoning).
+    """
+    if not forecast_hourly or not obs_list:
+        return 0.0, "no_forecast_or_obs"
+    obs_by_hour = {r["hour_local"]: r["temp_c"] for r in obs_list}
+    fcst_by_hour = dict(forecast_hourly)
+    matched = [(h, obs_by_hour[h], fcst_by_hour[h])
+                for h in obs_by_hour
+                if h in fcst_by_hour and h <= current_hour]
+    if len(matched) < 3:
+        return 0.0, "insufficient_overlap"
+    residuals = [obs - fcst for _, obs, fcst in matched]
+    residual_std = (
+        math.sqrt(sum((r - sum(residuals)/len(residuals))**2 for r in residuals)
+                   / (len(residuals) - 1))
+        if len(residuals) > 1 else 0.0
+    )
+    # Tracking quality: 1.0 means perfect, drops to 0 as residual_std → 2°C
+    tracking_quality = max(0.0, 1.0 - residual_std / 2.0)
+    # Look ahead 3 hours in forecast
+    future = sorted([(h, t) for h, t in forecast_hourly
+                      if h > current_hour])[:3]
+    if not future:
+        return 0.0, "no_forecast_ahead"
+    current_temp = obs_by_hour.get(current_hour) or matched[-1][1]
+    cooling_rate = current_temp - future[-1][1]    # positive = cooling
+    if cooling_rate < 0.5:                          # < 0.5°C drop in 3hr
+        return 0.0, "forecast_not_cooling"
+    confidence = tracking_quality * min(1.0, cooling_rate / 2.0)
+    return confidence, (f"fcst_cooling_{cooling_rate:+.1f}C_in_3h "
+                        f"tracking_std_{residual_std:.2f}C")
+
+
+def _cooling_via_derivative(obs_list: list[dict],
+                              current_hour: int) -> tuple[float, str]:
+    """Fit quadratic to last 5 hourly obs, check derivative at current hour.
+    Catches cooling when forecast is wrong but obs clearly show it.
+    Returns (confidence ∈ [0,1], reasoning).
+    """
+    recent = sorted(obs_list, key=lambda r: r["hour_local"])[-5:]
+    if len(recent) < 4:
+        return 0.0, "insufficient_obs_for_fit"
+    hours = [r["hour_local"] for r in recent]
+    temps = [r["temp_c"] for r in recent]
+    # Simple linear regression — robust enough for 4-5 obs.  Slope = derivative.
+    n = len(hours)
+    mean_h = sum(hours) / n
+    mean_t = sum(temps) / n
+    num = sum((h - mean_h) * (t - mean_t) for h, t in zip(hours, temps))
+    den = sum((h - mean_h) ** 2 for h in hours)
+    if den < 1e-9:
+        return 0.0, "no_hour_variance"
+    slope = num / den    # °C per hour
+    if slope >= -0.2:    # not cooling fast enough to confirm
+        return 0.0, f"slope_{slope:+.2f}C/hr_not_cooling"
+    # Map slope to confidence: -0.2 → 0, -1.0 → 1.0
+    confidence = min(1.0, abs(slope + 0.2) / 0.8)
+    return confidence, f"slope_{slope:+.2f}C/hr"
+
+
+def detect_cooling(obs_list: list[dict],
+                    forecast_hourly: list[tuple[int, float]],
+                    observed_max: float,
+                    observed_peak_hour: int | None,
+                    current_hour: int) -> tuple[float, str]:
+    """Combined cooling-phase confidence ∈ [0,1].
+
+    Weighted average of three independent signals:
+      - obs_trajectory (weight 0.5): cooling obs after peak, N-rule gated
+      - forecast_tracking (weight 0.3): NWS forecast predicts cooling AND
+        today's obs are tracking the forecast closely
+      - derivative (weight 0.2): linear fit to recent obs has negative slope
+
+    Confidence ≥ STRONG_COOLING_THRESHOLD (default 0.7) → engage bin-lock
+    in predict_bins.
+    """
+    obs_c, obs_r = _cooling_via_obs_trajectory(
+        obs_list, observed_max, observed_peak_hour, current_hour)
+    fcst_c, fcst_r = _cooling_via_forecast_tracking(
+        obs_list, forecast_hourly, current_hour)
+    deriv_c, deriv_r = _cooling_via_derivative(obs_list, current_hour)
+    weights = {"obs": 0.5, "fcst": 0.3, "deriv": 0.2}
+    confidence = (weights["obs"]   * obs_c
+                + weights["fcst"]  * fcst_c
+                + weights["deriv"] * deriv_c)
+    reason = f"obs={obs_c:.2f}({obs_r}) fcst={fcst_c:.2f}({fcst_r}) deriv={deriv_c:.2f}({deriv_r})"
+    return confidence, reason
+
+
+def find_bin_containing_temp(temp_c: float, bins: list[dict]) -> dict | None:
+    """Return the bin (from a list of Polymarket bin dicts) whose Celsius
+    range contains temp_c.  Used by bin-lock when cooling is confirmed."""
+    for b in bins:
+        lo, hi = bin_temp_range(b)
+        if lo is not None and temp_c < lo:
+            continue
+        if hi is not None and temp_c >= hi:
+            continue
+        return b
+    return None
+
+
 def estimate_day_high_dist(forecast_high: float, forecast_peak_hour: int,
                             observed_max: float, observed_peak_hour: int,
                             current_hour: int, sunset_hour: int,
                             neighbor_signal: dict,
                             base_sigma_c: float | None = None,
-                            ensemble_stats: dict | None = None
+                            ensemble_stats: dict | None = None,
+                            cooling_confidence: float = 0.0,
                             ) -> tuple[float, float]:
     """Returns (mu, sigma) of the day-high distribution after all adjustments.
 
@@ -526,6 +670,13 @@ def estimate_day_high_dist(forecast_high: float, forecast_peak_hour: int,
       * Inflates sigma if neighbor forecasts disagree (high std)
       * Blends mu toward ensemble median if settlement is an outlier
     None = ensemble disabled (legacy single-station behavior).
+
+    cooling_confidence: ∈ [0,1] from detect_cooling().  When non-zero,
+    reduces the FIX 1a "+0.3°C buffer" proportionally — at cooling=1.0
+    the buffer disappears and mu locks exactly at observed_max.  Also
+    narrows sigma proportionally on top of all other narrowing branches.
+    Bin-lock (mu = bin_center) is applied separately in predict_bins
+    when cooling_confidence >= STRONG_COOLING_THRESHOLD.
     """
     mu = forecast_high
     sigma = base_sigma_c if base_sigma_c is not None else DEFAULT_FORECAST_SIGMA_C
@@ -544,11 +695,28 @@ def estimate_day_high_dist(forecast_high: float, forecast_peak_hour: int,
             blend = min(0.5, (abs(divergence) - 1.5) / 5.0 + 0.2)
             mu = (1 - blend) * mu + blend * median
 
-    # FIX 1a: Observed already exceeded forecast — pull mu up to at least
-    # observed (+0.3°C buffer for further climb).
+    # FIX 1a: Observed already exceeded forecast.  Pull mu up to at
+    # least observed, plus a buffer that:
+    #   - tapers as we approach/pass forecast_peak_hour (Proposal B)
+    #   - shrinks proportionally with cooling_confidence (Proposal A)
+    #
+    # The legacy +0.3°C buffer was time-blind and caused the Houston bug:
+    # at 5pm with the day cooling, +0.3°C inflated mu just above a bin
+    # boundary, spilling probability into the wrong bin.
     if observed_max > -50 and observed_max > forecast_high:
         excess = observed_max - forecast_high
-        mu = observed_max + 0.3
+        # Tapered base buffer
+        hours_to_peak = forecast_peak_hour - current_hour
+        if hours_to_peak <= 0:
+            # Past forecast peak: small residual floor at 0.1°C, taper
+            # linearly with each hour past peak.
+            base_buffer = max(0.1, 0.3 + hours_to_peak * 0.1)
+        else:
+            base_buffer = 0.3
+        # Cooling-confidence override: at high cooling confidence, the
+        # buffer disappears entirely (mu = observed_max).
+        effective_buffer = base_buffer * (1.0 - cooling_confidence)
+        mu = observed_max + effective_buffer
         sigma = min(sigma_ceiling, max(1.0, sigma - 0.3 + excess * 0.2))
 
     # Narrow uncertainty as we pass the forecast peak hour
@@ -625,6 +793,15 @@ def estimate_day_high_dist(forecast_high: float, forecast_peak_hour: int,
         if std > 0.5:
             inflation = max(1.0, 1.0 + (std - 0.5) * 0.6)
             sigma = min(sigma * inflation, sigma_ceiling * 3.0)
+
+    # COOLING confidence sigma narrowing.  When cooling is confidently
+    # detected, the day's remaining uncertainty collapses — the high is
+    # essentially the observed peak.  Narrows sigma proportionally on
+    # top of any other narrowing.  Capped at 50% reduction so we don't
+    # double-narrow with the post-peak branches.
+    if cooling_confidence > 0:
+        extra_narrow = 1.0 - cooling_confidence * 0.5
+        sigma *= extra_narrow
 
     sigma = max(0.3, sigma)
     return mu, sigma
@@ -705,6 +882,18 @@ def predict_bins(event: dict, settlement_obs: list[dict],
     bias_c = get_station_bias(settlement_station) if settlement_station else 0.0
     bias_corrected_forecast = forecast["forecast_high"] - bias_c
 
+    # COOLING DETECTION — combine 3 independent signals to decide if the
+    # day's high has already been observed and we're cooling.  Drives
+    # both mu/sigma adjustments (inside estimate_day_high_dist) and the
+    # bin-lock override below.
+    cooling_confidence, cooling_reason = detect_cooling(
+        obs_list           = settlement_obs,
+        forecast_hourly    = forecast.get("hourly") or [],
+        observed_max       = observed_max_c if observed_max_c > -100 else bias_corrected_forecast,
+        observed_peak_hour = observed_peak_hour if observed_peak_hour >= 0 else None,
+        current_hour       = current_hour,
+    )
+
     mu, sigma = estimate_day_high_dist(
         forecast_high       = bias_corrected_forecast,
         forecast_peak_hour  = forecast["forecast_peak_hour"],
@@ -715,9 +904,36 @@ def predict_bins(event: dict, settlement_obs: list[dict],
         neighbor_signal     = neighbor_signal,
         base_sigma_c        = base_sigma,
         ensemble_stats      = ensemble_stats,
+        cooling_confidence  = cooling_confidence,
     )
 
     truncate_at = observed_max_c if observed_max_c > -100 else -100.0
+
+    # BIN-LOCK: when cooling is STRONGLY confirmed, the day's high is
+    # essentially the observed peak.  Override the truncated-normal
+    # mu/sigma with the bin geometry containing observed_max.  This
+    # bypasses the boundary-effect bug where mu sits right at a bin
+    # edge and probability spills into the next bin up.
+    bin_locked = False
+    if (cooling_confidence >= STRONG_COOLING_THRESHOLD
+        and observed_max_c > -100):
+        obs_bin = find_bin_containing_temp(observed_max_c, bins)
+        if obs_bin is not None:
+            bin_lo_c, bin_hi_c = bin_temp_range(obs_bin)
+            # For open-ended bins (≤X or ≥X), can't compute a clean
+            # center — fall back to non-bin-lock behavior.
+            if bin_lo_c is not None and bin_hi_c is not None:
+                mu = (bin_lo_c + bin_hi_c) / 2          # bin center
+                sigma = max(0.15, (bin_hi_c - bin_lo_c) / 6)  # 3σ each side
+                # Relax truncation by 0.1°C to admit measurement uncertainty
+                # in the observation (NWS reports in 0.1°C precision).
+                truncate_at = bin_lo_c - 0.1
+                bin_locked = True
+                log.debug(
+                    f"BIN-LOCK ({cooling_reason}): obs_bin={obs_bin.get('range_low')}"
+                    f"-{obs_bin.get('range_high')}{obs_bin.get('unit')} "
+                    f"mu={mu:.2f}C sigma={sigma:.2f}C trunc={truncate_at:.2f}C"
+                )
 
     bin_results = []
     for b in bins:
@@ -743,6 +959,9 @@ def predict_bins(event: dict, settlement_obs: list[dict],
         "bins":               bin_results,
         "mu":                 round(mu, 2),
         "sigma":              round(sigma, 2),
+        "cooling_confidence": round(cooling_confidence, 3),
+        "cooling_reason":     cooling_reason,
+        "bin_locked":         bin_locked,
         "observed_max_c":     round(observed_max_c, 2) if observed_max_c > -100 else None,
         "observed_peak_hour": observed_peak_hour if observed_peak_hour >= 0 else None,
         "forecast_high":      round(forecast["forecast_high"], 2),

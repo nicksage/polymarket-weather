@@ -114,6 +114,12 @@ KELLY_FRACTION       = float(os.getenv("PREDICTOR_KELLY_FRAC",   "0.25"))
 MAX_PCT_PER_TRADE    = float(os.getenv("PREDICTOR_MAX_PCT",      "0.05"))
 MIN_STAKE_USD        = float(os.getenv("PREDICTOR_MIN_STAKE",    "2.00"))
 SCAN_INTERVAL_MIN    = int  (os.getenv("PREDICTOR_SCAN_MIN",     "15"))
+# Topup logic — when actual filled position is below target stake, top up.
+# TOPUP_TOLERANCE_PCT: position is "at target" when filled >= target * (1 - tol).
+#   Default 0.05 = stop topping up when within 5% of target.
+# TOPUP_MIN_USD: don't bother attempting topup orders smaller than this.
+TOPUP_TOLERANCE_PCT  = float(os.getenv("PREDICTOR_TOPUP_TOLERANCE_PCT", "0.05"))
+TOPUP_MIN_USD        = float(os.getenv("PREDICTOR_TOPUP_MIN_USD",       "1.50"))
 # Weather cache TTL — NWS forecast + observation calls cached for this
 # many seconds.  Polymarket prices are always refreshed every scan; only
 # weather data is cached.  Default: 300s (5 min).  Combined with
@@ -317,25 +323,108 @@ def event_has_buy_today(conn, event_id: str, mode: str) -> bool:
 
 
 def event_buys_today_count(conn, event_id: str, mode: str) -> int:
-    """Number of bins bought for THIS EVENT in this mode, for the
-    event's entire lifetime.  Used by the MAX_BINS_PER_EVENT cap.
+    """Number of DISTINCT bins bought for this event in this mode.
+    Used by MAX_BINS_PER_EVENT cap.
 
-    IMPORTANT: we do NOT filter by scan UTC date.  Each Polymarket
-    event has a unique event_id and resolves on exactly one day, so
-    "buys for this event" is well-defined without a date filter.  An
-    earlier version filtered by substr(scanned_at_utc) = today_utc,
-    which meant the counter reset at UTC midnight — so a scan running
-    at 00:00:01 UTC on day N+1 saw "0 buys" for an event that hadn't
-    yet resolved in the city's local timezone, and fired a second buy.
+    Counts DISTINCT contract_ids so that topup orders (multiple BUY
+    rows for the same contract_id) don't inflate the count.  Each
+    distinct (event, contract) pair = one bin bought, regardless of
+    how many orders it took to fill.
     """
     row = conn.execute(
         """
-        SELECT COUNT(*) FROM paper_predictor_signals
+        SELECT COUNT(DISTINCT contract_id) FROM paper_predictor_signals
         WHERE event_id = ? AND action = ?
         """,
         (event_id, _action_for_mode(mode)),
     ).fetchone()
     return int(row[0]) if row else 0
+
+
+# ---------------------------------------------------------------------------
+# Polymarket positions API — used for actual-deployed lookup + topup logic
+# ---------------------------------------------------------------------------
+
+POLYMARKET_DATA_API = "https://data-api.polymarket.com"
+
+
+def _get_proxy_address() -> str | None:
+    """Find the wallet/proxy address that holds our Polymarket positions."""
+    for var in ("POLYMARKET_FUNDER_ADDRESS", "POLYMARKET_PROXY_ADDRESS",
+                 "POLY_PROXY", "BROWSER_ADDRESS", "PROXY_ADDRESS",
+                 "WALLET_ADDRESS"):
+        v = os.getenv(var)
+        if v and isinstance(v, str) and v.lower().startswith("0x") and len(v) == 42:
+            return v
+    return None
+
+
+def fetch_polymarket_positions_by_token() -> dict[str, dict]:
+    """Returns {token_id: {size, avg_price, deployed_usdc, cur_price, cash_pnl}}.
+
+    Used in the scan loop to determine actual deployed capital per
+    contract — driving topup decisions and dedup checks (live mode).
+    Empty dict on failure: callers fall back to DB-derived stake sums.
+    """
+    addr = _get_proxy_address()
+    if not addr:
+        log.debug("no proxy address in env — skipping live position fetch")
+        return {}
+    try:
+        import urllib.request, urllib.parse
+        params = {"user": addr, "sizeThreshold": "0.01",
+                   "limit": "500", "sortBy": "CURRENT"}
+        url = f"{POLYMARKET_DATA_API}/positions?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url,
+                                       headers={"User-Agent": "polymarket-weather/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.load(resp)
+        out: dict[str, dict] = {}
+        for p in data:
+            token = p.get("asset") or p.get("token_id") or p.get("tokenId")
+            if not token:
+                continue
+            size = float(p.get("size") or 0)
+            avg  = float(p.get("avgPrice") or p.get("avg_price") or 0)
+            if size <= 0 or avg <= 0:
+                continue
+            out[str(token)] = {
+                "size":          size,
+                "avg_price":     avg,
+                "deployed_usdc": size * avg,
+                "cur_price":     float(p.get("curPrice") or p.get("cur_price") or 0),
+                "cash_pnl":      float(p.get("cashPnl") or p.get("cash_pnl") or 0),
+            }
+        log.info(f"Polymarket positions: {len(out)} live positions fetched")
+        return out
+    except Exception as e:
+        log.warning(f"Polymarket positions API failed: {e} — topup falls back to DB")
+        return {}
+
+
+def get_actual_deployed_usd(conn, event_id: str, contract_id: str,
+                              yes_token_id: str | None, mode: str,
+                              live_positions: dict[str, dict]) -> float:
+    """Returns actual $ deployed for THIS contract in this mode.
+
+    For LIVE: uses Polymarket API actual size × avgPrice if available;
+    falls back to DB sum (last resort).
+    For PAPER: sums recommended_stake_usd across all BUY rows for this
+    contract (paper always fills full, so sum = total deployed).
+    """
+    if mode == "live" and yes_token_id and live_positions:
+        pos = live_positions.get(str(yes_token_id))
+        if pos:
+            return pos["deployed_usdc"]
+    # Fallback — sum from DB
+    action = _action_for_mode(mode)
+    row = conn.execute(
+        """SELECT COALESCE(SUM(recommended_stake_usd), 0)
+           FROM paper_predictor_signals
+           WHERE event_id = ? AND contract_id = ? AND action = ?""",
+        (event_id, contract_id, action),
+    ).fetchone()
+    return float(row[0]) if row else 0.0
 
 
 def deployed_today_usd(conn, mode: str) -> float:
@@ -528,6 +617,13 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
         log.error(f"event discovery failed: {e}")
         return {"error": str(e), "scanned_at_utc": scan_start.isoformat()}
 
+    # Fetch live positions ONCE per scan — used for topup decisions and
+    # accurate dedup (a "live BUY" that only partially filled is NOT
+    # truly bought yet; we should keep topping up until at target).
+    live_positions = (
+        fetch_polymarket_positions_by_token() if PREDICTOR_MODE == "live" else {}
+    )
+
     # City-name normalization: Polymarket's parser title-cases city tokens
     # ("nyc" → "Nyc"), but acronyms in our CITY_STATIONS stay uppercase
     # ("NYC").  Build a case-insensitive lookup from us_cities so we can
@@ -659,21 +755,46 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                 if not pred.get("bins"):
                     continue
 
-                # Rank bins by OUR PROBABILITY descending.  The top
-                # MAX_BINS_PER_EVENT are eligible candidates IF the event
-                # still has buy slots available; otherwise ALL bins are
-                # non_candidates and get SKIP rows (preserves fresh
-                # market_prob for the dashboard).
+                # Identify contracts we've already bought (any amount) for
+                # this event.  Used to allow topup orders to existing
+                # partially-filled positions without counting them as new
+                # bins against MAX_BINS_PER_EVENT.
+                _action_str = _action_for_mode(PREDICTOR_MODE)
+                already_bought_contracts = {r[0] for r in conn.execute(
+                    """SELECT DISTINCT contract_id FROM paper_predictor_signals
+                       WHERE event_id = ? AND action = ?""",
+                    (event_id, _action_str)).fetchall()}
+
+                # Rank bins by OUR PROBABILITY descending.  Two kinds of
+                # candidates:
+                #   1. FRESH-BUY candidates: top P-rank bins NOT already
+                #      bought.  Limited to slots_remaining (cap-bound).
+                #   2. TOPUP candidates: bins ALREADY bought that may still
+                #      have headroom below the target stake.  Not cap-bound
+                #      because topping up an existing bin doesn't add a new
+                #      bin to the event.
                 bins_by_p = sorted(pred["bins"], key=lambda x: -x["our_prob"])
+
+                fresh_bins = [b for b in bins_by_p
+                               if b["contract_id"] not in already_bought_contracts]
+                topup_bins = [b for b in bins_by_p
+                               if b["contract_id"] in already_bought_contracts]
+
                 if event_at_cap:
-                    top_candidates  = []                # no new buys allowed
-                    non_candidates  = bins_by_p
+                    fresh_candidates = []     # no new bins allowed at cap
                     non_candidate_reason = "event_at_cap_today"
                 else:
                     slots_remaining = MAX_BINS_PER_EVENT - buys_already
-                    top_candidates  = bins_by_p[:slots_remaining]
-                    non_candidates  = bins_by_p[slots_remaining:]
+                    fresh_candidates = fresh_bins[:slots_remaining]
                     non_candidate_reason = "not_top_p_in_event"
+
+                top_candidates = fresh_candidates + topup_bins
+                # Bins not even considered for a fresh buy AND not already
+                # bought → these are the SKIP rows for visibility.
+                non_candidates = [b for b in bins_by_p if b not in top_candidates]
+                # Track which candidates are topups so we don't double-count
+                # them against the per-event cap.
+                _topup_contract_ids = {b["contract_id"] for b in topup_bins}
 
                 # Track whether the event was aborted (top-P bin failed
                 # gates).  Any remaining top-candidates that haven't been
@@ -689,13 +810,34 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                     liquidity  = b["liquidity_usd"]
                     contract_id  = b["contract_id"]
                     yes_token_id = b["yes_token_id"]
+                    is_topup     = contract_id in _topup_contract_ids
+
+                    # Compute target stake + remaining-to-target for topup support.
+                    target_stake = compute_stake(edge, market_p, PAPER_BANKROLL_USD)
+                    actual_deployed = get_actual_deployed_usd(
+                        conn, event_id, contract_id, yes_token_id,
+                        PREDICTOR_MODE, live_positions,
+                    )
+                    remaining_to_target = max(0.0, target_stake - actual_deployed)
+                    # "At target" if within TOPUP_TOLERANCE_PCT OR remaining
+                    # is below TOPUP_MIN_USD (not worth a tiny order).
+                    at_target_threshold = max(
+                        TOPUP_MIN_USD,
+                        target_stake * TOPUP_TOLERANCE_PCT,
+                    )
+                    at_target = remaining_to_target < at_target_threshold
 
                     if event_aborted:
                         ok = False
                         reason = "event_aborted (higher-P bin failed gates)"
+                    elif at_target:
+                        ok = False
+                        reason = (f"at_target (deployed=${actual_deployed:.2f} "
+                                  f"/ target=${target_stake:.2f})")
                     else:
-                        acted = already_acted_today(conn, event_id, contract_id,
-                                                      PREDICTOR_MODE)
+                        # Note: already_acted is now False because we handle
+                        # the "fully filled" case via at_target above.  Topups
+                        # to a partially-filled bin should pass the dedup gate.
                         ok, reason = evaluate_gates(
                             current_hour    = now_local.hour,
                             edge            = edge,
@@ -703,19 +845,26 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                             liquidity       = liquidity,
                             deployed_today  = deployed,
                             trades_today    = n_trades,
-                            already_acted   = acted,
+                            already_acted   = False,
                         )
-                        # NEW: enforce per-scan cap (covers race within scan)
-                        if ok and events_bought_this_scan.get(event_id, 0) >= MAX_BINS_PER_EVENT - buys_already:
+                        # Per-scan cap — only counts FRESH buys (topups don't
+                        # add new bins to the event)
+                        if (ok and not is_topup
+                            and events_bought_this_scan.get(event_id, 0)
+                                 >= MAX_BINS_PER_EVENT - buys_already):
                             ok = False
                             reason = "event_cap_reached_this_scan"
-                        # NEW: if top-P (rank 0) bin fails gates, abort
-                        # the rest of this event per the strict rule.
-                        if not ok and rank_idx == 0:
+                        # Strict abort: if rank-0 fresh-buy candidate fails
+                        # gates, abort the event.  Topup failures don't abort
+                        # (the position was decided in an earlier scan; failing
+                        # now just means we stop topping up).
+                        if not ok and rank_idx == 0 and not is_topup:
                             event_aborted = True
 
                     if ok:
-                        stake = compute_stake(edge, market_p, PAPER_BANKROLL_USD)
+                        # Stake for THIS order = remaining_to_target.
+                        # Initial buy: == target.  Topup: == what's left to fill.
+                        stake = remaining_to_target
                         if stake < MIN_STAKE_USD:
                             ok = False
                             reason = f"stake_too_small (${stake:.2f} < ${MIN_STAKE_USD:.2f})"
@@ -727,8 +876,15 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                         deployed  += stake
                         limit_px   = marketable_limit(market_p)
                         gate_blocked_by = None
-                        events_bought_this_scan[event_id] = (
-                            events_bought_this_scan.get(event_id, 0) + 1
+                        # Only count FRESH buys toward the per-scan cap
+                        if not is_topup:
+                            events_bought_this_scan[event_id] = (
+                                events_bought_this_scan.get(event_id, 0) + 1
+                            )
+                        log.info(
+                            f"  {'TOPUP' if is_topup else 'BUY'}: {city} {b['label']} "
+                            f"${stake:.2f} (target=${target_stake:.2f}, "
+                            f"already=${actual_deployed:.2f})"
                         )
                     else:
                         action = "AVOID" if edge <= -0.20 else "SKIP"
