@@ -1189,19 +1189,16 @@ $("mode-live").addEventListener("click",  () => setMode("live"));
 $("mode-both").addEventListener("click",  () => setMode("both"));
 
 // ===== Restore persisted UI state on page load =====
-// Mode + view buttons start with HTML-baked "paper" / "signals" active
-// classes, so if the user previously chose a different option we need
-// to update the button states (and re-render with the right filter).
-// The values themselves were already loaded into MODE_FILTER/VIEW_MODE
-// at the top of the script; here we just flip the UI to match.
+// ALWAYS call setMode/setView to force button states to match the
+// persisted MODE_FILTER/VIEW_MODE values.  Calling unconditionally
+// (rather than only when != default) is bulletproof:
+//   - if persisted = "paper", setMode("paper") is a no-op visually
+//   - if persisted = "both", setMode("both") flips the visual state
+//   - if HTML hard-coded the wrong default, this still fixes it
+// Each call also triggers a renderAll(), so the data filters update.
 function restorePersistedUI() {{
-  // Mode toggle
-  if (MODE_FILTER !== "paper") setMode(MODE_FILTER);
-  else {{
-    // Even if "paper", ensure ONLY paper is highlighted (HTML default OK)
-  }}
-  // View toggle
-  if (VIEW_MODE !== "signals") setView(VIEW_MODE);
+  setMode(MODE_FILTER);
+  setView(VIEW_MODE);
   // Filter inputs — restore from STATE, but only those that exist in the
   // current data (selects may have different options than last session).
   const restoreInput = (id, key) => {{
@@ -1281,6 +1278,10 @@ async function silentRefresh() {{
     if (newLivePos !== null)    LIVE_POSITIONS = newLivePos;
     recomputeDerived();
     renderAll();
+    // Re-assert button states after render — defensive against any
+    // accidental DOM reset during the silent refresh cycle.
+    setMode(MODE_FILTER);
+    setView(VIEW_MODE);
     // Update generated-at timestamp in header if present
     const tsMatch = text.match(/generated ([0-9-]+ [0-9:]+ UTC)/);
     if (tsMatch) {{
