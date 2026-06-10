@@ -96,6 +96,13 @@ MIN_EDGE             = float(os.getenv("PREDICTOR_MIN_EDGE",     "0.10"))
 # so the stricter MIN_EDGE protects you there.
 MIN_EDGE_LOW_MKT     = float(os.getenv("PREDICTOR_MIN_EDGE_LOW_MKT", "0.05"))
 HIGH_MKT_THRESHOLD   = float(os.getenv("PREDICTOR_HIGH_MKT_THRESHOLD", "0.75"))
+# Market-probability floor: refuse to buy any bin whose market_p is below
+# this threshold.  Catches catastrophic model miscalibrations — e.g., the
+# 2026-06-10 Denver bug where the model computed our_p=1.0 for "≤83°F"
+# while the market priced it at mkt_p=0.014.  When market is THAT skeptical,
+# the model is almost certainly wrong (consensus aggregates a lot of info).
+# Default 0.15 = blocks any bin the market deems <15% likely.
+MIN_MARKET_PROB = float(os.getenv("PREDICTOR_MIN_MARKET_PROB", "0.15"))
 MIN_LIQUIDITY_USD    = float(os.getenv("PREDICTOR_MIN_LIQUIDITY", "300"))
 MIN_TRIGGER_HOUR     = int  (os.getenv("PREDICTOR_MIN_HOUR",     "13"))
 MAX_TRIGGER_HOUR     = int  (os.getenv("PREDICTOR_MAX_HOUR",     "22"))
@@ -240,6 +247,14 @@ def evaluate_gates(*, current_hour: int, edge: float, market_p: float,
         return False, f"too_early (hour={current_hour} < {MIN_TRIGGER_HOUR})"
     if current_hour > MAX_TRIGGER_HOUR:
         return False, f"too_late (hour={current_hour} > {MAX_TRIGGER_HOUR})"
+    # Market sanity floor — bin must have at least MIN_MARKET_PROB market
+    # confidence.  Catches catastrophic model errors: if market thinks a
+    # bin has <15% chance, our model claiming 100% is almost certainly
+    # a bug, not edge.  Runs BEFORE edge calc so we don't burn cycles on
+    # garbage signals.
+    if market_p < MIN_MARKET_PROB:
+        return False, (f"market_too_skeptical (mkt={market_p:.3f} < "
+                       f"{MIN_MARKET_PROB:.2f})")
     # Tiered edge gate: stricter when market_p is "expensive" (>= 0.75),
     # looser when cheap (<0.75).  The original MIN_EDGE=0.10 was designed
     # to filter out high-priced bins where we'd lose the full stake on the
@@ -496,6 +511,11 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
 
     ensure_schema()
     _load_calibration()
+    try:
+        from scripts.intraday_predictor import _load_station_bias
+        _load_station_bias()
+    except Exception as e:
+        log.warning(f"station bias load failed: {e}")
 
     us_cities = list(US_CITY_STATES.keys()) if US_CITY_STATES else [
         c for c, m in CITY_STATIONS.items() if m[0].startswith("K")
@@ -569,10 +589,11 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
             cache_age = (now_epoch - cached[0]) if cached else None
             if cached and cache_age < WEATHER_CACHE_SEC:
                 w = cached[1]
-                nws_obs     = w["nws_obs"]
-                forecast    = w["forecast"]
-                wind_octant = w["wind_octant"]
-                nbr_signal  = w["nbr_signal"]
+                nws_obs        = w["nws_obs"]
+                forecast       = w["forecast"]
+                wind_octant    = w["wind_octant"]
+                nbr_signal     = w["nbr_signal"]
+                ensemble_stats = w.get("ensemble_stats")
                 log.debug(f"weather cache HIT for {city} (age={cache_age:.0f}s)")
             else:
                 nws_obs = fetch_nws_today_obs(icao, tz_str)
@@ -589,11 +610,29 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                 wind_mean = vector_mean_dir(afternoon_winds)
                 wind_octant = deg_to_cardinal(wind_mean) if wind_mean is not None else None
                 nbr_signal = compute_neighbor_signal(city, today_str_local, wind_octant)
+                # Ensemble forecast from neighbor ASOS stations.  Multi-
+                # station consensus catches local NWS gridpoint biases +
+                # gives us empirical uncertainty for sigma inflation.
+                try:
+                    from scripts.ensemble_forecast import compute_ensemble_stats
+                    ensemble_stats = compute_ensemble_stats(city, forecast, tz_str)
+                    if ensemble_stats.get("settlement_is_outlier"):
+                        log.info(
+                            f"  {city}: settlement forecast is OUTLIER "
+                            f"(divergence={ensemble_stats['divergence_c']:+.2f}°C vs "
+                            f"{ensemble_stats['n_stations_used']}-station ensemble "
+                            f"median={ensemble_stats['ensemble_median']:.2f}°C, "
+                            f"std={ensemble_stats['ensemble_std']:.2f}°C)"
+                        )
+                except Exception as e:
+                    log.warning(f"ensemble fetch failed for {city}: {e}")
+                    ensemble_stats = None
                 _WEATHER_CACHE[city] = (now_epoch, {
-                    "nws_obs":     nws_obs,
-                    "forecast":    forecast,
-                    "wind_octant": wind_octant,
-                    "nbr_signal":  nbr_signal,
+                    "nws_obs":        nws_obs,
+                    "forecast":       forecast,
+                    "wind_octant":    wind_octant,
+                    "nbr_signal":     nbr_signal,
+                    "ensemble_stats": ensemble_stats,
                 })
                 log.debug(f"weather cache REFRESH for {city}")
 
@@ -615,7 +654,8 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                     n_events_skipped_already_bought += 1   # for the summary
 
                 pred = predict_bins(ev, nws_obs, forecast, nbr_signal,
-                                     now_local.hour, city=city)
+                                     now_local.hour, city=city,
+                                     ensemble_stats=ensemble_stats)
                 if not pred.get("bins"):
                     continue
 

@@ -89,6 +89,13 @@ DEFAULT_FORECAST_SIGMA_C = float(os.getenv("PREDICTOR_DEFAULT_SIGMA_C", "2.0"))
 CALIBRATION_PATH = os.path.join(_BOT_DIR, "data", "forecast_calibration.json")
 _CALIBRATION: dict = {}
 
+# Per-station systematic forecast bias.  Produced by
+# scripts.station_bias_calibration from historical forecast-vs-observed
+# comparisons.  Applied as: corrected_mu = forecast - bias.  Positive
+# bias = station's forecast runs HOT (we subtract); negative = cold.
+STATION_BIAS_PATH = os.path.join(_BOT_DIR, "data", "station_bias.json")
+_STATION_BIAS: dict = {}
+
 
 def _load_calibration() -> None:
     """Loaded once at script start.  Re-run scripts.forecast_rmse_calibration
@@ -120,6 +127,34 @@ def get_city_sigma(city: str) -> float:
     if s is None or s <= 0:
         return DEFAULT_FORECAST_SIGMA_C
     return float(s)
+
+
+def _load_station_bias() -> None:
+    """Loaded once at script start.  Refresh via station_bias_calibration."""
+    global _STATION_BIAS
+    if not os.path.exists(STATION_BIAS_PATH):
+        log.info(f"No station bias file at {STATION_BIAS_PATH} — "
+                  "forecasts used as-is (no per-station bias correction). "
+                  "Run scripts.station_bias_calibration to generate.")
+        return
+    try:
+        with open(STATION_BIAS_PATH, encoding="utf-8") as fh:
+            _STATION_BIAS = json.load(fh)
+        n = len(_STATION_BIAS.get("by_station", {}))
+        log.info(f"Loaded per-station bias for {n} stations "
+                  f"(generated {_STATION_BIAS.get('generated_at', '?')[:19]})")
+    except Exception as e:
+        log.warning(f"Failed to load {STATION_BIAS_PATH}: {e}.  No bias correction.")
+        _STATION_BIAS = {}
+
+
+def get_station_bias(station_icao: str) -> float:
+    """Return the per-station forecast bias (°C).  0.0 if no data.
+    Subtract this from the forecast: corrected = forecast - bias."""
+    entry = (_STATION_BIAS.get("by_station") or {}).get(station_icao)
+    if not entry:
+        return 0.0
+    return float(entry.get("mean_bias_c") or 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -478,15 +513,36 @@ def estimate_day_high_dist(forecast_high: float, forecast_peak_hour: int,
                             observed_max: float, observed_peak_hour: int,
                             current_hour: int, sunset_hour: int,
                             neighbor_signal: dict,
-                            base_sigma_c: float | None = None) -> tuple[float, float]:
+                            base_sigma_c: float | None = None,
+                            ensemble_stats: dict | None = None
+                            ) -> tuple[float, float]:
     """Returns (mu, sigma) of the day-high distribution after all adjustments.
 
     base_sigma_c: per-city σ from calibration (RMSE of Open-Meteo vs observed
     over the last ~60 days).  Falls back to DEFAULT_FORECAST_SIGMA_C if None.
+
+    ensemble_stats: optional dict from compute_ensemble_stats() containing
+    multi-station forecast consensus.  When provided:
+      * Inflates sigma if neighbor forecasts disagree (high std)
+      * Blends mu toward ensemble median if settlement is an outlier
+    None = ensemble disabled (legacy single-station behavior).
     """
     mu = forecast_high
     sigma = base_sigma_c if base_sigma_c is not None else DEFAULT_FORECAST_SIGMA_C
     sigma_ceiling = sigma   # for later clamps that reference the prior
+
+    # ENSEMBLE PHASE 2 — mu blending toward neighbor consensus.  Done
+    # BEFORE all the time-of-day adjustments so the obs-based logic
+    # works on the corrected mu.
+    if ensemble_stats and ensemble_stats.get("n_stations_used", 1) >= 3:
+        divergence = ensemble_stats.get("divergence_c", 0.0)
+        if abs(divergence) > 1.5:
+            # Settlement station is an outlier — partial pull toward
+            # ensemble median.  Capped at 50% blend so we never let
+            # neighbors override settlement entirely.
+            median = ensemble_stats["ensemble_median"]
+            blend = min(0.5, (abs(divergence) - 1.5) / 5.0 + 0.2)
+            mu = (1 - blend) * mu + blend * median
 
     # FIX 1a: Observed already exceeded forecast — pull mu up to at least
     # observed (+0.3°C buffer for further climb).
@@ -506,12 +562,29 @@ def estimate_day_high_dist(forecast_high: float, forecast_peak_hour: int,
             blend = min(0.8, hours_past * 0.15)
             mu = (1 - blend) * mu + blend * observed_max
 
-    # NEW: Time-since-OBSERVED-peak narrowing.  Once we've actually seen
-    # the peak and a few hours have passed without it being exceeded, the
+    # Time-since-OBSERVED-peak narrowing.  Once we've actually seen the
+    # peak and a few hours have passed without it being exceeded, the
     # day-high is essentially locked at observed_max.  Empirically (from
     # the temp-drop backtest): hold rate is 84% at 1h past peak, 97% at
     # 2h, 99%+ at 3h+.  We narrow sigma aggressively to reflect this.
-    if observed_max > -50 and observed_peak_hour is not None and observed_peak_hour >= 0:
+    #
+    # BUG FIX (2026-06-10): this branch used to fire ANY time observations
+    # existed, even before the day's forecasted peak.  Result: a 10am
+    # morning reading was treated as "the peak", aggressively pulling
+    # mu toward 80°F when forecast was 87°F at 4pm.  Now gated on
+    # "day has plausibly peaked": either we're past forecast_peak_hour,
+    # or observed_max has actually reached near forecast_high.  If the
+    # day's still warming, the morning observation is a LOWER BOUND
+    # (handled by truncation in predict_bins), not a "peak."
+    day_has_likely_peaked = (
+        current_hour >= forecast_peak_hour            # past forecasted peak
+        or (observed_max > -50
+            and observed_max >= forecast_high - 1.0)  # obs reached forecast
+    )
+    if (observed_max > -50
+        and observed_peak_hour is not None
+        and observed_peak_hour >= 0
+        and day_has_likely_peaked):
         hours_since_obs_peak = current_hour - observed_peak_hour
         if hours_since_obs_peak >= 1:
             # Geometric narrowing: 0.7^h
@@ -536,6 +609,22 @@ def estimate_day_high_dist(forecast_high: float, forecast_peak_hour: int,
         if observed_max > -50:
             blend = 0.2 * strength
             mu = (1 - blend) * mu + blend * observed_max
+
+    # ENSEMBLE PHASE 1 — sigma inflation based on neighbor disagreement.
+    # Done AFTER all narrowing branches: if 5 nearby stations disagree
+    # by ±2°C, our base_sigma_c (which was calibrated for one station's
+    # forecast error) is too tight.  Multiplicative so we don't inflate
+    # away the post-peak narrowing — we just acknowledge the residual
+    # regional uncertainty.
+    #   ensemble_std < 0.5°C: forecasts agree → no inflation
+    #   ensemble_std = 1.0°C: +30%
+    #   ensemble_std = 2.0°C: +100%
+    #   capped at 3x the base
+    if ensemble_stats and ensemble_stats.get("n_stations_used", 1) >= 3:
+        std = ensemble_stats.get("ensemble_std", 0.0)
+        if std > 0.5:
+            inflation = max(1.0, 1.0 + (std - 0.5) * 0.6)
+            sigma = min(sigma * inflation, sigma_ceiling * 3.0)
 
     sigma = max(0.3, sigma)
     return mu, sigma
@@ -583,8 +672,14 @@ def bin_temp_range(bin_dict: dict) -> tuple[float | None, float | None]:
 
 def predict_bins(event: dict, settlement_obs: list[dict],
                   forecast: dict, neighbor_signal: dict,
-                  current_hour: int, city: str | None = None) -> dict:
-    """Per-event bin probability + edge + recommendation."""
+                  current_hour: int, city: str | None = None,
+                  ensemble_stats: dict | None = None) -> dict:
+    """Per-event bin probability + edge + recommendation.
+
+    ensemble_stats: optional output from compute_ensemble_stats() — when
+    provided, the day-high mu/sigma estimation uses multi-station consensus
+    for outlier detection (mu) and uncertainty calibration (sigma).
+    """
     bins = event.get("outcomes") or []
     if not bins or not forecast:
         return {"bins": [], "skipped": "no_data"}
@@ -601,8 +696,17 @@ def predict_bins(event: dict, settlement_obs: list[dict],
         observed_peak_hour = -1
 
     base_sigma = get_city_sigma(city) if city else DEFAULT_FORECAST_SIGMA_C
+
+    # Apply per-station forecast bias correction.  If a station's NWS
+    # forecast historically runs 1.5°C HOT (overpredicts), we subtract
+    # 1.5°C from the input forecast.  Calibrated by
+    # scripts.station_bias_calibration from saved historical data.
+    settlement_station = event.get("settlement_station") or ""
+    bias_c = get_station_bias(settlement_station) if settlement_station else 0.0
+    bias_corrected_forecast = forecast["forecast_high"] - bias_c
+
     mu, sigma = estimate_day_high_dist(
-        forecast_high       = forecast["forecast_high"],
+        forecast_high       = bias_corrected_forecast,
         forecast_peak_hour  = forecast["forecast_peak_hour"],
         observed_max        = observed_max_c if observed_max_c > -100 else forecast["forecast_high"],
         observed_peak_hour  = observed_peak_hour if observed_peak_hour >= 0 else None,
@@ -610,6 +714,7 @@ def predict_bins(event: dict, settlement_obs: list[dict],
         sunset_hour         = forecast["sunset_hour"],
         neighbor_signal     = neighbor_signal,
         base_sigma_c        = base_sigma,
+        ensemble_stats      = ensemble_stats,
     )
 
     truncate_at = observed_max_c if observed_max_c > -100 else -100.0

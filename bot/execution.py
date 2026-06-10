@@ -14,6 +14,7 @@ Live order status values returned by Polymarket CLOB:
 """
 
 import logging
+import os
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -32,12 +33,15 @@ from db import (
 )
 
 
-# Maximum BUY retries per contract within a 6-hour window.  Hardcoded
-# because the right cap is more about "preventing thrash" than something
-# users tune frequently.  At 3 retries × 30-min scan = 1.5h of attempts
-# before we give up, plenty for normal market liquidity to recover.
-_MAX_BUY_RETRIES_PER_6H = 3
-_BUY_RETRY_WINDOW_HOURS = 6
+# Buy-retry cap.  Counts how many cancelled BUYs for the same contract
+# we've burned within the lookback window before refusing to thrash on
+# it any further.  Both env-tunable so live operators can tighten or
+# loosen without a code change.
+# Legacy names retained to avoid breaking imports — the values now reflect
+# whatever PREDICTOR_BUY_RETRY_LIMIT / PREDICTOR_BUY_RETRY_WINDOW_HOURS
+# resolves to.  Defaults: 10 retries per 1-hour window.
+_MAX_BUY_RETRIES_PER_6H = int(os.getenv("PREDICTOR_BUY_RETRY_LIMIT", "10"))
+_BUY_RETRY_WINDOW_HOURS = int(os.getenv("PREDICTOR_BUY_RETRY_WINDOW_HOURS", "1"))
 
 
 # ---------------------------------------------------------------------------

@@ -423,6 +423,13 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
     cities_json = json.dumps(cities_meta, default=str, separators=(",", ":"))
     positions_json = json.dumps(live_positions or [], default=str,
                                   separators=(",", ":"))
+    # Dashboard's default mode mirrors the bot's PREDICTOR_MODE so a fresh
+    # browser (no localStorage) shows what the bot is actually doing.
+    # localStorage still wins when present — the user's manual toggle takes
+    # priority over the env default.
+    default_mode = (os.getenv("PREDICTOR_MODE") or "paper").lower().strip()
+    if default_mode not in ("paper", "live", "both"):
+        default_mode = "paper"
 
     # No meta refresh — the JS does a silent fetch + re-render every
     # auto_refresh_sec, preserving sort order, filter state, and scroll
@@ -542,8 +549,12 @@ function saveState(updates) {{
 const STATE = loadState();
 
 // Active mode filter for the entire dashboard: 'paper' | 'live' | 'both'
-// Initialized from localStorage so the user's choice persists across reloads.
-let MODE_FILTER = STATE.mode || "paper";
+// Resolution order:
+//   1. STATE.mode (user's previously-saved choice via localStorage)
+//   2. server-injected DEFAULT_MODE (= PREDICTOR_MODE from .env)
+//   3. "paper" as ultimate fallback
+const DEFAULT_MODE = "{default_mode}";
+let MODE_FILTER = STATE.mode || DEFAULT_MODE || "paper";
 // Right-side bottom table: 'signals' (all evaluations) or 'trades' (just BUYs
 // with entry, current, P&L, live status).
 let VIEW_MODE = STATE.view || "signals";
