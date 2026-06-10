@@ -277,18 +277,20 @@ def _action_for_mode(mode: str) -> str:
 
 def already_acted_today(conn, event_id: str, contract_id: str,
                           mode: str) -> bool:
-    """True if THIS exact (event,bin) was already bought today IN THIS MODE.
-    Paper and live are independent — a paper-bought bin can still be
-    live-bought (they're different 'pools')."""
-    today = _today_utc_date_str()
+    """True if THIS exact (event,bin) was already bought IN THIS MODE
+    for this event.  We don't filter by scan_date — each Polymarket
+    event has a unique event_id and a single resolution day, so a
+    "previously bought" check should look at the event's lifetime.
+    Previously this used substr(scanned_at_utc) = today_utc, which
+    reset the counter at UTC midnight and caused duplicate buys on
+    events that hadn't yet resolved in the city's local timezone."""
     row = conn.execute(
         """
         SELECT 1 FROM paper_predictor_signals
         WHERE event_id = ? AND contract_id = ? AND action = ?
-          AND substr(scanned_at_utc, 1, 10) = ?
         LIMIT 1
         """,
-        (event_id, contract_id, _action_for_mode(mode), today),
+        (event_id, contract_id, _action_for_mode(mode)),
     ).fetchone()
     return row is not None
 
@@ -300,17 +302,23 @@ def event_has_buy_today(conn, event_id: str, mode: str) -> bool:
 
 
 def event_buys_today_count(conn, event_id: str, mode: str) -> int:
-    """Number of bins bought for this event today in this mode.  Used by
-    the MAX_BINS_PER_EVENT cap — when the count equals the cap, the
-    event is full and no more bins can be bought today."""
-    today = _today_utc_date_str()
+    """Number of bins bought for THIS EVENT in this mode, for the
+    event's entire lifetime.  Used by the MAX_BINS_PER_EVENT cap.
+
+    IMPORTANT: we do NOT filter by scan UTC date.  Each Polymarket
+    event has a unique event_id and resolves on exactly one day, so
+    "buys for this event" is well-defined without a date filter.  An
+    earlier version filtered by substr(scanned_at_utc) = today_utc,
+    which meant the counter reset at UTC midnight — so a scan running
+    at 00:00:01 UTC on day N+1 saw "0 buys" for an event that hadn't
+    yet resolved in the city's local timezone, and fired a second buy.
+    """
     row = conn.execute(
         """
         SELECT COUNT(*) FROM paper_predictor_signals
         WHERE event_id = ? AND action = ?
-          AND substr(scanned_at_utc, 1, 10) = ?
         """,
-        (event_id, _action_for_mode(mode), today),
+        (event_id, _action_for_mode(mode)),
     ).fetchone()
     return int(row[0]) if row else 0
 
