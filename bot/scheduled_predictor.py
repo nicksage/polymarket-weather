@@ -781,27 +781,16 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                 # cap is now enforced as a per-bin gate below (every bin
                 # gets a SKIP row with reason "event_at_cap"), so prices
                 # stay live.
-                buys_already = (event_buys_today_count(conn, event_id, PREDICTOR_MODE)
-                                  if event_id else 0)
-                event_at_cap = buys_already >= MAX_BINS_PER_EVENT
-                if event_at_cap:
-                    n_events_skipped_already_bought += 1   # for the summary
-
-                pred = predict_bins(ev, nws_obs, forecast, nbr_signal,
-                                     now_local.hour, city=city,
-                                     ensemble_stats=ensemble_stats)
-                if not pred.get("bins"):
-                    continue
-
                 # Identify contracts that count as "currently bought" for
                 # this event.  Used to (a) allow topups to existing
-                # positions without re-tripping the cap, and (b) prevent
-                # double-buying the same bin.
+                # positions without re-tripping the cap, (b) prevent
+                # double-buying the same bin, AND (c) drive the
+                # event_at_cap decision below.
                 #
                 # LIVE mode: source of truth is the Polymarket API.  A DB
                 # LIVE_BUY row that no longer has an API position (closed
-                # manually, order failed, never filled) does NOT count as
-                # "bought" — the slot is free for re-buy.
+                # manually, order failed, never filled, resolved to zero)
+                # does NOT count as "bought" — the slot is free for re-buy.
                 #
                 # PAPER mode: DB is the truth (paper "fills" are simulated
                 # and persist as long as the row exists).
@@ -824,6 +813,24 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                     # buys count.  API-unreachable fallback is conservative
                     # so we don't spam re-buys when we can't verify.
                     already_bought_contracts = set(db_buys.keys())
+
+                # Cap check derived from the API-FILTERED set, not the raw
+                # DB count.  A historical LIVE_BUY row whose position no
+                # longer exists on Polymarket does NOT count toward the cap.
+                buys_already = len(already_bought_contracts)
+                event_at_cap = buys_already >= MAX_BINS_PER_EVENT
+                if event_at_cap:
+                    n_events_skipped_already_bought += 1
+
+                # Now run the bin predictor (cheap — pure math on already-
+                # fetched obs+forecast).  We do this AFTER the cap check
+                # so the API-derived buys_already is what drives candidate
+                # selection below.
+                pred = predict_bins(ev, nws_obs, forecast, nbr_signal,
+                                     now_local.hour, city=city,
+                                     ensemble_stats=ensemble_stats)
+                if not pred.get("bins"):
+                    continue
 
                 # Rank bins by OUR PROBABILITY descending.  Two kinds of
                 # candidates:
