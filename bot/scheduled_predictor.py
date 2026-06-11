@@ -396,15 +396,19 @@ def fetch_polymarket_positions_by_token() -> dict[str, dict] | None:
             cur  = float(p.get("curPrice") or p.get("cur_price") or 0)
             if size <= 0 or avg <= 0:
                 continue
-            # DUST FILTER (parity with dashboard).  Polymarket's data API
-            # returns positions for any token the wallet holds — including
-            # tiny resolved/closed positions whose current value is just
-            # cents.  Without this filter, the bot treats those as "we hold
-            # this contract" and blocks fresh buys via the at_target gate.
-            # Keep if EITHER current value or cost basis exceeds $0.50.
+            # POSITION-VALIDITY FILTER.  Polymarket's data API returns
+            # positions for any token the wallet holds — including:
+            #   - dust positions with sub-cent current value
+            #   - resolved-to-zero positions (market closed, cur≈0)
+            # Both should be treated as "we no longer hold this for
+            # trading purposes" so they don't block fresh buys via the
+            # at_target gate.
+            #
+            # A position is VALID (tradeable) only when all true:
+            #   1. cur > 0.005   — market is still tradeable (>0.5¢)
+            #   2. size * cur >= 0.50  — current value is meaningful
             current_value = size * cur
-            cost_basis    = size * avg
-            if current_value < 0.50 and cost_basis < 0.50:
+            if cur < 0.005 or current_value < 0.50:
                 n_dust += 1
                 continue
             out[str(token)] = {
@@ -415,7 +419,7 @@ def fetch_polymarket_positions_by_token() -> dict[str, dict] | None:
                 "cash_pnl":      float(p.get("cashPnl") or p.get("cash_pnl") or 0),
             }
         log.info(f"Polymarket positions: {len(out)} live positions fetched"
-                  f"{f' (+ {n_dust} dust filtered)' if n_dust else ''}")
+                  f"{f' (+ {n_dust} dust/resolved filtered)' if n_dust else ''}")
         return out
     except Exception as e:
         log.warning(f"Polymarket positions API failed: {e} — topup falls back to DB")

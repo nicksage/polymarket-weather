@@ -619,16 +619,18 @@ function recomputeDerived() {{
   // Threshold logic: keep if EITHER current value OR avgPrice × size
   // (the cost basis) exceeds $0.50.  This keeps Miami ($5 value)
   // visible while dropping dust (cents).
+  // Position validity filter — same as the bot side.  A position is
+  // tradeable only if cur > 0.005 (market still has price) AND
+  // current_value >= $0.50.  Resolved-to-zero positions (cur ≈ 0) and
+  // sub-50¢ positions are dropped so they don't show LIVE pills.
   LIVE_POS_BY_TOKEN = {{}};
   for (const p of (LIVE_POSITIONS || [])) {{
     const tok = p.asset || p.token_id || p.tokenId;
     if (!tok) continue;
     const size = parseFloat(p.size ?? 0);
     const cur  = parseFloat(p.curPrice ?? p.cur_price ?? 0);
-    const avg  = parseFloat(p.avgPrice ?? p.avg_price ?? 0);
     const current_value = size * cur;
-    const cost_basis    = size * avg;
-    if (current_value < 0.50 && cost_basis < 0.50) continue;   // dust
+    if (size <= 0 || cur < 0.005 || current_value < 0.50) continue;
     LIVE_POS_BY_TOKEN[String(tok)] = p;
   }}
   // CHANGED: filter by event_date (the resolution day of the Polymarket
