@@ -876,11 +876,31 @@ function _actualDeployedForBuy(s) {{
   return s.recommended_stake_usd || 0;
 }}
 
+// Reduce DATE_SIGNALS to one active BUY row PER CONTRACT.  A single
+// position can produce many LIVE_BUY rows (original purchase + multiple
+// topups), but the user has only one position per contract — so the KPI
+// "n BUYs" and the trades view should count contracts, not rows.  Keeps
+// the most-recent active row per contract.
+function _uniqueActiveBuys(signals) {{
+  const latestByContract = {{}};
+  for (const s of signals) {{
+    if (!matchesBuyMode(s) || !_isActiveBuy(s)) continue;
+    const k = s.contract_id;
+    if (!latestByContract[k]
+        || (s.scanned_at_utc || "") > (latestByContract[k].scanned_at_utc || "")) {{
+      latestByContract[k] = s;
+    }}
+  }}
+  return Object.values(latestByContract);
+}}
+
 function renderKPIs() {{
-  // Filter to CURRENTLY-ACTIVE buys.  LIVE_BUY rows whose token is no
-  // longer in the Polymarket API positions list are not counted (they
-  // were closed/failed/cancelled).  PAPER_BUYs always count.
-  const buys = DATE_SIGNALS.filter(s => matchesBuyMode(s) && _isActiveBuy(s));
+  // Filter to CURRENTLY-ACTIVE buys, ONE PER CONTRACT.  The bot writes
+  // a new LIVE_BUY signal row per topup, so a single position can have
+  // 3-5 LIVE_BUY rows in the DB.  Counting rows here would massively
+  // inflate "n BUYs" — we want to count distinct held contracts, which
+  // is what the user sees on Polymarket.
+  const buys = _uniqueActiveBuys(DATE_SIGNALS);
   const nBuys = buys.length;
   // Use the same active/inactive distinction for deployed $ — for active
   // LIVE buys, sum the API's actual size × avgPrice (matches Polymarket
@@ -1157,13 +1177,10 @@ document.querySelectorAll("th").forEach(th => {{
 let TRADES_SORT_KEY = "scanned_at_utc", TRADES_SORT_DIR = -1;
 
 function buildTradesData() {{
-  // Active BUY rows in the current date range.  Trades view shows
-  // currently-held positions only (paper buys are always "held"; live
-  // buys are held only if the Polymarket API confirms the token).
-  // Closed/failed/cancelled LIVE buys are excluded from this view.
-  const buys = DATE_SIGNALS.filter(s =>
-    (s.action === "PAPER_BUY" || s.action === "LIVE_BUY")
-    && _isActiveBuy(s));
+  // Active BUY rows in the current date range, deduped to one per
+  // contract (the bot writes a fresh LIVE_BUY row per topup, but the
+  // trades view should reflect one row per held position).
+  const buys = _uniqueActiveBuys(DATE_SIGNALS);
   // Latest known market price per contract (any scan in this date)
   const latestByContract = {{}};
   for (const s of DATE_SIGNALS) {{
