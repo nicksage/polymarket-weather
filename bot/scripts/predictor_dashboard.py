@@ -607,12 +607,29 @@ function todayUtcStr() {{
 
 function recomputeDerived() {{
   if (!SELECTED_DATE) SELECTED_DATE = todayUtcStr();
-  // Rebuild the live-positions lookup table (keyed by token_id).  Used
-  // by buildCitySnapshot to attach authoritative LIVE P&L per bin.
+  // Rebuild the live-positions lookup table (keyed by token_id).
+  // Filter out DUST positions — those where the position's current
+  // value (size × curPrice) is below a meaningful dollar threshold.
+  // Polymarket's API returns ALL positions with size > 0.01 shares,
+  // including resolved-to-zero markets (where shares remain but
+  // curPrice ≈ 0).  Without this filter, the dashboard treats every
+  // historical losing bet as a "still-active position" and slaps a
+  // LIVE pill on it.
+  //
+  // Threshold logic: keep if EITHER current value OR avgPrice × size
+  // (the cost basis) exceeds $0.50.  This keeps Miami ($5 value)
+  // visible while dropping dust (cents).
   LIVE_POS_BY_TOKEN = {{}};
   for (const p of (LIVE_POSITIONS || [])) {{
     const tok = p.asset || p.token_id || p.tokenId;
-    if (tok) LIVE_POS_BY_TOKEN[String(tok)] = p;
+    if (!tok) continue;
+    const size = parseFloat(p.size ?? 0);
+    const cur  = parseFloat(p.curPrice ?? p.cur_price ?? 0);
+    const avg  = parseFloat(p.avgPrice ?? p.avg_price ?? 0);
+    const current_value = size * cur;
+    const cost_basis    = size * avg;
+    if (current_value < 0.50 && cost_basis < 0.50) continue;   // dust
+    LIVE_POS_BY_TOKEN[String(tok)] = p;
   }}
   // CHANGED: filter by event_date (the resolution day of the Polymarket
   // market), not by scanned_at_utc.  This is semantically what the user
