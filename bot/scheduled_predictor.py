@@ -386,22 +386,36 @@ def fetch_polymarket_positions_by_token() -> dict[str, dict] | None:
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.load(resp)
         out: dict[str, dict] = {}
+        n_dust = 0
         for p in data:
             token = p.get("asset") or p.get("token_id") or p.get("tokenId")
             if not token:
                 continue
             size = float(p.get("size") or 0)
             avg  = float(p.get("avgPrice") or p.get("avg_price") or 0)
+            cur  = float(p.get("curPrice") or p.get("cur_price") or 0)
             if size <= 0 or avg <= 0:
+                continue
+            # DUST FILTER (parity with dashboard).  Polymarket's data API
+            # returns positions for any token the wallet holds — including
+            # tiny resolved/closed positions whose current value is just
+            # cents.  Without this filter, the bot treats those as "we hold
+            # this contract" and blocks fresh buys via the at_target gate.
+            # Keep if EITHER current value or cost basis exceeds $0.50.
+            current_value = size * cur
+            cost_basis    = size * avg
+            if current_value < 0.50 and cost_basis < 0.50:
+                n_dust += 1
                 continue
             out[str(token)] = {
                 "size":          size,
                 "avg_price":     avg,
                 "deployed_usdc": size * avg,
-                "cur_price":     float(p.get("curPrice") or p.get("cur_price") or 0),
+                "cur_price":     cur,
                 "cash_pnl":      float(p.get("cashPnl") or p.get("cash_pnl") or 0),
             }
-        log.info(f"Polymarket positions: {len(out)} live positions fetched")
+        log.info(f"Polymarket positions: {len(out)} live positions fetched"
+                  f"{f' (+ {n_dust} dust filtered)' if n_dust else ''}")
         return out
     except Exception as e:
         log.warning(f"Polymarket positions API failed: {e} — topup falls back to DB")
