@@ -746,7 +746,12 @@ function buildCitySnapshot(cityMeta) {{
         // as a position) if Polymarket API confirms it.  Without that
         // confirmation, the position was closed/failed/cancelled and
         // shouldn't show as deployed capital.
-        const isLiveActive  = buy.action === 'LIVE_BUY' && livePos !== null;
+        //
+        // Use truthy check (not `!== null`): map lookup returns `undefined`
+        // when the token isn't in the API response, and `undefined !== null`
+        // is `true` in JS strict mode — which would WRONGLY mark missing
+        // positions as active.  Truthy check covers both null and undefined.
+        const isLiveActive  = buy.action === 'LIVE_BUY' && Boolean(livePos);
         const isPaperActive = buy.action === 'PAPER_BUY';
         const isActive = isLiveActive || isPaperActive;
 
