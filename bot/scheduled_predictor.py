@@ -681,6 +681,9 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
     n_bins_evaluated = 0
 
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    # Use Row factory so dict-style column access (r["contract_id"]) works
+    # in the new candidate-selection queries that ship today.
+    conn.row_factory = sqlite3.Row
     n_events_skipped_not_today = 0
     n_events_skipped_already_bought = 0
     try:
