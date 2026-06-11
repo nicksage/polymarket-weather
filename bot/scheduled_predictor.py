@@ -359,17 +359,22 @@ def _get_proxy_address() -> str | None:
     return None
 
 
-def fetch_polymarket_positions_by_token() -> dict[str, dict]:
+def fetch_polymarket_positions_by_token() -> dict[str, dict] | None:
     """Returns {token_id: {size, avg_price, deployed_usdc, cur_price, cash_pnl}}.
 
     Used in the scan loop to determine actual deployed capital per
     contract — driving topup decisions and dedup checks (live mode).
-    Empty dict on failure: callers fall back to DB-derived stake sums.
+    Return value semantics (important for callers):
+      * dict (possibly EMPTY {}) — API call succeeded.  Empty = we have
+        zero open positions.  Callers should TRUST this (no positions =
+        no positions, slots are open for re-buy).
+      * None — API call FAILED (network, missing creds).  Callers should
+        fall back to DB-derived sums conservatively.
     """
     addr = _get_proxy_address()
     if not addr:
         log.debug("no proxy address in env — skipping live position fetch")
-        return {}
+        return None
     try:
         import urllib.request, urllib.parse
         params = {"user": addr, "sizeThreshold": "0.01",
@@ -399,24 +404,33 @@ def fetch_polymarket_positions_by_token() -> dict[str, dict]:
         return out
     except Exception as e:
         log.warning(f"Polymarket positions API failed: {e} — topup falls back to DB")
-        return {}
+        return None
 
 
 def get_actual_deployed_usd(conn, event_id: str, contract_id: str,
                               yes_token_id: str | None, mode: str,
-                              live_positions: dict[str, dict]) -> float:
+                              live_positions: dict[str, dict] | None) -> float:
     """Returns actual $ deployed for THIS contract in this mode.
 
-    For LIVE: uses Polymarket API actual size × avgPrice if available;
-    falls back to DB sum (last resort).
+    For LIVE: trusts Polymarket API as the source of truth.
+      * API has the position → actual size × avgPrice
+      * API does NOT have the position → 0  (position is closed, was
+        cancelled, never filled, etc.  Slot is open for re-buy/topup.)
+      * API unreachable (live_positions=None) → fall back to DB sum
+        (defensive, won't fire topups but won't lose data either)
+
     For PAPER: sums recommended_stake_usd across all BUY rows for this
-    contract (paper always fills full, so sum = total deployed).
+    contract (paper always fills full, so DB sum = total deployed).
     """
-    if mode == "live" and yes_token_id and live_positions:
-        pos = live_positions.get(str(yes_token_id))
-        if pos:
-            return pos["deployed_usdc"]
-    # Fallback — sum from DB
+    if mode == "live":
+        if live_positions is None:
+            # API unreachable — defensive fallback to DB sum so we don't
+            # try to re-buy when we genuinely can't tell what we hold.
+            pass
+        else:
+            pos = live_positions.get(str(yes_token_id)) if yes_token_id else None
+            return pos["deployed_usdc"] if pos else 0.0
+    # Paper mode (or live with API unreachable) — sum from DB
     action = _action_for_mode(mode)
     row = conn.execute(
         """SELECT COALESCE(SUM(recommended_stake_usd), 0)
@@ -618,10 +632,12 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
         return {"error": str(e), "scanned_at_utc": scan_start.isoformat()}
 
     # Fetch live positions ONCE per scan — used for topup decisions and
-    # accurate dedup (a "live BUY" that only partially filled is NOT
-    # truly bought yet; we should keep topping up until at target).
+    # accurate dedup.  Returns None for paper mode (no API call) AND
+    # for live mode if the API call fails — both signal "fall back to
+    # DB-derived sums".  Returns dict (possibly empty) only when API
+    # call succeeded.
     live_positions = (
-        fetch_polymarket_positions_by_token() if PREDICTOR_MODE == "live" else {}
+        fetch_polymarket_positions_by_token() if PREDICTOR_MODE == "live" else None
     )
 
     # City-name normalization: Polymarket's parser title-cases city tokens
@@ -755,15 +771,37 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                 if not pred.get("bins"):
                     continue
 
-                # Identify contracts we've already bought (any amount) for
-                # this event.  Used to allow topup orders to existing
-                # partially-filled positions without counting them as new
-                # bins against MAX_BINS_PER_EVENT.
+                # Identify contracts that count as "currently bought" for
+                # this event.  Used to (a) allow topups to existing
+                # positions without re-tripping the cap, and (b) prevent
+                # double-buying the same bin.
+                #
+                # LIVE mode: source of truth is the Polymarket API.  A DB
+                # LIVE_BUY row that no longer has an API position (closed
+                # manually, order failed, never filled) does NOT count as
+                # "bought" — the slot is free for re-buy.
+                #
+                # PAPER mode: DB is the truth (paper "fills" are simulated
+                # and persist as long as the row exists).
                 _action_str = _action_for_mode(PREDICTOR_MODE)
-                already_bought_contracts = {r[0] for r in conn.execute(
-                    """SELECT DISTINCT contract_id FROM paper_predictor_signals
+                db_buys = {r["contract_id"]: r["yes_token_id"]
+                            for r in conn.execute(
+                    """SELECT DISTINCT contract_id, yes_token_id
+                       FROM paper_predictor_signals
                        WHERE event_id = ? AND action = ?""",
                     (event_id, _action_str)).fetchall()}
+                if PREDICTOR_MODE == "live" and live_positions is not None:
+                    # Only count contracts whose token is currently in the
+                    # Polymarket API positions list.
+                    already_bought_contracts = {
+                        c for c, tok in db_buys.items()
+                        if tok and str(tok) in live_positions
+                    }
+                else:
+                    # Paper mode (or live with API unreachable) — all DB
+                    # buys count.  API-unreachable fallback is conservative
+                    # so we don't spam re-buys when we can't verify.
+                    already_bought_contracts = set(db_buys.keys())
 
                 # Rank bins by OUR PROBABILITY descending.  Two kinds of
                 # candidates:
