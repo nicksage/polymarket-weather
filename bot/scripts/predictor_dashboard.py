@@ -687,47 +687,60 @@ function buildCitySnapshot(cityMeta) {{
       const buy = buyByContract[r.contract_id];
       let entry_price = null, stake_usd = null, pnl_usd = null;
       let pnl_source = null;     // 'api' (Polymarket) or 'formula' (paper)
+      let active_buy = null;     // the BUY to display (null = no pill shown)
       if (buy) {{
-        // Default: use the intended stake from the signal row.
-        // For live trades, this gets OVERRIDDEN below with actual fill data.
-        stake_usd = buy.recommended_stake_usd || 0;
-        // For LIVE trades, prefer Polymarket's authoritative numbers:
-        //   - actual deployed = size * avgPrice (not intended stake)
-        //   - entry_price = avgPrice (actual weighted fill, not signal market_p)
-        //   - cashPnl computed by Polymarket
-        // Falls back to formula if API data unavailable for this token.
         const livePos = (buy.action === 'LIVE_BUY' && r.yes_token_id)
                           ? LIVE_POS_BY_TOKEN[String(r.yes_token_id)]
                           : null;
-        if (livePos) {{
-          const livSize = parseFloat(livePos.size ?? 0);
-          const livAvg  = parseFloat(livePos.avgPrice ?? livePos.avg_price ?? 0);
-          // ACTUAL deployed = shares × avgPrice (matches Polymarket "Traded")
-          if (livSize > 0 && livAvg > 0) {{
-            stake_usd   = livSize * livAvg;
-            entry_price = livAvg;
+
+        // ACTIVE-POSITION GATE: a LIVE_BUY is only "active" (displayed
+        // as a position) if Polymarket API confirms it.  Without that
+        // confirmation, the position was closed/failed/cancelled and
+        // shouldn't show as deployed capital.
+        const isLiveActive  = buy.action === 'LIVE_BUY' && livePos !== null;
+        const isPaperActive = buy.action === 'PAPER_BUY';
+        const isActive = isLiveActive || isPaperActive;
+
+        if (isActive) {{
+          active_buy = buy;
+          stake_usd = buy.recommended_stake_usd || 0;
+
+          if (livePos) {{
+            // LIVE with current position → use Polymarket's authoritative
+            // numbers (actual size × avgPrice, real cashPnl).
+            const livSize = parseFloat(livePos.size ?? 0);
+            const livAvg  = parseFloat(livePos.avgPrice ?? livePos.avg_price ?? 0);
+            if (livSize > 0 && livAvg > 0) {{
+              stake_usd   = livSize * livAvg;
+              entry_price = livAvg;
+            }} else {{
+              entry_price = parseFloat(livePos.avgPrice ?? livePos.avg_price ?? buy.market_prob);
+            }}
+            const cashPnl = parseFloat(livePos.cashPnl ?? livePos.cash_pnl ?? NaN);
+            if (!isNaN(cashPnl)) {{
+              pnl_usd = cashPnl;
+              pnl_source = 'api';
+            }} else if (entry_price > 0) {{
+              const curPx = parseFloat(livePos.curPrice ?? livePos.cur_price ?? r.market_prob);
+              const size  = parseFloat(livePos.size ?? 0);
+              pnl_usd = size * (curPx - entry_price);
+              pnl_source = 'api';
+            }}
           }} else {{
-            entry_price = parseFloat(livePos.avgPrice ?? livePos.avg_price ?? buy.market_prob);
+            // PAPER mode — use formula
+            entry_price = buy.market_prob;
+            if (entry_price > 0) {{
+              pnl_usd = stake_usd * ((r.market_prob / entry_price) - 1);
+              pnl_source = 'formula';
+            }}
           }}
-          // P&L: prefer API cashPnl; fallback to size*(curPrice-avgPrice)
-          const cashPnl = parseFloat(livePos.cashPnl ?? livePos.cash_pnl ?? NaN);
-          if (!isNaN(cashPnl)) {{
-            pnl_usd = cashPnl;
-            pnl_source = 'api';
-          }} else if (entry_price > 0) {{
-            const curPx = parseFloat(livePos.curPrice ?? livePos.cur_price ?? r.market_prob);
-            const size  = parseFloat(livePos.size ?? 0);
-            pnl_usd = size * (curPx - entry_price);
-            pnl_source = 'api';
-          }}
-        }}
-        // PAPER trades, or LIVE trades with no API data → formula
-        if (pnl_usd === null) {{
-          entry_price = buy.market_prob;
-          if (entry_price > 0) {{
-            pnl_usd = stake_usd * ((r.market_prob / entry_price) - 1);
-            pnl_source = 'formula';
-          }}
+        }} else {{
+          // LIVE_BUY signal exists but Polymarket has no current position.
+          // Position was closed/failed/cancelled — don't display as active.
+          // (Trades view still shows full history.)
+          stake_usd = 0;
+          entry_price = null;
+          pnl_usd = null;
         }}
       }}
       return {{
@@ -735,7 +748,8 @@ function buildCitySnapshot(cityMeta) {{
         our_prob:     r.our_prob,
         market_prob:  r.market_prob,
         edge:         r.edge,
-        action:       buy ? buy.action : null,
+        // action is null for closed/failed LIVE buys (no pill displayed)
+        action:       active_buy ? active_buy.action : null,
         entry_price:  entry_price,
         stake_usd:    stake_usd,
         pnl_usd:      pnl_usd,
