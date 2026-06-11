@@ -91,22 +91,26 @@ DASHBOARD_ROW_HARD_CAP = int(os.getenv("DASHBOARD_ROW_HARD_CAP", "30000"))
 
 
 def load_signals(db: str, since_utc: datetime) -> list[dict]:
-    """Load signals into the dashboard.
+    """Load ONLY what the dashboard actually displays.
 
-    Optimized: rather than pulling everything since `since_utc` (which
-    grew to 78K+ rows after the 'always re-evaluate' fix and started
-    OOM-ing the dashboard service), we:
-      1. Pull only rows whose event_date is in the lookback window.
-         The dashboard filters by event_date in JS anyway, so anything
-         outside this window is invisible to the user.
-      2. ORDER by scanned_at_utc DESC and LIMIT to a hard cap so a
-         runaway insert pattern can't blow up memory again.
+    Two row sets, UNION'd:
+      1. The most-recent scan per (event_date) — gives "current state"
+         for each city panel.  Typically ~120 rows.
+      2. All BUY rows (PAPER_BUY / LIVE_BUY) in the date window —
+         needed for the trades view + buy attribution in panels.
+         Typically ~5-30 rows.
+
+    Total: ~150 rows vs the previous 30,000.  This is a ~150x reduction
+    in HTML size and JSON parse time on the browser side.
+
+    The old implementation loaded EVERY scan's rows (after the "always
+    re-evaluate" fix), bloating to ~80K+ rows/day = ~50MB JSON.  The
+    dashboard browser doesn't need any of the historical scans — they
+    just slow things down.
     """
     if not os.path.exists(db):
         return []
     _ensure_tables(db)
-    # Build a list of event_dates we want — today's UTC date plus
-    # however many days back the caller asked for.
     since_date = since_utc.date()
     today_date = datetime.now(timezone.utc).date()
     dates_wanted = []
@@ -116,35 +120,63 @@ def load_signals(db: str, since_utc: datetime) -> list[dict]:
         d = d + timedelta(days=1)
     placeholders = ",".join("?" for _ in dates_wanted)
 
+    cols = (
+        "scanned_at_utc, mode, city, settlement_station, "
+        "event_date, event_id, contract_id, yes_token_id, bin_label, "
+        "bin_range_low, our_prob, market_prob, edge, liquidity_usd, "
+        "action, gate_blocked_by, recommended_stake_usd, "
+        "observed_max_c, observed_peak_hour, forecast_high_c, "
+        "forecast_peak_hour, wind_octant"
+    )
+
     with sqlite3.connect(db) as conn:
         conn.row_factory = sqlite3.Row
         try:
-            rows = conn.execute(
+            # Row set 1: latest scan per event_date.  We grab the max
+            # scanned_at_utc per event_date and join back to get all rows
+            # from that exact timestamp.
+            latest = conn.execute(
                 f"""
-                SELECT id, scanned_at_utc, mode, city, settlement_station,
-                       event_date, event_id, contract_id, bin_label,
-                       bin_range_low, bin_range_high, unit,
-                       our_prob, market_prob, edge, liquidity_usd,
-                       action, gate_blocked_by,
-                       recommended_stake_usd, recommended_limit_price,
-                       current_hour_local, observed_max_c, observed_peak_hour,
-                       forecast_high_c, forecast_peak_hour,
-                       mu_c, sigma_c, wind_octant
-                FROM paper_predictor_signals
+                SELECT {cols} FROM paper_predictor_signals
                 WHERE event_date IN ({placeholders})
-                ORDER BY scanned_at_utc DESC
-                LIMIT ?
+                  AND scanned_at_utc IN (
+                    SELECT MAX(scanned_at_utc)
+                    FROM paper_predictor_signals
+                    WHERE event_date IN ({placeholders})
+                    GROUP BY event_date
+                  )
                 """,
-                (*dates_wanted, DASHBOARD_ROW_HARD_CAP),
+                (*dates_wanted, *dates_wanted),
+            ).fetchall()
+            # Row set 2: all BUY rows in the window (regardless of scan
+            # timestamp).  De-dup'd against row set 1 by id-less merge
+            # (using contract_id + scanned_at_utc as effective primary key).
+            buys = conn.execute(
+                f"""
+                SELECT {cols} FROM paper_predictor_signals
+                WHERE event_date IN ({placeholders})
+                  AND action IN ('PAPER_BUY', 'LIVE_BUY')
+                """,
+                tuple(dates_wanted),
             ).fetchall()
         except sqlite3.OperationalError as e:
             log.warning(f"paper_predictor_signals not readable: {e}")
             return []
-    if len(rows) >= DASHBOARD_ROW_HARD_CAP:
-        log.warning(f"hit row hard cap ({DASHBOARD_ROW_HARD_CAP}) — "
-                     f"older rows truncated.  Bump DASHBOARD_ROW_HARD_CAP "
-                     f"in .env or reduce DASHBOARD_DAYS.")
-    return [dict(r) for r in rows]
+
+    seen = set()
+    out: list[dict] = []
+    for r in list(latest) + list(buys):
+        d = dict(r)
+        key = (d["contract_id"], d["scanned_at_utc"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(d)
+    # Sort newest-first to match prior ordering expectations in JS
+    out.sort(key=lambda d: d["scanned_at_utc"], reverse=True)
+    log.info(f"load_signals: {len(out)} rows ({len(latest)} latest-scan + "
+              f"{len(buys)} buy rows, de-duped)")
+    return out
 
 
 def load_live_orders(db: str, since_utc: datetime) -> list[dict]:
@@ -792,10 +824,44 @@ function buildCitySnapshot(cityMeta) {{
 }}
 
 // ===== KPI rendering =====
+// Returns true if a BUY signal row represents a CURRENTLY-ACTIVE position.
+//   - PAPER_BUY → always active (paper "fills" are persistent in DB)
+//   - LIVE_BUY  → active only if Polymarket API confirms the token
+//                  is still held (i.e., not closed/failed/cancelled)
+function _isActiveBuy(s) {{
+  if (!s) return false;
+  if (s.action === "PAPER_BUY") return true;
+  if (s.action === "LIVE_BUY") {{
+    return s.yes_token_id
+        && LIVE_POS_BY_TOKEN[String(s.yes_token_id)] != null;
+  }}
+  return false;
+}}
+
+// Returns actual deployed $ for a single BUY row (API for live, signal for paper).
+function _actualDeployedForBuy(s) {{
+  if (s.action === "LIVE_BUY" && s.yes_token_id) {{
+    const livePos = LIVE_POS_BY_TOKEN[String(s.yes_token_id)];
+    if (livePos) {{
+      const size = parseFloat(livePos.size ?? 0);
+      const avg  = parseFloat(livePos.avgPrice ?? livePos.avg_price ?? 0);
+      if (size > 0 && avg > 0) return size * avg;
+    }}
+    return 0;   // LIVE with no API match → not deployed
+  }}
+  return s.recommended_stake_usd || 0;
+}}
+
 function renderKPIs() {{
-  const buys = DATE_SIGNALS.filter(matchesBuyMode);
+  // Filter to CURRENTLY-ACTIVE buys.  LIVE_BUY rows whose token is no
+  // longer in the Polymarket API positions list are not counted (they
+  // were closed/failed/cancelled).  PAPER_BUYs always count.
+  const buys = DATE_SIGNALS.filter(s => matchesBuyMode(s) && _isActiveBuy(s));
   const nBuys = buys.length;
-  const deployed = buys.reduce((s, b) => s + (b.recommended_stake_usd || 0), 0);
+  // Use the same active/inactive distinction for deployed $ — for active
+  // LIVE buys, sum the API's actual size × avgPrice (matches Polymarket
+  // "Traded").  For PAPER, use the recommended_stake_usd.
+  const deployed = buys.reduce((s, b) => s + _actualDeployedForBuy(b), 0);
 
   // Compute total P&L across all buys in current mode
   let totalPnl = 0;
@@ -1067,9 +1133,13 @@ document.querySelectorAll("th").forEach(th => {{
 let TRADES_SORT_KEY = "scanned_at_utc", TRADES_SORT_DIR = -1;
 
 function buildTradesData() {{
-  // All BUY rows in the current date range
+  // Active BUY rows in the current date range.  Trades view shows
+  // currently-held positions only (paper buys are always "held"; live
+  // buys are held only if the Polymarket API confirms the token).
+  // Closed/failed/cancelled LIVE buys are excluded from this view.
   const buys = DATE_SIGNALS.filter(s =>
-    s.action === "PAPER_BUY" || s.action === "LIVE_BUY");
+    (s.action === "PAPER_BUY" || s.action === "LIVE_BUY")
+    && _isActiveBuy(s));
   // Latest known market price per contract (any scan in this date)
   const latestByContract = {{}};
   for (const s of DATE_SIGNALS) {{
@@ -1090,9 +1160,15 @@ function buildTradesData() {{
   return buys.map(b => {{
     const latest = latestByContract[b.contract_id] || b;
     const live   = b.action === "LIVE_BUY" ? liveByContract[b.contract_id] : null;
-    const entry  = b.market_prob;
+    // For LIVE: use Polymarket's actual avg fill price + actual deployed.
+    // For PAPER: use signal-time market_prob and intended stake.
+    const livePos = (b.action === "LIVE_BUY" && b.yes_token_id)
+                    ? LIVE_POS_BY_TOKEN[String(b.yes_token_id)] : null;
+    const entry  = livePos
+                   ? parseFloat(livePos.avgPrice ?? livePos.avg_price ?? b.market_prob)
+                   : b.market_prob;
     const cur    = latest.market_prob;
-    const stake  = b.recommended_stake_usd || 0;
+    const stake  = _actualDeployedForBuy(b);
     const shares = entry > 0 ? stake / entry : 0;
     const value  = shares * cur;
     const pnl    = value - stake;
