@@ -277,6 +277,11 @@ CREATE TABLE IF NOT EXISTS raw_metar_log (
     wind_dir_deg         REAL,
     wind_speed_mps       REAL,
     present_weather      TEXT,
+    -- 'tenths' | 'whole' | 'missing' — see precision-handling block in
+    -- intraday_predictor.py for the semantics.  Surfaces whether temp_c
+    -- came from the METAR T-group (precise to ±0.05°C) or the body
+    -- value (whole-°C body, conservative -0.5°C lower bound applied).
+    temp_precision       TEXT,
     persisted_at_utc     TEXT NOT NULL,
     UNIQUE(icao, cycle_timestamp_utc)
 );
@@ -341,6 +346,14 @@ def ensure_schema() -> None:
         # non-decreasing once forecast_peak_hour has passed; oscillation
         # is the bin-lock-discontinuity churn surfacing as data).
         _add_column("paper_predictor_signals", "cooling_confidence", "REAL")
+        # temp_precision: per METAR cycle, records whether temp_c was
+        # derived from the T-group (tenths precision, ±0.05°C) or the
+        # body value (whole-°C, conservatively bound to lower edge).
+        # See the precision-handling block in intraday_predictor.py.
+        # Surfaced for diagnostic queries: SELECT temp_precision, COUNT(*)
+        # FROM raw_metar_log GROUP BY temp_precision tells you what
+        # fraction of obs are precision-quality at any given station.
+        _add_column("raw_metar_log", "temp_precision", "TEXT")
         conn.commit()
 
 
@@ -663,6 +676,61 @@ def trades_today(conn, mode: str) -> int:
     return int(row[0]) if row else 0
 
 
+def pending_contracts_today(conn) -> set[str]:
+    """Contracts with at least one order placed today that hasn't yet
+    transitioned to filled / cancelled / stale / error.
+
+    These count as "committed" for cap purposes — a contract with a
+    pending order should NOT permit a new bin entry for the same event
+    (the NYC 2026-06-12 race condition).  The reconciliation sweep runs
+    at the start of every scan, so by the time this query fires, any
+    orders that actually filled have already been promoted out of
+    'placed' status.
+
+    Returns empty set in paper mode or when the table is empty —
+    pending-order tracking is a live-mode concept.
+    """
+    today = _today_utc_date_str()
+    try:
+        rows = conn.execute(
+            """SELECT DISTINCT contract_id FROM live_predictor_orders
+               WHERE substr(placed_at_utc, 1, 10) = ?
+                 AND status = 'placed'
+                 AND contract_id IS NOT NULL""",
+            (today,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    return {r[0] if not hasattr(r, "keys") else r["contract_id"] for r in rows}
+
+
+def pending_stake_for_contract_today(conn, contract_id: str) -> float:
+    """Sum of stakes for orders on `contract_id` placed today that
+    haven't yet filled / cancelled / staled.
+
+    These count as "committed" toward the target stake — the Houston
+    2026-06-12 race condition.  Without this, the per-bin loop sees
+    actual_deployed (filled-only) below target and keeps placing more
+    orders, then they all eventually fill and total deployed blows past
+    the target.
+
+    Returns 0.0 in paper mode or when the table is unavailable.
+    """
+    today = _today_utc_date_str()
+    try:
+        row = conn.execute(
+            """SELECT COALESCE(SUM(stake_usd), 0)
+               FROM live_predictor_orders
+               WHERE substr(placed_at_utc, 1, 10) = ?
+                 AND status = 'placed'
+                 AND contract_id = ?""",
+            (today, contract_id),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return 0.0
+    return float(row[0]) if row else 0.0
+
+
 def write_signal(conn, row: dict) -> int:
     """Insert and return the new row's id."""
     cols = list(row.keys())
@@ -831,13 +899,13 @@ def persist_raw_metar_cycles(conn, raw_cycles: list[dict]) -> int:
             """INSERT OR IGNORE INTO raw_metar_log
                  (icao, event_date, cycle_timestamp_utc, raw_message,
                   temp_c, dewpoint_c, wind_dir_deg, wind_speed_mps,
-                  present_weather, persisted_at_utc)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                  present_weather, temp_precision, persisted_at_utc)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (c.get("icao"), c.get("event_date"), c.get("cycle_timestamp_utc"),
              c.get("raw_message"),
              c.get("temp_c"), c.get("dewpoint_c"),
              c.get("wind_dir_deg"), c.get("wind_speed_mps"),
-             c.get("present_weather"), now_iso),
+             c.get("present_weather"), c.get("temp_precision"), now_iso),
         )
         inserted += cur.rowcount or 0
     conn.commit()
@@ -1336,12 +1404,28 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                     for b in pred["bins"]
                 }
 
-                # Cap is occupied ONLY by held contracts whose underlying
-                # market is still open.  A resolved-to-zero position is
-                # held but the market is closed — no slot occupied.
-                # (Topups against closed markets are also rejected below.)
+                # FIX 2 (2026-06-12): committed = held + pending.
+                # A contract with a placed-but-not-yet-filled order
+                # should count toward the cap.  Without this, the bot
+                # would buy a DIFFERENT bin on the same event while
+                # the first bin's order was still resting on the book
+                # (NYC race: bought 92-93°F at 17:37, then 94-95°F at
+                # 18:32 because API hadn't seen 92-93°F fill yet, ended
+                # up holding both bins on a MAX_BINS_PER_EVENT=1 event).
+                # Pending orders are paper-mode no-op (empty set).
+                if PREDICTOR_MODE == "live":
+                    _pending_today = pending_contracts_today(conn)
+                else:
+                    _pending_today = set()
+                committed_contracts = held_contracts | _pending_today
+
+                # Cap is occupied by COMMITTED contracts (held OR with a
+                # pending order) whose underlying market is still open.
+                # Resolved-to-zero positions are held but the market is
+                # closed → no slot occupied.  (Topups against closed
+                # markets are also rejected below.)
                 already_bought_contracts = {
-                    c for c in held_contracts
+                    c for c in committed_contracts
                     if market_open.get(c, True)
                 }
                 buys_already = len(already_bought_contracts)
@@ -1352,16 +1436,21 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                 # Rank bins by OUR PROBABILITY descending.  Two kinds of
                 # candidates:
                 #   1. FRESH-BUY candidates: top P-rank bins NOT already
-                #      held AND market still open.  Cap-bound.
-                #   2. TOPUP candidates: bins ALREADY held AND still open.
-                #      Not cap-bound (no new bin added to the event).
+                #      committed AND market still open.  Cap-bound.
+                #   2. TOPUP candidates: bins ALREADY HELD (filled) and
+                #      market still open.  Not cap-bound (no new bin
+                #      added).  NOTE: topup target is only bins in
+                #      `held_contracts` — bins with merely pending
+                #      orders don't get more topup attempts piled on
+                #      until their first order resolves.
                 bins_by_p = sorted(pred["bins"], key=lambda x: -x["our_prob"])
 
                 fresh_bins = [b for b in bins_by_p
-                               if b["contract_id"] not in held_contracts
+                               if b["contract_id"] not in committed_contracts
                                and market_open.get(b["contract_id"], True)]
                 topup_bins = [b for b in bins_by_p
-                               if b["contract_id"] in already_bought_contracts]
+                               if b["contract_id"] in already_bought_contracts
+                               and b["contract_id"] in held_contracts]
 
                 if event_at_cap:
                     fresh_candidates = []     # no new bins allowed at cap
@@ -1401,27 +1490,48 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                         conn, event_id, contract_id, yes_token_id,
                         PREDICTOR_MODE, live_positions,
                     )
-                    remaining_to_target = max(0.0, target_stake - actual_deployed)
 
-                    # Per-contract daily $ ceiling.  Anchored to ACTUAL
-                    # cost basis on Polymarket (actual_deployed), not to
-                    # the sum of signal-row intents.  Earlier versions
-                    # summed `recommended_stake_usd` across all today's
-                    # LIVE_BUY rows for this contract, which counted
-                    # unfilled orders against the cap — a volatile market
-                    # producing unfilled topup attempts would block
-                    # legitimate target completion, the opposite of the
-                    # safety property we want.
+                    # FIX 1 (2026-06-12): committed = actual + pending.
+                    # Orders placed today but not yet filled don't show
+                    # up in actual_deployed (which reads cost basis from
+                    # Polymarket's positions API).  Without counting
+                    # them as committed, the bot keeps placing more
+                    # topup orders thinking it's under target — and when
+                    # they all eventually fill, total deployed blows
+                    # past the target.  This was the Houston 2026-06-12
+                    # bug: $74.99 actual deployed despite $10 target,
+                    # produced by repeated pending-order stacking across
+                    # multiple scans before any order resolved.
+                    if PREDICTOR_MODE == "live":
+                        pending_stake = pending_stake_for_contract_today(
+                            conn, contract_id)
+                    else:
+                        pending_stake = 0.0
+                    committed_deployed = actual_deployed + pending_stake
+                    remaining_to_target = max(
+                        0.0, target_stake - committed_deployed)
+
+                    # Per-contract daily $ ceiling.  Anchored to COMMITTED
+                    # cost basis on Polymarket (actual_deployed + any
+                    # pending order stakes), not to the sum of signal-row
+                    # intents.  Earlier versions summed
+                    # `recommended_stake_usd` across all today's LIVE_BUY
+                    # rows, which counted unfilled-and-cancelled orders
+                    # against the cap — a volatile market producing
+                    # unfilled topup attempts would block legitimate
+                    # target completion.
                     #
-                    # actual_deployed comes from the Polymarket positions
-                    # API (`get_actual_deployed_usd` above): size × avg
-                    # of what's actually held.  If you sold a fraction of
-                    # the position mid-day, that reduces actual_deployed
-                    # and frees cap headroom — also the right behavior.
+                    # Using committed (actual + pending) here means we
+                    # cap based on capital we've ACTUALLY put on the line
+                    # — filled positions + resting orders.  Sold shares
+                    # reduce actual_deployed → free cap headroom (also
+                    # the right behavior).  Cancelled orders move out of
+                    # 'placed' → free cap headroom (via reconciliation
+                    # at next scan).
                     contract_ceiling_remaining = None
                     if MAX_PER_CONTRACT_USD > 0:
                         contract_ceiling_remaining = max(
-                            0.0, MAX_PER_CONTRACT_USD - actual_deployed,
+                            0.0, MAX_PER_CONTRACT_USD - committed_deployed,
                         )
                         remaining_to_target = min(
                             remaining_to_target, contract_ceiling_remaining,
@@ -1447,14 +1557,23 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                         ok = False
                         reason = "event_aborted (higher-P bin failed gates)"
                     elif at_target:
+                        # Include pending stake in the reason so the
+                        # dashboard distinguishes "no headroom because
+                        # filled" from "no headroom because orders are
+                        # still resting on the book."
+                        _pending_str = (f" + ${pending_stake:.2f} pending"
+                                          if pending_stake > 0.01 else "")
                         if contract_ceiling_hit:
                             ok = False
                             reason = (f"per_contract_daily_cap "
-                                      f"(deployed=${actual_deployed:.2f} "
+                                      f"(committed=${committed_deployed:.2f}"
+                                      f"{_pending_str} "
                                       f"/ cap=${MAX_PER_CONTRACT_USD:.2f})")
                         else:
                             ok = False
-                            reason = (f"at_target (deployed=${actual_deployed:.2f} "
+                            reason = (f"at_target "
+                                      f"(committed=${committed_deployed:.2f}"
+                                      f"{_pending_str} "
                                       f"/ target=${target_stake:.2f})")
                     else:
                         # Note: already_acted is now False because we handle

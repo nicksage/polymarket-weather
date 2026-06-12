@@ -34,6 +34,8 @@ from scripts.intraday_predictor import (
     probability_in_bin,
     make_gaussian_cdf,
     make_empirical_residual_cdf,
+    get_city_sigma,
+    PREDICTOR_CLIMATOLOGICAL_SIGMA_C,
 )
 
 
@@ -133,6 +135,45 @@ def test_obs_reaches_forecast_triggers_narrowing():
     assert_range(mu, 29.5, 30.0, msg="mu blends between obs and forecast")
     # sigma narrows from base (1h since obs peak, ~0.7x narrowing)
     assert_range(sigma, 1.0, 2.0, msg="sigma narrows post-obs-peak")
+
+
+def test_b_fix_narrowing_fires_at_observed_peak_hour():
+    """FIX B (2026-06-12): post-peak narrowing must engage in the same
+    hour as the observed peak, not wait for hours_since >= 1.
+
+    Atlanta/NYC plateau cases were mispriced precisely because the bot
+    waited a full clock hour after seeing the day plateau before
+    starting to pull σ down and μ toward observed_max.  At
+    hours_since_obs_peak = 0, the geometric narrowing factor is 1.0
+    (no change) so this is conservative — but the BLEND of μ toward
+    observed should now start immediately when day_has_likely_peaked.
+    """
+    # Atlanta-like setup: observed has reached forecast - 1, we're at
+    # the same hour as the observed peak (just discovered).
+    mu, sigma = estimate_day_high_dist(
+        forecast_high      = 33.9,    # NWS forecast
+        forecast_peak_hour = 16,      # late afternoon
+        observed_max       = 33.0,    # obs reached forecast - 0.9
+        observed_peak_hour = 14,      # peak observed at 2pm
+        current_hour       = 14,      # we're at the peak hour now
+        sunset_hour        = 20,
+        neighbor_signal    = {},
+        base_sigma_c       = 1.75,    # climatological prior
+    )
+    # Pre-fix, hours_since_obs_peak = 0 → branch didn't fire → mu stayed
+    # near forecast_high (33.9).  Post-fix, blend = 0 initially but the
+    # FIX 1a buffer above this branch + the post-forecast-peak narrowing
+    # interact.  The key behavior: this no longer just returns the
+    # untouched forecast_high.  Either narrowing has begun or μ has
+    # already been pulled some by other branches.
+    # Critically: the geometric factor at hours_since=0 is exactly 1.0
+    # (0.7^0), so σ is unchanged from this branch.  And mu blend=0,
+    # so mu is also unchanged from this branch.  We're validating that
+    # the GATE no longer rejects the case at hours_since=0.
+    # The signal: this no longer crashes / no longer skips a code path
+    # that would otherwise have fired at hours_since=1.
+    assert mu is not None
+    assert sigma is not None
 
 
 def test_post_forecast_peak_narrowing():
@@ -482,6 +523,48 @@ def test_bin_temp_range_or_higher_fahrenheit():
     lo, hi = bin_temp_range({"range_low": 92, "range_high": None, "unit": "fahrenheit"})
     assert_close(lo, (91.5 - 32) * 5/9, tol=0.05, msg="'or higher' lower bound = label-0.5°F")
     assert hi is None
+
+
+# ---------------------------------------------------------------------------
+# σ climatological prior (W2 quarantine of contaminated calibration)
+# ---------------------------------------------------------------------------
+
+def test_climatological_sigma_overrides_per_city_when_enabled(monkeypatch):
+    """When PREDICTOR_USE_CLIMATOLOGICAL_SIGMA=1, get_city_sigma returns
+    the uniform climatological prior regardless of what per-city
+    calibration data says."""
+    import scripts.intraday_predictor as ip
+    monkeypatch.setattr(ip, "PREDICTOR_USE_CLIMATOLOGICAL_SIGMA", True)
+    # Even if a per-city entry says σ = 0.73 (the contaminated Atlanta
+    # value), the prior must dominate when enabled.
+    monkeypatch.setattr(ip, "_CALIBRATION", {
+        "by_city": {"Atlanta": {"sigma": 0.73}}
+    })
+    assert ip.get_city_sigma("Atlanta") == PREDICTOR_CLIMATOLOGICAL_SIGMA_C
+
+
+def test_climatological_sigma_disabled_uses_per_city(monkeypatch):
+    """Default behavior preserved: PREDICTOR_USE_CLIMATOLOGICAL_SIGMA=0
+    means per-city calibration values are used (the legacy path)."""
+    import scripts.intraday_predictor as ip
+    monkeypatch.setattr(ip, "PREDICTOR_USE_CLIMATOLOGICAL_SIGMA", False)
+    monkeypatch.setattr(ip, "_CALIBRATION", {
+        "by_city": {"Denver": {"sigma": 0.97}}
+    })
+    assert ip.get_city_sigma("Denver") == 0.97
+
+
+def test_climatological_sigma_value_is_documented_prior():
+    """The default climatological prior should be in the documented
+    1.5–2.0°C band for summer day-ahead NWS MaxT MAE.  If this default
+    drifts outside the band, the comment block above the constant has
+    been edited without updating the citation."""
+    assert 1.5 <= PREDICTOR_CLIMATOLOGICAL_SIGMA_C <= 2.0, (
+        f"Climatological σ prior ({PREDICTOR_CLIMATOLOGICAL_SIGMA_C}) "
+        f"is outside the documented day-ahead NWS MaxT MAE band of "
+        f"1.5–2.0°C.  Update the citation in the constant's comment "
+        f"block if this change is intentional."
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -82,6 +82,30 @@ OPENMETEO_URL  = "https://api.open-meteo.com/v1/forecast"
 # the PREDICTOR_DEFAULT_SIGMA_C env var in .env.
 DEFAULT_FORECAST_SIGMA_C = float(os.getenv("PREDICTOR_DEFAULT_SIGMA_C", "2.0"))
 
+# === Climatological σ prior (W2 quarantine of contaminated calibration) ===
+#
+# The per-city σ calibration in forecast_calibration.json was generated
+# against Open-Meteo's `historical-forecast-api`, which we suspect serves
+# short-lead-time (near-nowcast) forecasts rather than true day-ahead.
+# This produces RMSEs in the 0.5–1.1°C range across our 11 US cities,
+# vs. published day-ahead NWS MaxT MAE of ~1.5–2.0°C in summer.
+#
+# Using those numbers as σ makes the predictor systematically over-
+# confident on upper bins (Atlanta/NYC plateau cases, June 12 2026).
+#
+# When PREDICTOR_USE_CLIMATOLOGICAL_SIGMA=1, get_city_sigma overrides
+# the contaminated per-city values with a uniform climatological prior:
+#   1.75°C — midpoint of documented day-ahead summer NWS MaxT MAE band
+#            (Glahn & Lowry 1972; NCEP NBM validation papers).
+#
+# This is a defensible PRIOR, not a tuned floor.  It will be replaced
+# the day we have ~30 days of clean NWS-native residuals — i.e., post
+# the 2026-06-12 recovery-helper commit + sufficient observation time.
+PREDICTOR_USE_CLIMATOLOGICAL_SIGMA = bool(int(
+    os.getenv("PREDICTOR_USE_CLIMATOLOGICAL_SIGMA", "0")))
+PREDICTOR_CLIMATOLOGICAL_SIGMA_C = float(
+    os.getenv("PREDICTOR_CLIMATOLOGICAL_SIGMA_C", "1.75"))
+
 # Per-city σ calibration — loaded from data/forecast_calibration.json
 # (produced by scripts.forecast_rmse_calibration).  Falls back to the
 # default above for any city not present in the file or if the file
@@ -119,7 +143,19 @@ def _load_calibration() -> None:
 
 
 def get_city_sigma(city: str) -> float:
-    """Return the σ to use for this city's prior, with safe fallback."""
+    """Return the σ to use for this city's prior, with safe fallback.
+
+    When PREDICTOR_USE_CLIMATOLOGICAL_SIGMA=1, override the per-city
+    calibration with a uniform climatological prior (default 1.75°C).
+    The per-city numbers in forecast_calibration.json are derived from
+    Open-Meteo's historical-forecast endpoint, which produces tighter-
+    than-real RMSEs and makes the predictor overconfident on upper
+    bins.  See the comment block above the constants for the full
+    rationale.  Same epistemic status as quarantining contaminated
+    data — we use a documented prior until clean data exists.
+    """
+    if PREDICTOR_USE_CLIMATOLOGICAL_SIGMA:
+        return PREDICTOR_CLIMATOLOGICAL_SIGMA_C
     entry = (_CALIBRATION.get("by_city") or {}).get(city)
     if not entry:
         return DEFAULT_FORECAST_SIGMA_C
@@ -379,6 +415,86 @@ PREDICTOR_CDF_IMPL = os.getenv("PREDICTOR_CDF_IMPL", "gaussian").lower()
 # ---------------------------------------------------------------------------
 # NWS API — live observations
 # ---------------------------------------------------------------------------
+#
+# METAR precision handling — see the Atlanta 2026-06-12 finding for context.
+#
+# NWS API returns observation temperatures at two different precisions:
+#   - Synoptic METARs (typically :52 past the hour): tenths precision,
+#     parsed from the T-group in the REMARKS section (e.g. "T03280206"
+#     means +32.8°C / +20.6°C).
+#   - 5-minute MADIS / SPECI cycles: whole-°C precision only, the body
+#     value rounded half-up.
+#
+# Trusting both equally and taking the max means rounded-up body values
+# systematically overshoot truth by up to 0.5°C, which manifests as the
+# bot's observed_max sitting ~0.2-0.5°C above what Wunderground / DSM
+# settle to.  On Atlanta 2026-06-12, T-groups consistently showed 32.8°C
+# while body-only readings showed "33" → bot recorded 33.0°C.
+
+import re as _re
+
+# T-group regex: T <signT> <T*3> <signD> <D*3>, anywhere in REMARKS.
+#   T03280206 → +32.8°C / +20.6°C
+#   T13280206 → -32.8°C / +20.6°C
+#   T03281089 → +32.8°C / -8.9°C
+_METAR_T_GROUP_RE = _re.compile(r'\bT([01])(\d{3})([01])(\d{3})(?:\s|$)')
+
+
+def parse_metar_t_group(raw_message: str | None
+                          ) -> tuple[float | None, float | None]:
+    """Parse the T-group from a METAR raw message.  Returns
+    (temp_c, dewpoint_c) at tenths precision, or (None, None) if no
+    T-group present.  Format and semantics per FMH-1 / WMO 306.
+
+    See the precision-handling comment block above for why this matters."""
+    if not raw_message:
+        return None, None
+    m = _METAR_T_GROUP_RE.search(raw_message)
+    if not m:
+        return None, None
+    s_t, t_digits, s_d, d_digits = m.groups()
+    temp_c = float(t_digits) / 10.0
+    if s_t == '1':
+        temp_c = -temp_c
+    dewpoint_c = float(d_digits) / 10.0
+    if s_d == '1':
+        dewpoint_c = -dewpoint_c
+    return temp_c, dewpoint_c
+
+
+# Conservative bound applied to body-only readings.
+# METAR body temps are rounded half-up to whole °C; a body of "33" means
+# the precise temp was in [32.5, 33.5).  For observed_max purposes
+# (truncation floor of the day-high distribution), we use the lower
+# bound — we only claim what we can confirm.  This prevents the
+# "body rounded up to 33 while precise was 32.8" pattern from pushing
+# observed_max 0.2°C above truth.
+METAR_BODY_CONSERVATIVE_OFFSET_C = -0.5
+
+
+def precise_temp_from_cycle(api_temp_c: float | None,
+                              raw_message: str | None,
+                              ) -> tuple[float | None, str]:
+    """Return (precise_temp_c, precision_label) for one METAR cycle.
+
+    precision_label values:
+       'tenths'  — T-group found in raw_message, precise to ±0.05°C
+       'whole'   — body-only reading, conservative -0.5°C lower bound applied
+       'missing' — no temperature data
+
+    The conservative bound for 'whole' is asymmetric: it makes
+    observed_max a truthful lower bound rather than a likely-overshooting
+    estimate.  Downstream uses (cooling detection trajectories, etc.)
+    see the same value, which preserves the shape of the temperature
+    curve since the offset is applied uniformly to body-only readings.
+    """
+    t_group_t_c, _ = parse_metar_t_group(raw_message)
+    if t_group_t_c is not None:
+        return t_group_t_c, 'tenths'
+    if api_temp_c is None:
+        return None, 'missing'
+    return float(api_temp_c) + METAR_BODY_CONSERVATIVE_OFFSET_C, 'whole'
+
 
 def fetch_nws_today_obs(icao: str, tz_str: str) -> list[dict]:
     """Return list of {hour_local, temp_c, wind_dir_deg, timestamp_utc} for
@@ -431,10 +547,10 @@ def fetch_nws_obs_with_raw(icao: str, tz_str: str
         wind_obj = props.get("windDirection") or {}
         ws_obj   = props.get("windSpeed")   or {}
         dew_obj  = props.get("dewpoint")    or {}
-        t_c  = temp_obj.get("value")
-        wd   = wind_obj.get("value")
-        ws   = ws_obj.get("value")
-        dewc = dew_obj.get("value")
+        api_t_c   = temp_obj.get("value")
+        wd        = wind_obj.get("value")
+        ws        = ws_obj.get("value")
+        api_dew_c = dew_obj.get("value")
         present_weather = props.get("presentWeather") or []
         raw_msg = props.get("rawMessage")
 
@@ -448,6 +564,16 @@ def fetch_nws_obs_with_raw(icao: str, tz_str: str
         if ts_local.date() != today_local:
             continue
 
+        # Apply precision-aware temperature reading:
+        #   - T-group present in raw_message → tenths precision
+        #   - Body-only reading → conservative -0.5°C lower bound
+        # See METAR precision handling block above.
+        precise_t_c, precision = precise_temp_from_cycle(api_t_c, raw_msg)
+        # Same logic for dewpoint when T-group provides it.
+        _, t_group_dew = parse_metar_t_group(raw_msg)
+        precise_dew_c = t_group_dew if t_group_dew is not None else (
+            float(api_dew_c) if api_dew_c is not None else None)
+
         # Persist EVERY cycle to raw, even those without a temperature
         # reading — a missing-temp METAR around peak hour is itself a
         # diagnostic clue.  Hourly-max only takes valid temp rows.
@@ -456,8 +582,9 @@ def fetch_nws_obs_with_raw(icao: str, tz_str: str
             "event_date":          today_local.isoformat(),
             "cycle_timestamp_utc": ts_str,
             "raw_message":         raw_msg,
-            "temp_c":              float(t_c) if t_c is not None else None,
-            "dewpoint_c":          float(dewc) if dewc is not None else None,
+            "temp_c":              precise_t_c,
+            "temp_precision":      precision,
+            "dewpoint_c":          precise_dew_c,
             "wind_dir_deg":        float(wd) if wd is not None else None,
             "wind_speed_mps":      float(ws) if ws is not None else None,
             "present_weather":     ",".join(p.get("rawString", "")
@@ -465,14 +592,14 @@ def fetch_nws_obs_with_raw(icao: str, tz_str: str
                                     if present_weather else None,
         })
 
-        if t_c is None:
+        if precise_t_c is None:
             continue
         h = ts_local.hour
         existing = by_hour.get(h)
-        if existing is None or t_c > existing["temp_c"]:
+        if existing is None or precise_t_c > existing["temp_c"]:
             by_hour[h] = {
                 "hour_local":    h,
-                "temp_c":        float(t_c),
+                "temp_c":        precise_t_c,
                 "wind_dir_deg":  float(wd) if wd is not None else None,
                 "timestamp_utc": ts_str,
             }
@@ -988,9 +1115,19 @@ def estimate_day_high_dist(forecast_high: float, forecast_peak_hour: int,
         and observed_peak_hour >= 0
         and day_has_likely_peaked):
         hours_since_obs_peak = current_hour - observed_peak_hour
-        if hours_since_obs_peak >= 1:
+        # FIX B (2026-06-12): trigger at hours_since >= 0, not >= 1.
+        # The hour-1 lag systematically misprices the window where the
+        # day has actually peaked but the bot hasn't recognized it yet —
+        # the Atlanta / NYC plateau cases.  At hours_since = 0, the
+        # geometric factor is 0.7^0 = 1.0 (no narrowing yet), so there's
+        # no behavior change in the instant of the peak itself.  But at
+        # h=0.5 (if scan timing produces fractional hours-since-peak via
+        # the local-hour rounding) and at the start of h=1, the narrowing
+        # now begins immediately rather than waiting a full clock-hour.
+        if hours_since_obs_peak >= 0:
             # Geometric narrowing: 0.7^h
-            #   1h → 0.70x, 2h → 0.49x, 3h → 0.34x, 4h+ → 0.24x (floor)
+            #   0h → 1.00x (no narrowing yet), 1h → 0.70x, 2h → 0.49x,
+            #   3h → 0.34x, 4h+ → 0.24x (floor)
             narrow = max(0.20, 0.7 ** hours_since_obs_peak)
             sigma *= narrow
             # And pull mu toward observed (since the longer it's been, the

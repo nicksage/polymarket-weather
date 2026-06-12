@@ -106,6 +106,15 @@ REQUIRED_NAMES: list[str] = [
     "DATA_QUALITY_SIZE_BLOCK",               # don't-trade tier
     "event_size_factor",                     # the actual sizing-application wiring
     "data_quality_blocked",                  # SKIP reason when size_factor=0
+
+    # --- raw_metar_log temp_precision column (T-group support) ---
+    "temp_precision",                        # column in raw_metar_log
+
+    # --- Pending-order race fix (NYC double position, Houston $74.99) ---
+    "def pending_contracts_today",           # set of contracts with placed orders
+    "def pending_stake_for_contract_today",  # $ sum of pending stakes per contract
+    "committed_contracts",                   # held + pending — for cap check
+    "committed_deployed",                    # actual + pending — for target math
 ]
 
 
