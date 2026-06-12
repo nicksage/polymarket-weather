@@ -59,7 +59,6 @@ from config      import DB_PATH  # type: ignore
 
 # Reuse the intraday predictor's plumbing instead of duplicating it
 from scripts.intraday_predictor import (  # type: ignore
-    fetch_nws_today_obs,
     fetch_nws_obs_with_raw,        # returns (hourly_max, raw_cycles) in one call
     fetch_nws_today_forecast,
     fetch_openmeteo_today,        # kept as fallback if NWS unreachable
@@ -105,6 +104,22 @@ HIGH_MKT_THRESHOLD   = float(os.getenv("PREDICTOR_HIGH_MKT_THRESHOLD", "0.75"))
 # the model is almost certainly wrong (consensus aggregates a lot of info).
 # Default 0.15 = blocks any bin the market deems <15% likely.
 MIN_MARKET_PROB = float(os.getenv("PREDICTOR_MIN_MARKET_PROB", "0.15"))
+
+# W4 — market-anchored risk cap.  Blowup-preventer for the case where a
+# liquid market disagrees with our model by a huge margin.  Reasoning:
+# our_p = 95% and mkt_p = 5% on a $25k-liquid market is almost certainly
+# either (a) a stale model price (we missed an NWS update / NBM cycle)
+# or (b) a bug.  Either way, we shouldn't bet the farm.  This veto
+# operates ENTIRELY at the gate layer — it never touches the edge
+# calc, so our_p stays clean and the diagnostic signal stays measurable.
+#
+# Disable by setting MARKET_DISAGREEMENT_LIQ_THRESHOLD=0 (any value of
+# liquidity will compare false to that gate) or
+# MARKET_DISAGREEMENT_PP_THRESHOLD=1.1 (no real edge ever exceeds 1.0).
+MARKET_DISAGREEMENT_LIQ_THRESHOLD = float(
+    os.getenv("PREDICTOR_MARKET_DISAGREEMENT_LIQ_THRESHOLD", "10000"))
+MARKET_DISAGREEMENT_PP_THRESHOLD  = float(
+    os.getenv("PREDICTOR_MARKET_DISAGREEMENT_PP_THRESHOLD", "0.40"))
 MIN_LIQUIDITY_USD    = float(os.getenv("PREDICTOR_MIN_LIQUIDITY", "300"))
 MIN_TRIGGER_HOUR     = int  (os.getenv("PREDICTOR_MIN_HOUR",     "13"))
 MAX_TRIGGER_HOUR     = int  (os.getenv("PREDICTOR_MAX_HOUR",     "22"))
@@ -330,6 +345,19 @@ def evaluate_gates(*, current_hour: int, edge: float, market_p: float,
     if edge < required_edge:
         return False, (f"low_edge ({edge:+.3f} < {required_edge:.2f}, "
                        f"mkt_p={market_p:.2f})")
+    # W4 — market-anchored risk cap.  On a LIQUID market, an extreme
+    # disagreement (>40pp by default) between our model and the market
+    # is more likely a stale-model / bug case than genuine edge.  Veto
+    # without affecting the edge calc — diagnostic signal stays clean.
+    # Operates AFTER the low_edge gate so it doesn't fire on normal
+    # small-edge buys; only the suspicious "huge edge on liquid book"
+    # case trips it.
+    if (liquidity >= MARKET_DISAGREEMENT_LIQ_THRESHOLD
+        and edge >= MARKET_DISAGREEMENT_PP_THRESHOLD):
+        return False, (f"liquid_market_strong_disagreement "
+                        f"(edge={edge:+.2f} >= {MARKET_DISAGREEMENT_PP_THRESHOLD:.2f}, "
+                        f"liq=${liquidity:.0f} >= "
+                        f"${MARKET_DISAGREEMENT_LIQ_THRESHOLD:.0f})")
     if market_p >= MAX_MARKET_PRICE:
         return False, f"priced_in (mkt={market_p:.3f} ≥ {MAX_MARKET_PRICE:.2f})"
     if liquidity < MIN_LIQUIDITY_USD:
@@ -1266,6 +1294,7 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                         "wind_octant":            wind_octant,
                         "upwind_signal_strength": nbr_signal.get("signal_strength"),
                         "market_closed":          1 if b.get("closed") else 0,
+                        "data_quality_flag":      pred.get("cdf_used"),
                     }
                     if not dry_run:
                         signal_id = write_signal(conn, sig_row)
@@ -1327,6 +1356,7 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                         "wind_octant":            wind_octant,
                         "upwind_signal_strength": nbr_signal.get("signal_strength"),
                         "market_closed":          1 if b.get("closed") else 0,
+                        "data_quality_flag":      pred.get("cdf_used"),
                     }
                     if not dry_run:
                         write_signal(conn, sig_row)

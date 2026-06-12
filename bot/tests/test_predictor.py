@@ -31,6 +31,9 @@ from scripts.intraday_predictor import (
     _cooling_via_forecast_tracking,
     _cooling_via_derivative,
     STRONG_COOLING_THRESHOLD,
+    probability_in_bin,
+    make_gaussian_cdf,
+    make_empirical_residual_cdf,
 )
 
 
@@ -265,6 +268,188 @@ def test_truncated_normal_bin_split_by_truncation():
     p = truncated_normal_prob(lo=28.0, hi=31.0, mu=30.0, sigma=1.0, truncate_at=29.0)
     # Bin straddles truncation — should get significant mass
     assert_range(p, 0.6, 1.0, msg="straddle bin gets most of upper mass")
+
+
+# ---------------------------------------------------------------------------
+# W2 Phase A — probability_in_bin equivalence with truncated_normal_prob
+# ---------------------------------------------------------------------------
+# Pure refactor: with cdf=make_gaussian_cdf(mu, sigma) and
+# truncate_at_hi=None, probability_in_bin must produce the SAME number as
+# truncated_normal_prob to floating-point noise.  This locks in that the
+# CDF-agnostic refactor is zero-diff before W2 B/C plug in new CDFs.
+
+def _equivalence_cases():
+    """Every interesting (lo, hi, mu, sigma, truncate_at) combination —
+    centered, open-low, open-high, straddle, below-trunc, above-trunc,
+    extreme sigma, etc."""
+    return [
+        # centered bin, no truncation
+        (29.5,  30.5, 30.0, 1.0, -100.0),
+        # 'or higher' open upper
+        (32.0,  None, 30.0, 1.0, -100.0),
+        # 'or below' open lower
+        (None,  28.0, 30.0, 1.0, -100.0),
+        # truncated to observed_max=29
+        (None,  28.0, 30.0, 1.0, 29.0),    # bin entirely below trunc → 0
+        (28.0,  31.0, 30.0, 1.0, 29.0),    # straddle bin
+        (29.5,  30.5, 30.0, 1.0, 29.0),    # bin starts at/above trunc
+        # large sigma
+        (29.5,  30.5, 30.0, 3.0, -100.0),
+        # tiny sigma
+        (29.5,  30.5, 30.0, 0.1, -100.0),
+        # truncation pushing distribution into degenerate mass
+        (35.0,  None, 30.0, 1.0, 34.0),    # 'or higher' with tight trunc
+        # asymmetric: bin shifted off mu
+        (33.0,  35.0, 30.0, 2.0, 28.0),
+        # negative-temp regime (US cold-month edge case)
+        (-3.0,  -1.0, -2.0, 1.5, -10.0),
+    ]
+
+
+def test_probability_in_bin_matches_truncated_normal_prob():
+    """Numerical equivalence — pure-refactor guarantee."""
+    for (lo, hi, mu, sigma, trunc) in _equivalence_cases():
+        old = truncated_normal_prob(lo, hi, mu, sigma, trunc)
+        new = probability_in_bin(lo, hi, make_gaussian_cdf(mu, sigma),
+                                  truncate_at_lo=trunc)
+        assert abs(old - new) < 1e-9, (
+            f"refactor mismatch: lo={lo} hi={hi} mu={mu} sigma={sigma} "
+            f"trunc={trunc}: old={old!r} new={new!r}"
+        )
+
+
+def test_probability_in_bin_normalizes_to_one_over_full_support():
+    """Sum of probabilities over a partition of the line equals 1."""
+    cdf = make_gaussian_cdf(mu=30.0, sigma=2.0)
+    # Partition: (-inf, 26], (26, 28], (28, 30], (30, 32], (32, 34], (34, +inf)
+    bins = [(None, 26.0), (26.0, 28.0), (28.0, 30.0),
+            (30.0, 32.0), (32.0, 34.0), (34.0, None)]
+    total = sum(probability_in_bin(lo, hi, cdf) for lo, hi in bins)
+    assert abs(total - 1.0) < 1e-9, f"partition sums to {total} not 1"
+
+
+def test_probability_in_bin_two_sided_truncation_normalizes():
+    """W3 prep: with both truncate_at_lo and truncate_at_hi set, the
+    probabilities over any partition of [lo, hi] still sum to 1."""
+    cdf = make_gaussian_cdf(mu=30.0, sigma=2.0)
+    # Truncate to [28, 33] — partition that range
+    trunc_lo, trunc_hi = 28.0, 33.0
+    bins = [(28.0, 29.0), (29.0, 30.5), (30.5, 31.5),
+            (31.5, 32.5), (32.5, 33.0)]
+    total = sum(probability_in_bin(lo, hi, cdf,
+                                     truncate_at_lo=trunc_lo,
+                                     truncate_at_hi=trunc_hi)
+                for lo, hi in bins)
+    assert abs(total - 1.0) < 1e-9, (
+        f"two-sided truncation: partition sums to {total} not 1"
+    )
+
+
+def test_probability_in_bin_upper_truncation_zeroes_above():
+    """Bin entirely above the upper-truncation cap gets zero mass."""
+    cdf = make_gaussian_cdf(mu=30.0, sigma=2.0)
+    # Cap day_high at 32; bin [33, 34] is entirely above the cap → 0
+    p = probability_in_bin(33.0, 34.0, cdf,
+                            truncate_at_lo=28.0, truncate_at_hi=32.0)
+    assert p == 0.0, f"bin above cap got mass {p}"
+
+
+def test_probability_in_bin_upper_truncation_contracts_upper_tail():
+    """W3 expected behavior: tighter upper truncation reduces upper-tail
+    bin probability — asymmetric contraction the wall-clock σ branch
+    can't produce."""
+    cdf = make_gaussian_cdf(mu=30.0, sigma=2.0)
+    # Bin [31, 33] with permissive upper trunc vs tight upper trunc
+    p_wide   = probability_in_bin(31.0, 33.0, cdf,
+                                    truncate_at_lo=28.0,
+                                    truncate_at_hi=35.0)
+    p_tight  = probability_in_bin(31.0, 33.0, cdf,
+                                    truncate_at_lo=28.0,
+                                    truncate_at_hi=33.0)
+    # Tighter upper bound means MORE mass concentrates in [31, 33] as a
+    # fraction of the (smaller) renormalized window
+    assert p_tight > p_wide, (
+        f"tighter upper truncation should concentrate mass: "
+        f"wide={p_wide:.4f} tight={p_tight:.4f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# W2 Phase C — empirical residual CDF
+# ---------------------------------------------------------------------------
+
+def test_empirical_residual_cdf_monotonic():
+    """CDF must be monotone non-decreasing — basic sanity."""
+    residuals = [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 3.5]
+    cdf = make_empirical_residual_cdf(center_temp_c=30.0,
+                                        centered_residuals=residuals)
+    vals = [cdf(t) for t in range(20, 40)]
+    for a, b in zip(vals, vals[1:]):
+        assert b >= a - 1e-9, f"CDF not monotone at sample: {a} → {b}"
+
+
+def test_empirical_residual_cdf_endpoints():
+    """Below the smallest implied day-high → 0, above the largest → 1."""
+    residuals = [-2.0, 0.0, 2.0]  # implies day-highs of 32, 30, 28 around center=30
+    cdf = make_empirical_residual_cdf(center_temp_c=30.0,
+                                        centered_residuals=residuals)
+    assert cdf(20.0) == 0.0
+    assert cdf(40.0) == 1.0
+
+
+def test_empirical_residual_cdf_asymmetric_input_preserved():
+    """Skewed input residuals must produce a skewed CDF.  This is what
+    the empirical path exists for — symmetric Gaussian can't represent
+    e.g. marine-layer upper ceilings."""
+    # Heavy LEFT tail (forecast often UNDERPREDICTS — observed > forecast)
+    # residuals = forecast - observed < 0 frequently
+    skewed_left = [-5.0, -4.0, -3.0, -2.5, -2.0, -1.0, 0.0, 1.0]
+    cdf = make_empirical_residual_cdf(center_temp_c=30.0,
+                                        centered_residuals=skewed_left)
+    # implied day-highs: [35, 34, 33, 32.5, 32, 31, 30, 29]
+    # so 50% mass should be ABOVE 30 (we're hot more often than not)
+    p_above_30 = 1.0 - cdf(30.0)
+    assert p_above_30 > 0.4, (
+        f"left-skewed residuals should put mass above center; got "
+        f"P(>30)={p_above_30:.3f}"
+    )
+
+
+def test_empirical_residual_cdf_scale_widens_distribution():
+    """The scale factor should multiplicatively widen the CDF — used by
+    predict_bins to inherit σ-narrowing from estimate_day_high_dist."""
+    residuals = [-1.0, 0.0, 1.0]
+    narrow = make_empirical_residual_cdf(30.0, residuals, scale=0.5)
+    wide   = make_empirical_residual_cdf(30.0, residuals, scale=2.0)
+    # Probability of being within ±0.5°C of center should be HIGHER for
+    # the narrow distribution
+    p_narrow_in_band = narrow(30.5) - narrow(29.5)
+    p_wide_in_band   = wide(30.5)   - wide(29.5)
+    assert p_narrow_in_band > p_wide_in_band, (
+        f"narrow scale should concentrate mass in the band: "
+        f"narrow={p_narrow_in_band:.3f} wide={p_wide_in_band:.3f}"
+    )
+
+
+def test_empirical_residual_cdf_empty_residuals_degenerate():
+    """No residuals → degenerate point distribution at center.  This is
+    the safe-fallback case (predict_bins guards on EMPIRICAL_MIN_SAMPLES
+    before even getting here, but defense in depth)."""
+    cdf = make_empirical_residual_cdf(center_temp_c=30.0,
+                                        centered_residuals=[])
+    assert cdf(29.9) == 0.0
+    assert cdf(30.1) == 1.0
+
+
+def test_empirical_cdf_partition_integrates_to_one_via_probability_in_bin():
+    """End-to-end: empirical CDF + probability_in_bin should integrate
+    over a partition to 1, same as the gaussian path."""
+    residuals = [-3.0, -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 3.0]
+    cdf = make_empirical_residual_cdf(30.0, residuals)
+    bins = [(None, 26.0), (26.0, 28.0), (28.0, 30.0),
+            (30.0, 32.0), (32.0, 34.0), (34.0, None)]
+    total = sum(probability_in_bin(lo, hi, cdf) for lo, hi in bins)
+    assert abs(total - 1.0) < 1e-9, f"partition sums to {total} not 1"
 
 
 # ---------------------------------------------------------------------------

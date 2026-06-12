@@ -129,6 +129,28 @@ def get_city_sigma(city: str) -> float:
     return float(s)
 
 
+# W2 Phase C — minimum residual count below which the empirical CDF is
+# too noisy to trust.  Below this, the gaussian path is used even when
+# PREDICTOR_CDF_IMPL=empirical.  Tuned conservatively — a 60-day window
+# typically yields ~50 usable days per city after gaps.
+EMPIRICAL_MIN_SAMPLES = int(os.getenv("PREDICTOR_EMPIRICAL_MIN_SAMPLES", "30"))
+
+
+def get_city_centered_residuals(city: str) -> list[float] | None:
+    """Return the sorted list of centered (mean-zero) forecast residuals
+    for this city, or None if not enough samples for the empirical CDF.
+    Centered residuals carry the SHAPE of forecast error — asymmetry, fat
+    tails — without re-encoding the per-station mean bias (that's handled
+    by station_bias upstream).  W2 Phase C consumer."""
+    entry = (_CALIBRATION.get("by_city") or {}).get(city)
+    if not entry:
+        return None
+    r = entry.get("centered_residuals")
+    if not isinstance(r, list) or len(r) < EMPIRICAL_MIN_SAMPLES:
+        return None
+    return [float(x) for x in r]
+
+
 def _load_station_bias() -> None:
     """Loaded once at script start.  Refresh via station_bias_calibration."""
     global _STATION_BIAS
@@ -169,7 +191,13 @@ def truncated_normal_prob(lo: float | None, hi: float | None,
                            mu: float, sigma: float,
                            truncate_at: float) -> float:
     """Probability that X falls in [lo, hi], given X ~ N(mu, sigma²) and
-    X >= truncate_at.  lo/hi can be None for open-ended intervals."""
+    X >= truncate_at.  lo/hi can be None for open-ended intervals.
+
+    Legacy interface — preserved for backtest scripts that import it
+    directly.  Internally the live predictor now uses probability_in_bin
+    (CDF-agnostic) so future distributions (NBM percentiles, empirical
+    residuals) can drop in without touching this code path.
+    """
     # Effective lower bound
     eff_lo = max(lo, truncate_at) if lo is not None else truncate_at
     if hi is not None and hi <= truncate_at:
@@ -188,6 +216,164 @@ def truncated_normal_prob(lo: float | None, hi: float | None,
     cdf_lo = normal_cdf(eff_lo, mu, sigma)
     cdf_hi = normal_cdf(hi, mu, sigma) if hi is not None else 1.0
     return max(0.0, (cdf_hi - cdf_lo) / Z)
+
+
+# ---------------------------------------------------------------------------
+# W2 Phase A — CDF-agnostic probability integrator
+# ---------------------------------------------------------------------------
+#
+# A "day-high CDF" is any callable that maps a temperature (°C) to
+# P(day_high <= temp).  Concrete implementations:
+#
+#   make_gaussian_cdf(mu, sigma)       — current behavior (W2 Phase A; in place)
+#   make_empirical_residual_cdf(...)   — W2 Phase C, fed from per-city
+#                                         historical (forecast - actual)
+#                                         residuals.  Asymmetric, fat tails.
+#   make_nbm_percentile_cdf(...)       — W2 Phase B, fed from NBM/ensemble
+#                                         percentile points if/when ingestion
+#                                         lands.
+#
+# probability_in_bin integrates any of these over a bin's [lo, hi] with
+# OPTIONAL two-sided truncation:
+#   truncate_at_lo  — day_high >= this (current: observed_max_so_far)
+#   truncate_at_hi  — day_high <= this (W3: physical ceiling estimate)
+#
+# When called with only truncate_at_lo, output matches truncated_normal_prob
+# numerically to <1e-10 for any gaussian CDF.  Pure refactor — verified by
+# tests added in test_predictor.py.
+
+from typing import Callable
+
+DayHighCDF = Callable[[float], float]
+
+
+def make_gaussian_cdf(mu: float, sigma: float) -> DayHighCDF:
+    """Drop-in CDF for the current Gaussian-day-high model.  W2 Phase A
+    default; future workstreams add make_empirical_residual_cdf /
+    make_nbm_percentile_cdf and dispatch via PREDICTOR_CDF_IMPL."""
+    safe_sigma = max(sigma, 1e-6)
+    return lambda t: normal_cdf(t, mu, safe_sigma)
+
+
+def make_empirical_residual_cdf(center_temp_c: float,
+                                  centered_residuals: list[float],
+                                  scale: float = 1.0) -> DayHighCDF:
+    """W2 Phase C — empirical day-high CDF built from per-city historical
+    forecast residuals.  Captures asymmetry and fat tails that a
+    symmetric Gaussian erases.
+
+    The distribution is constructed as:
+       implied_day_high_i = center_temp_c - (centered_residual_i * scale)
+
+    center_temp_c: bias-corrected forecast high (output of upstream mu
+       adjustments — observations, ensemble blending, cooling).
+    centered_residuals: sorted, mean-zero per-city residual list from
+       data/forecast_calibration.json.  Mean is ~0 by construction; the
+       station bias is already applied upstream so we don't double-count.
+    scale: multiplicative width factor.  Default 1.0 = use the empirical
+       distribution as-is.  Pass `sigma / base_sigma_c` to inherit the
+       wall-clock contraction that estimate_day_high_dist applies — keeps
+       the empirical SHAPE while still narrowing late-day.
+
+    Returns a CDF callable that linearly interpolates between sorted
+    sample points.  O(log n) per query.
+    """
+    if not centered_residuals:
+        # Degenerate point distribution — falls back to "all mass at center".
+        return lambda t: 0.0 if t < center_temp_c else 1.0
+
+    safe_scale = max(scale, 1e-6)
+    samples = sorted(center_temp_c - r * safe_scale
+                      for r in centered_residuals)
+    n = len(samples)
+
+    def _cdf(t: float) -> float:
+        if t <= samples[0]:
+            return 0.0
+        if t >= samples[-1]:
+            return 1.0
+        # Binary search: largest index where samples[idx] <= t
+        lo, hi = 0, n - 1
+        while lo + 1 < hi:
+            mid = (lo + hi) // 2
+            if samples[mid] <= t:
+                lo = mid
+            else:
+                hi = mid
+        x0, x1 = samples[lo], samples[hi]
+        if x1 == x0:
+            return (lo + 1) / n
+        frac = (t - x0) / (x1 - x0)
+        return (lo + frac) / n
+    return _cdf
+
+
+def probability_in_bin(bin_lo_c: float | None, bin_hi_c: float | None,
+                         cdf: DayHighCDF,
+                         truncate_at_lo: float | None = None,
+                         truncate_at_hi: float | None = None) -> float:
+    """P(day_high in [bin_lo_c, bin_hi_c]) given two-sided truncation.
+
+    - bin_lo_c=None means the bin extends to -infinity ("X or below").
+    - bin_hi_c=None means the bin extends to +infinity ("X or higher").
+    - truncate_at_lo, if set, asserts day_high >= truncate_at_lo
+      (e.g., the temperature we've already observed today).
+    - truncate_at_hi, if set, asserts day_high <= truncate_at_hi
+      (e.g., the W3 physical-ceiling estimate from remaining solar /
+      sky state).  Currently always None — set to None preserves the
+      pre-W3 one-sided-truncation behavior exactly.
+
+    Numerical guarantee: with cdf=make_gaussian_cdf(mu, sigma) and
+    truncate_at_hi=None, this returns the SAME value as
+    truncated_normal_prob(bin_lo_c, bin_hi_c, mu, sigma, truncate_at_lo)
+    to within floating-point noise.
+    """
+    # Clip bin to effective truncation range
+    eff_lo = bin_lo_c
+    if truncate_at_lo is not None:
+        eff_lo = (max(eff_lo, truncate_at_lo) if eff_lo is not None
+                   else truncate_at_lo)
+    eff_hi = bin_hi_c
+    if truncate_at_hi is not None:
+        eff_hi = (min(eff_hi, truncate_at_hi) if eff_hi is not None
+                   else truncate_at_hi)
+
+    # Bin entirely outside truncation window → zero
+    if (truncate_at_lo is not None and bin_hi_c is not None
+        and bin_hi_c <= truncate_at_lo):
+        return 0.0
+    if (truncate_at_hi is not None and bin_lo_c is not None
+        and bin_lo_c >= truncate_at_hi):
+        return 0.0
+    # Bin clipped down to empty range
+    if (eff_lo is not None and eff_hi is not None
+        and eff_lo >= eff_hi):
+        return 0.0
+
+    # Normalization Z = P(day_high in [truncate_at_lo, truncate_at_hi])
+    Z_lo = cdf(truncate_at_lo) if truncate_at_lo is not None else 0.0
+    Z_hi = cdf(truncate_at_hi) if truncate_at_hi is not None else 1.0
+    Z = Z_hi - Z_lo
+
+    if Z <= 1e-12:
+        # Degenerate: distribution gives essentially zero mass to the
+        # truncated range.  Matches truncated_normal_prob's fallback:
+        # the "or higher" bin catches the residual; otherwise lo<=ref<hi.
+        if bin_hi_c is None:
+            return 1.0
+        ref = truncate_at_lo if truncate_at_lo is not None else (Z_lo + Z_hi) / 2
+        if bin_lo_c is not None and bin_lo_c <= ref < bin_hi_c:
+            return 1.0
+        return 0.0
+
+    p_lo = cdf(eff_lo) if eff_lo is not None else 0.0
+    p_hi = cdf(eff_hi) if eff_hi is not None else 1.0
+    return max(0.0, (p_hi - p_lo) / Z)
+
+
+# Dispatch knob.  W2 Phase A ships with only "gaussian" wired.  Phase C
+# will register "empirical"; Phase B will register "nbm" (if pursued).
+PREDICTOR_CDF_IMPL = os.getenv("PREDICTOR_CDF_IMPL", "gaussian").lower()
 
 
 # ---------------------------------------------------------------------------
@@ -983,10 +1169,45 @@ def predict_bins(event: dict, settlement_obs: list[dict],
                     f"mu={mu:.2f}C sigma={sigma:.2f}C trunc={truncate_at:.2f}C"
                 )
 
+    # Construct the day-high CDF once per event.  Dispatch lets future
+    # workstreams plug in empirical / NBM CDFs without changing the bin
+    # loop.  Phase A: gaussian.  Phase C: empirical residual.
+    cdf_choice = PREDICTOR_CDF_IMPL
+    cdf_used   = "gaussian"   # what we actually fell back to (for diagnostics)
+    if cdf_choice == "empirical":
+        residuals = get_city_centered_residuals(city) if city else None
+        if residuals:
+            # Scale the empirical width by sigma/base_sigma so the
+            # late-day wall-clock narrowing from estimate_day_high_dist
+            # carries through.  base_sigma was computed earlier in this
+            # function (see above) — using the same value as the
+            # gaussian path's starting sigma.
+            scale = (sigma / base_sigma) if base_sigma > 0 else 1.0
+            day_high_cdf = make_empirical_residual_cdf(mu, residuals, scale=scale)
+            cdf_used = "empirical"
+        else:
+            # Insufficient samples or no calibration entry — fall back
+            # rather than ship a bad distribution.  W3's data-quality
+            # flag (paper_predictor_signals.data_quality_flag) will
+            # eventually carry this fact to the dashboard.
+            day_high_cdf = make_gaussian_cdf(mu, sigma)
+    elif cdf_choice == "gaussian":
+        day_high_cdf = make_gaussian_cdf(mu, sigma)
+    else:
+        log.warning(f"unknown PREDICTOR_CDF_IMPL={cdf_choice!r}, "
+                     f"falling back to gaussian")
+        day_high_cdf = make_gaussian_cdf(mu, sigma)
+
     bin_results = []
     for b in bins:
         c_lo, c_hi = bin_temp_range(b)
-        p = truncated_normal_prob(c_lo, c_hi, mu, sigma, truncate_at)
+        # Pre-W3: only the observed_max-derived lower truncation.  W3
+        # will add truncate_at_hi from the physical-ceiling model.
+        p = probability_in_bin(
+            c_lo, c_hi, day_high_cdf,
+            truncate_at_lo=truncate_at,
+            truncate_at_hi=None,
+        )
         market_p = float(b.get("yes_price") or 0)
         edge = p - market_p
         bin_results.append({
@@ -1011,6 +1232,7 @@ def predict_bins(event: dict, settlement_obs: list[dict],
         "bins":               bin_results,
         "mu":                 round(mu, 2),
         "sigma":              round(sigma, 2),
+        "cdf_used":           cdf_used,           # "gaussian" | "empirical"
         "cooling_confidence": round(cooling_confidence, 3),
         "cooling_reason":     cooling_reason,
         "bin_locked":         bin_locked,

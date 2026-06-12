@@ -191,12 +191,24 @@ def calibrate_city(city: str, start: str, end: str) -> dict | None:
         key=lambda x: -abs(x[3]),
     )[:3]
 
+    # === W2 Phase C — centered residuals for empirical-CDF construction ===
+    # The per-day residuals (forecast - observed), mean-subtracted so the
+    # shape captures asymmetry / fat tails WITHOUT re-encoding the mean
+    # bias (which is already handled by station_bias_calibration upstream
+    # of the predictor).  Sorted ascending for fast CDF interpolation.
+    bias_val = stats.get("bias")
+    if residuals and bias_val is not None:
+        centered = sorted(round(r - bias_val, 3) for r in residuals)
+    else:
+        centered = []
+
     return {
         "city":     city,
         "station":  icao,
         "tz":       tz,
         **stats,
         "sigma":    round(sigma, 3),
+        "centered_residuals": centered,
         "worst_days": [
             {"date": d, "forecast": round(f, 2), "observed": round(o, 2),
              "residual": round(r, 2)} for d, f, o, r in worst
@@ -284,6 +296,14 @@ def main() -> int:
                                   if k not in ("city", "worst_days")}
                       for r in results if r.get("n", 0) > 0},
     }
+    # Diagnostic: how many cities have enough samples for the W2 Phase C
+    # empirical CDF.  Below the threshold the predictor falls back to
+    # the gaussian path even when PREDICTOR_CDF_IMPL=empirical.
+    EMPIRICAL_MIN = 30
+    enough = sum(1 for c in out_data["by_city"].values()
+                  if len(c.get("centered_residuals") or []) >= EMPIRICAL_MIN)
+    print(f"  Empirical CDF eligible: {enough}/{len(out_data['by_city'])} cities "
+           f"have >= {EMPIRICAL_MIN} centered residuals")
     with open(args.output, "w", encoding="utf-8") as fh:
         json.dump(out_data, fh, indent=2)
     print()
