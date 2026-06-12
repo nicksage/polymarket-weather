@@ -122,6 +122,35 @@ MARKET_DISAGREEMENT_LIQ_THRESHOLD = float(
 MARKET_DISAGREEMENT_PP_THRESHOLD  = float(
     os.getenv("PREDICTOR_MARKET_DISAGREEMENT_PP_THRESHOLD", "0.40"))
 
+# Cold-start detection (data-quality contract).  If the first scan of a
+# city's day is at or after this local hour, NWS /forecastHourly may
+# have returned only evening cooling periods on that very first fetch —
+# the recovery helper has no higher prior value to draw on, so
+# forecast_high_c for that city today may be the evening cooling curve,
+# not the actual day's high.  Per the contract, these rows get
+# `cold_start_suspect` appended to their data_quality_flag, which the
+# sizing multiplier picks up to apply a haircut (default 0.30).
+COLD_START_PEAK_HOUR_LOCAL = int(
+    os.getenv("PREDICTOR_COLD_START_PEAK_HOUR_LOCAL", "14"))
+
+# Sizing scalar multipliers per data-quality flag — see
+# docs/data_quality_contract.md.  Relative tiers all at 1.00 (no
+# informational haircut today because no PRIMARY tier exists yet),
+# absolute-trustability tiers at 0.30 (uncalibrated cities, cold-start
+# suspects), block tier at 0.00.
+DATA_QUALITY_SIZE_PRIMARY                = float(
+    os.getenv("PREDICTOR_DQ_SIZE_PRIMARY", "1.00"))
+DATA_QUALITY_SIZE_EMPIRICAL              = float(
+    os.getenv("PREDICTOR_DQ_SIZE_EMPIRICAL", "1.00"))
+DATA_QUALITY_SIZE_GAUSSIAN               = float(
+    os.getenv("PREDICTOR_DQ_SIZE_GAUSSIAN", "1.00"))
+DATA_QUALITY_SIZE_GAUSSIAN_DEFAULT_SIGMA = float(
+    os.getenv("PREDICTOR_DQ_SIZE_GAUSSIAN_DEFAULT_SIGMA", "0.30"))
+DATA_QUALITY_SIZE_COLD_START_SUSPECT     = float(
+    os.getenv("PREDICTOR_DQ_SIZE_COLD_START_SUSPECT", "0.30"))
+DATA_QUALITY_SIZE_BLOCK                  = float(
+    os.getenv("PREDICTOR_DQ_SIZE_BLOCK", "0.00"))
+
 MIN_LIQUIDITY_USD    = float(os.getenv("PREDICTOR_MIN_LIQUIDITY", "300"))
 MIN_TRIGGER_HOUR     = int  (os.getenv("PREDICTOR_MIN_HOUR",     "13"))
 MAX_TRIGGER_HOUR     = int  (os.getenv("PREDICTOR_MAX_HOUR",     "22"))
@@ -591,8 +620,24 @@ def deployed_today_usd(conn, mode: str) -> float:
 
 
 def deployed_today_for_contract(conn, mode: str, contract_id: str) -> float:
-    """Sum of stakes for THIS contract today.  Used by the per-contract
-    daily ceiling to prevent runaway scaling via repeated topups."""
+    """DEPRECATED — do NOT use for per-contract cap decisions or any
+    other "how much have we deployed?" question.
+
+    This function sums `recommended_stake_usd` across today's LIVE_BUY
+    rows for the given contract.  That count includes orders that
+    NEVER FILLED — limit orders that the market moved past, cancelled
+    attempts, etc.  Using it for the per-contract daily cap caused a
+    bug on Dallas 2026-06-12: $6.68 actually deployed on Polymarket,
+    $15 of signal-row intent in the DB, cap blocked legitimate topups.
+
+    The right source of truth for "how much $ is in this contract" is
+    `get_actual_deployed_usd()`, which reads cost basis from the
+    Polymarket positions API.
+
+    Kept callable for any historical reporting that genuinely wants the
+    "sum of attempted-stake intent" — but flag that intent at the call
+    site, don't pretend it's deployed capital.
+    """
     today = _today_utc_date_str()
     row = conn.execute(
         """
@@ -638,6 +683,85 @@ def write_live_order(conn, row: dict) -> None:
         [row[c] for c in cols],
     )
     conn.commit()
+
+
+def is_cold_start_day(conn, city: str, event_date: str, tz_str: str,
+                        candidate_scan_at_utc: str) -> bool:
+    """True if the first scan of (city, event_date) is at or after
+    COLD_START_PEAK_HOUR_LOCAL in local time.
+
+    A cold-start day's first NWS fetch may have caught only the evening
+    cooling curve.  Subsequent scans inherit the buggy forecast_high
+    via the recovery helper (since there's no higher prior to recover
+    from), so cold_start_suspect is a per-DAY label not a per-scan one.
+
+    The candidate_scan_at_utc parameter is used when no prior scans
+    exist for this (city, event_date) — we treat THIS scan as the
+    candidate "first scan" so a single late-day cold-start scan still
+    gets correctly flagged.
+    """
+    from zoneinfo import ZoneInfo
+    row = conn.execute(
+        """SELECT MIN(scanned_at_utc) FROM paper_predictor_signals
+           WHERE city = ? AND event_date = ?""",
+        (city, event_date),
+    ).fetchone()
+    first_scan_at_utc = row[0] if row else None
+    if not first_scan_at_utc:
+        first_scan_at_utc = candidate_scan_at_utc
+    try:
+        tz = ZoneInfo(tz_str)
+        first_t = datetime.fromisoformat(
+            first_scan_at_utc.replace("Z", "+00:00"))
+        first_hour_local = first_t.astimezone(tz).hour
+    except (ValueError, KeyError, AttributeError):
+        return False
+    return first_hour_local >= COLD_START_PEAK_HOUR_LOCAL
+
+
+# Lookup table for sizing-scalar computation.  Stored as module-level so
+# tests can override (e.g. monkeypatching DATA_QUALITY_SIZE_GAUSSIAN to
+# verify the haircut path).  Recomputed at call time, not memoized, so
+# env-var overrides take effect immediately.
+def _dq_size_by_flag() -> dict[str, float]:
+    return {
+        "primary":                  DATA_QUALITY_SIZE_PRIMARY,
+        "empirical":                DATA_QUALITY_SIZE_EMPIRICAL,
+        "gaussian":                 DATA_QUALITY_SIZE_GAUSSIAN,
+        "gaussian_default_sigma":   DATA_QUALITY_SIZE_GAUSSIAN_DEFAULT_SIGMA,
+        "cold_start_suspect":       DATA_QUALITY_SIZE_COLD_START_SUSPECT,
+        "block":                    DATA_QUALITY_SIZE_BLOCK,
+    }
+
+
+def compute_data_quality_size_factor(flag_str: str | None) -> float:
+    """Return the most conservative size multiplier across all flag
+    components in flag_str.
+
+    flag_str is a comma-separated list of flag values, each optionally
+    suffixed with ":reason" (e.g. "primary_fallback:stale_11h").  We
+    split on commas, strip the optional reason suffix, look up each
+    base flag, and return the minimum factor — composable haircuts.
+
+    Unknown flags don't contribute (treated as 1.00 — neutral).  Empty
+    or None flag → 1.00.
+
+    Examples:
+       compute_data_quality_size_factor(None)               → 1.00
+       compute_data_quality_size_factor("gaussian")         → 1.00 (today)
+       compute_data_quality_size_factor("cold_start_suspect") → 0.30
+       compute_data_quality_size_factor("gaussian,cold_start_suspect") → 0.30
+       compute_data_quality_size_factor("primary_fallback:stale_11h,empirical") → 1.00
+    """
+    if not flag_str:
+        return 1.00
+    table = _dq_size_by_flag()
+    factors: list[float] = []
+    for component in flag_str.split(","):
+        base = component.strip().split(":")[0]   # drop ":reason" suffix
+        if base in table:
+            factors.append(table[base])
+    return min(factors) if factors else 1.00
 
 
 def recover_persisted_day_forecast(conn, city: str, event_date: str,
@@ -1184,6 +1308,25 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                 if not pred.get("bins"):
                     continue
 
+                # Compose the data-quality flag for every signal row we
+                # write this event.  Starts with the CDF path that produced
+                # our_prob (e.g. "gaussian"), appends "cold_start_suspect"
+                # if today's first scan for this city was at or after the
+                # climatological peak hour — see data-quality contract.
+                _dq_components: list[str] = []
+                if pred.get("cdf_used"):
+                    _dq_components.append(pred["cdf_used"])
+                try:
+                    if is_cold_start_day(conn, city, today_str_local, tz_str,
+                                           scan_start.isoformat()):
+                        _dq_components.append("cold_start_suspect")
+                except Exception as e:
+                    log.warning(f"cold-start detection failed for {city}: {e}")
+                event_data_quality_flag = (
+                    ",".join(_dq_components) if _dq_components else None)
+                event_size_factor = compute_data_quality_size_factor(
+                    event_data_quality_flag)
+
                 # SIGNAL 3: MARKET_OPEN per bin — Gamma's `closed` flag.
                 # Build a contract→open map so we can answer both
                 # "is this bin tradeable as a fresh buy?" and
@@ -1260,19 +1403,25 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                     )
                     remaining_to_target = max(0.0, target_stake - actual_deployed)
 
-                    # Per-contract daily $ ceiling.  Independent of
-                    # actual_deployed (which can drift with price moves
-                    # via cost basis).  Once we've staked MAX_PER_CONTRACT_USD
-                    # of fresh capital into this contract TODAY (across
-                    # initial + all topups recorded in the DB), no more
-                    # capital flows in until tomorrow.
+                    # Per-contract daily $ ceiling.  Anchored to ACTUAL
+                    # cost basis on Polymarket (actual_deployed), not to
+                    # the sum of signal-row intents.  Earlier versions
+                    # summed `recommended_stake_usd` across all today's
+                    # LIVE_BUY rows for this contract, which counted
+                    # unfilled orders against the cap — a volatile market
+                    # producing unfilled topup attempts would block
+                    # legitimate target completion, the opposite of the
+                    # safety property we want.
+                    #
+                    # actual_deployed comes from the Polymarket positions
+                    # API (`get_actual_deployed_usd` above): size × avg
+                    # of what's actually held.  If you sold a fraction of
+                    # the position mid-day, that reduces actual_deployed
+                    # and frees cap headroom — also the right behavior.
                     contract_ceiling_remaining = None
                     if MAX_PER_CONTRACT_USD > 0:
-                        spent_today_here = deployed_today_for_contract(
-                            conn, PREDICTOR_MODE, contract_id,
-                        )
                         contract_ceiling_remaining = max(
-                            0.0, MAX_PER_CONTRACT_USD - spent_today_here,
+                            0.0, MAX_PER_CONTRACT_USD - actual_deployed,
                         )
                         remaining_to_target = min(
                             remaining_to_target, contract_ceiling_remaining,
@@ -1301,7 +1450,7 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                         if contract_ceiling_hit:
                             ok = False
                             reason = (f"per_contract_daily_cap "
-                                      f"(spent=${MAX_PER_CONTRACT_USD - (contract_ceiling_remaining or 0):.2f} "
+                                      f"(deployed=${actual_deployed:.2f} "
                                       f"/ cap=${MAX_PER_CONTRACT_USD:.2f})")
                         else:
                             ok = False
@@ -1338,7 +1487,28 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                         # Stake for THIS order = remaining_to_target.
                         # Initial buy: == target.  Topup: == what's left to fill.
                         stake = remaining_to_target
-                        if stake < MIN_STAKE_USD:
+                        # Data-quality sizing scalar — applied AFTER Kelly
+                        # but BEFORE the MIN_STAKE_USD floor.  See
+                        # docs/data_quality_contract.md.  Today, the
+                        # relative tiers (gaussian / empirical) are all at
+                        # 1.00; the only haircut that actually fires is
+                        # cold_start_suspect at 0.30 (and BLOCK at 0.00).
+                        if event_size_factor < 1.0:
+                            stake_pre_dq = stake
+                            stake = stake * event_size_factor
+                            if event_size_factor <= 0.0:
+                                ok = False
+                                reason = (f"data_quality_blocked "
+                                          f"(flag={event_data_quality_flag!r}, "
+                                          f"size_factor=0.00)")
+                            else:
+                                log.info(
+                                    f"  data-quality haircut: {city} {b['label']} "
+                                    f"${stake_pre_dq:.2f} → ${stake:.2f} "
+                                    f"(flag={event_data_quality_flag!r}, "
+                                    f"×{event_size_factor:.2f})"
+                                )
+                        if ok and stake < MIN_STAKE_USD:
                             ok = False
                             reason = f"stake_too_small (${stake:.2f} < ${MIN_STAKE_USD:.2f})"
 
@@ -1397,7 +1567,7 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                         "wind_octant":            wind_octant,
                         "upwind_signal_strength": nbr_signal.get("signal_strength"),
                         "market_closed":          1 if b.get("closed") else 0,
-                        "data_quality_flag":      pred.get("cdf_used"),
+                        "data_quality_flag":      event_data_quality_flag,
                         "cooling_confidence":     pred.get("cooling_confidence"),
                     }
                     if not dry_run:
@@ -1460,7 +1630,7 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                         "wind_octant":            wind_octant,
                         "upwind_signal_strength": nbr_signal.get("signal_strength"),
                         "market_closed":          1 if b.get("closed") else 0,
-                        "data_quality_flag":      pred.get("cdf_used"),
+                        "data_quality_flag":      event_data_quality_flag,
                         "cooling_confidence":     pred.get("cooling_confidence"),
                     }
                     if not dry_run:

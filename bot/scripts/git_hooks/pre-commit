@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Pre-commit hook — runs deploy_safety_check.py to catch silent
+# regressions in scheduled_predictor.py before they leave the
+# developer's machine.
+#
+# Installed by: python bot/scripts/install_hooks.py
+# Source:       bot/scripts/git_hooks/pre-commit
+#
+# This file lives in the working tree (versioned) so it can be updated
+# with normal commits.  install_hooks.py copies it into .git/hooks/
+# where Git actually looks for it.  Re-run install_hooks.py after any
+# change to this file.
+
+set -e
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+
+# Use python from the venv if present, otherwise fall back to system python.
+if [ -x "$REPO_ROOT/venv/bin/python" ]; then
+    PY="$REPO_ROOT/venv/bin/python"
+elif [ -x "$REPO_ROOT/.venv/bin/python" ]; then
+    PY="$REPO_ROOT/.venv/bin/python"
+elif [ -x "$REPO_ROOT/.venv/Scripts/python.exe" ]; then
+    PY="$REPO_ROOT/.venv/Scripts/python.exe"   # Windows
+else
+    PY="python"
+fi
+
+"$PY" "$REPO_ROOT/bot/scripts/deploy_safety_check.py"
