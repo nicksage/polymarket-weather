@@ -605,6 +605,53 @@ def write_live_order(conn, row: dict) -> None:
     conn.commit()
 
 
+def recover_persisted_day_forecast(conn, city: str, event_date: str,
+                                      candidate_high_c: float,
+                                      candidate_peak_hour: int | None,
+                                      ) -> tuple[float, int | None]:
+    """Defend against the NWS `/forecastHourly` evening-scan bug.
+
+    NWS hourly only returns periods from "now" forward.  By late
+    afternoon, "today's" remaining periods describe the evening cooling
+    curve, not the day's actual high.  A late-day fetch therefore stores
+    artificially-low forecast_high_c values — the column ratchets DOWN
+    through the afternoon (verified against SF 2026-06-11: 28.33°C from
+    07:04 UTC stable through 23:06 UTC, then declining to 17.22°C by
+    23:24 UTC = 16:24 PDT, tracking the cooling curve exactly).
+
+    Fix: if a PRIOR scan for this (city, event_date) recorded a higher
+    forecast_high_c, use that.  Works as long as at least one earlier
+    scan ran while the hourly endpoint still contained the day's peak
+    periods.
+
+    Cold-start days where no morning scan ran cannot be recovered —
+    those rows must be filtered at calibration time (indicator: a
+    settled day where bot's observed_max_c ended up higher than its
+    own forecast_high_c by > 2°C).
+
+    Does NOT punish the Open-Meteo fallback path: Open-Meteo's
+    forecast_days=1 returns the full local day from midnight, so its
+    candidate_high_c is already correct.  Helper takes max(persisted,
+    candidate) so an accurate Open-Meteo candidate beats any stale
+    persisted value.
+    """
+    row = conn.execute(
+        """SELECT forecast_high_c, forecast_peak_hour
+           FROM paper_predictor_signals
+           WHERE city = ? AND event_date = ? AND forecast_high_c IS NOT NULL
+           ORDER BY forecast_high_c DESC LIMIT 1""",
+        (city, event_date),
+    ).fetchone()
+    if not row:
+        return candidate_high_c, candidate_peak_hour
+    prev_high = row[0] if not hasattr(row, "keys") else row["forecast_high_c"]
+    prev_peak = row[1] if not hasattr(row, "keys") else row["forecast_peak_hour"]
+    if prev_high is not None and prev_high > candidate_high_c:
+        recovered_peak = int(prev_peak) if prev_peak is not None else candidate_peak_hour
+        return float(prev_high), recovered_peak
+    return candidate_high_c, candidate_peak_hour
+
+
 def persist_raw_metar_cycles(conn, raw_cycles: list[dict]) -> int:
     """Insert raw METAR cycles into raw_metar_log.  Idempotent — the
     UNIQUE(icao, cycle_timestamp_utc) constraint means re-running this
@@ -982,6 +1029,27 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                     forecast = fetch_openmeteo_today(lat, lon, tz_str)
                 if not forecast:
                     continue
+                # Defend forecast_high against the NWS hourly evening-scan
+                # bug.  See recover_persisted_day_forecast docstring.  Done
+                # BEFORE the cache write so every subsequent cache hit
+                # within this day inherits the recovered value.
+                try:
+                    recovered_high, recovered_peak = recover_persisted_day_forecast(
+                        conn, city, today_str_local,
+                        candidate_high_c   = float(forecast["forecast_high"]),
+                        candidate_peak_hour= forecast.get("forecast_peak_hour"),
+                    )
+                    if recovered_high > forecast["forecast_high"] + 0.01:
+                        log.info(
+                            f"forecast_high recovered for {city}: "
+                            f"{forecast['forecast_high']:.2f}°C → {recovered_high:.2f}°C "
+                            f"(NWS hourly evening-scan bug)"
+                        )
+                    forecast["forecast_high"] = recovered_high
+                    if recovered_peak is not None:
+                        forecast["forecast_peak_hour"] = recovered_peak
+                except Exception as e:
+                    log.warning(f"forecast_high recovery failed for {city}: {e}")
                 afternoon_winds = [r["wind_dir_deg"] for r in nws_obs
                                     if r["hour_local"] in range(11, 19)
                                     and r["wind_dir_deg"] is not None]
