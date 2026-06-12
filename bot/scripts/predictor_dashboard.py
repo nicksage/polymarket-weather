@@ -126,7 +126,7 @@ def load_signals(db: str, since_utc: datetime) -> list[dict]:
         "bin_range_low, our_prob, market_prob, edge, liquidity_usd, "
         "action, gate_blocked_by, recommended_stake_usd, "
         "observed_max_c, observed_peak_hour, forecast_high_c, "
-        "forecast_peak_hour, wind_octant"
+        "forecast_peak_hour, wind_octant, market_closed"
     )
 
     with sqlite3.connect(db) as conn:
@@ -360,12 +360,18 @@ table.bins td.action .pill { display: inline-block; padding: 1px 6px;
                               border-radius: 10px; font-size: 9px; font-weight: 700; }
 .pill.PAPER_BUY { background: #22c55e; color: white; }
 .pill.LIVE_BUY  { background: #f59e0b; color: white; }
+.pill.RESOLVED  { background: #475569; color: #e2e8f0; }
 .pill.idle      { background: #334155; color: #94a3b8; }
 .pnl.pos { color: #4ade80; font-weight: 700; }
 .pnl.neg { color: #f87171; font-weight: 700; }
+.resolved-count { color: #94a3b8; font-size: 11px; margin-left: 4px; }
 
 table.bins tr.bought { background: rgba(34, 197, 94, 0.08); }
 table.bins tr.bought.live { background: rgba(245, 158, 11, 0.10); }
+table.bins tr.bought.resolved {
+  background: rgba(71, 85, 105, 0.18); color: #cbd5e1;
+}
+table.bins tr.bought.resolved .pnl { opacity: 0.85; }
 table.bins tr.top-p { box-shadow: inset 3px 0 0 #fbbf24; }
 
 .city-empty { padding: 24px; text-align: center; color: #64748b; font-size: 12px;
@@ -560,6 +566,10 @@ const CITIES = {cities_json};
 // Index live positions by asset (token_id) for O(1) lookup when computing
 // LIVE-trade P&L.  Rebuilt on every silent-refresh via recomputeDerived().
 let LIVE_POS_BY_TOKEN = {{}};
+// Per-contract market-open state.  {{contract_id: {{ts, open}}}}, rebuilt
+// every recompute from the freshest signal row's market_closed flag.
+// Authoritative for "is this market still tradeable?"
+let MARKET_OPEN_BY_CONTRACT = {{}};
 const REFRESH_SEC = {refresh_sec_js};
 const $ = id => document.getElementById(id);
 
@@ -607,30 +617,22 @@ function todayUtcStr() {{
 
 function recomputeDerived() {{
   if (!SELECTED_DATE) SELECTED_DATE = todayUtcStr();
-  // Rebuild the live-positions lookup table (keyed by token_id).
-  // Filter out DUST positions — those where the position's current
-  // value (size × curPrice) is below a meaningful dollar threshold.
-  // Polymarket's API returns ALL positions with size > 0.01 shares,
-  // including resolved-to-zero markets (where shares remain but
-  // curPrice ≈ 0).  Without this filter, the dashboard treats every
-  // historical losing bet as a "still-active position" and slaps a
-  // LIVE pill on it.
+  // === Three-signal position model (mirrors scheduled_predictor.py) ===
   //
-  // Threshold logic: keep if EITHER current value OR avgPrice × size
-  // (the cost basis) exceeds $0.50.  This keeps Miami ($5 value)
-  // visible while dropping dust (cents).
-  // Position validity filter — same as the bot side.  A position is
-  // tradeable only if cur > 0.005 (market still has price) AND
-  // current_value >= $0.50.  Resolved-to-zero positions (cur ≈ 0) and
-  // sub-50¢ positions are dropped so they don't show LIVE pills.
+  // LIVE_POS_BY_TOKEN — every token the wallet currently holds.
+  //   NO value/dust filter.  Resolved-to-zero positions ARE kept here.
+  //   This answers "did a fill happen?" not "is this active?"
+  //
+  // Whether a held position is rendered as LIVE vs RESOLVED is decided
+  // PER-BIN by the signal row's `market_closed` flag (Gamma's
+  // authoritative market resolution state at scan time), NOT by the
+  // position's $-value.  See _resolveBuyState() below.
   LIVE_POS_BY_TOKEN = {{}};
   for (const p of (LIVE_POSITIONS || [])) {{
     const tok = p.asset || p.token_id || p.tokenId;
     if (!tok) continue;
     const size = parseFloat(p.size ?? 0);
-    const cur  = parseFloat(p.curPrice ?? p.cur_price ?? 0);
-    const current_value = size * cur;
-    if (size <= 0 || cur < 0.005 || current_value < 0.50) continue;
+    if (size <= 0) continue;
     LIVE_POS_BY_TOKEN[String(tok)] = p;
   }}
   // CHANGED: filter by event_date (the resolution day of the Polymarket
@@ -650,6 +652,20 @@ function recomputeDerived() {{
     ? DATE_SIGNALS.reduce((m, s) => s.scanned_at_utc > m ? s.scanned_at_utc : m,
                           DATE_SIGNALS[0].scanned_at_utc)
     : "";
+
+  // MARKET_OPEN_BY_CONTRACT — Gamma's per-bin resolution state as of the
+  // latest scan we have for it.  Authoritative source for "is this
+  // market still tradeable?"  Read from the signal row's market_closed
+  // column (written by scheduled_predictor every scan).
+  MARKET_OPEN_BY_CONTRACT = {{}};
+  for (const s of DATE_SIGNALS) {{
+    if (!s.contract_id) continue;
+    const prev = MARKET_OPEN_BY_CONTRACT[s.contract_id];
+    if (!prev || s.scanned_at_utc > prev.ts) {{
+      MARKET_OPEN_BY_CONTRACT[s.contract_id] =
+        {{ ts: s.scanned_at_utc, open: !s.market_closed }};
+    }}
+  }}
 }}
 recomputeDerived();
 
@@ -739,31 +755,26 @@ function buildCitySnapshot(cityMeta) {{
       let entry_price = null, stake_usd = null, pnl_usd = null;
       let pnl_source = null;     // 'api' (Polymarket) or 'formula' (paper)
       let active_buy = null;     // the BUY to display (null = no pill shown)
+      let buy_state = "stale";    // "live" | "resolved" | "stale"
       if (buy) {{
+        // Three-state resolution via the shared helper.  No more $-value
+        // heuristics — the bot's `market_closed` flag drives "is this
+        // still live?" and the wallet position list drives "did we
+        // actually fill?"
+        buy_state = _resolveBuyState(buy);
         const livePos = (buy.action === 'LIVE_BUY' && r.yes_token_id)
                           ? LIVE_POS_BY_TOKEN[String(r.yes_token_id)]
                           : null;
 
-        // ACTIVE-POSITION GATE: a LIVE_BUY is only "active" (displayed
-        // as a position) if Polymarket API confirms it.  Without that
-        // confirmation, the position was closed/failed/cancelled and
-        // shouldn't show as deployed capital.
-        //
-        // Use truthy check (not `!== null`): map lookup returns `undefined`
-        // when the token isn't in the API response, and `undefined !== null`
-        // is `true` in JS strict mode — which would WRONGLY mark missing
-        // positions as active.  Truthy check covers both null and undefined.
-        const isLiveActive  = buy.action === 'LIVE_BUY' && Boolean(livePos);
-        const isPaperActive = buy.action === 'PAPER_BUY';
-        const isActive = isLiveActive || isPaperActive;
-
-        if (isActive) {{
+        if (buy_state === "live" || buy_state === "resolved") {{
           active_buy = buy;
           stake_usd = buy.recommended_stake_usd || 0;
 
           if (livePos) {{
-            // LIVE with current position → use Polymarket's authoritative
-            // numbers (actual size × avgPrice, real cashPnl).
+            // LIVE_BUY with a wallet position (live OR resolved) → use
+            // Polymarket's authoritative numbers (size × avgPrice, real
+            // cashPnl).  For resolved positions, cashPnl reflects the
+            // FINAL P&L since cur_price has settled to 1.0 or 0.0.
             const livSize = parseFloat(livePos.size ?? 0);
             const livAvg  = parseFloat(livePos.avgPrice ?? livePos.avg_price ?? 0);
             if (livSize > 0 && livAvg > 0) {{
@@ -783,7 +794,7 @@ function buildCitySnapshot(cityMeta) {{
               pnl_source = 'api';
             }}
           }} else {{
-            // PAPER mode — use formula
+            // PAPER_BUY — use formula
             entry_price = buy.market_prob;
             if (entry_price > 0) {{
               pnl_usd = stake_usd * ((r.market_prob / entry_price) - 1);
@@ -791,9 +802,9 @@ function buildCitySnapshot(cityMeta) {{
             }}
           }}
         }} else {{
-          // LIVE_BUY signal exists but Polymarket has no current position.
-          // Position was closed/failed/cancelled — don't display as active.
-          // (Trades view still shows full history.)
+          // "stale" — LIVE_BUY signal exists but no wallet position.
+          // Order failed/cancelled/never filled.  Don't render as a
+          // position; trades view shows the attempt for forensics.
           stake_usd = 0;
           entry_price = null;
           pnl_usd = null;
@@ -804,8 +815,9 @@ function buildCitySnapshot(cityMeta) {{
         our_prob:     r.our_prob,
         market_prob:  r.market_prob,
         edge:         r.edge,
-        // action is null for closed/failed LIVE buys (no pill displayed)
+        // action is null for stale LIVE buys (no pill displayed)
         action:       active_buy ? active_buy.action : null,
+        buy_state:    buy_state,     // "live" | "resolved" | "stale"
         entry_price:  entry_price,
         stake_usd:    stake_usd,
         pnl_usd:      pnl_usd,
@@ -818,9 +830,15 @@ function buildCitySnapshot(cityMeta) {{
       event_id:      eg.event_id,
       event_date:    eg.event_date,
       bins:          bins,
-      nBuys:         bins.filter(b => b.action).length,
-      nLiveBuys:     bins.filter(b => b.action === "LIVE_BUY").length,
-      totalDeployed: bins.reduce((s, b) => s + (b.stake_usd || 0), 0),
+      // Count "live" only.  Resolved positions are shown in the panel
+      // (so the user can see the final P&L) but they don't occupy a
+      // slot or count toward "active BUYs."
+      nBuys:         bins.filter(b => b.buy_state === "live").length,
+      nLiveBuys:     bins.filter(b => b.action === "LIVE_BUY"
+                                       && b.buy_state === "live").length,
+      nResolved:     bins.filter(b => b.buy_state === "resolved").length,
+      totalDeployed: bins.filter(b => b.buy_state === "live")
+                          .reduce((s, b) => s + (b.stake_usd || 0), 0),
       totalPnl:      bins.reduce((s, b) => s + (b.pnl_usd || 0), 0),
     }};
   }});
@@ -842,24 +860,48 @@ function buildCitySnapshot(cityMeta) {{
     windOctant:       anyRow.wind_octant,
     nBuys:            events.reduce((s, e) => s + e.nBuys, 0),
     nLiveBuys:        events.reduce((s, e) => s + e.nLiveBuys, 0),
+    nResolved:        events.reduce((s, e) => s + (e.nResolved || 0), 0),
     totalDeployed:    events.reduce((s, e) => s + e.totalDeployed, 0),
     totalPnl:         events.reduce((s, e) => s + e.totalPnl, 0),
   }};
 }}
 
 // ===== KPI rendering =====
-// Returns true if a BUY signal row represents a CURRENTLY-ACTIVE position.
-//   - PAPER_BUY → always active (paper "fills" are persistent in DB)
-//   - LIVE_BUY  → active only if Polymarket API confirms the token
-//                  is still held (i.e., not closed/failed/cancelled)
-function _isActiveBuy(s) {{
-  if (!s) return false;
-  if (s.action === "PAPER_BUY") return true;
-  if (s.action === "LIVE_BUY") {{
-    return s.yes_token_id
-        && LIVE_POS_BY_TOKEN[String(s.yes_token_id)] != null;
+// Resolve a BUY signal row to one of three explicit states.  These are
+// the SAME three signals the bot uses internally — keeping them
+// separated here means the dashboard never has to use a $-value proxy
+// to decide "is this real?"
+//
+//   "live"     → held + market still open.  Show LIVE pill, count in KPI.
+//   "resolved" → held + market settled.  Show RESOLVED badge, exclude
+//                  from "live BUYs" KPI but show in trades history with
+//                  final P&L.
+//   "stale"    → not held at all (failed/cancelled/never filled).
+//                  Don't render as a position; the LIVE order log still
+//                  has the attempt for forensics.
+function _resolveBuyState(s) {{
+  if (!s) return "stale";
+  if (s.action === "PAPER_BUY") {{
+    // Paper buys "fill" by writing the DB row.  Market still has to be
+    // open for them to count as live (paper trading a closed market is
+    // meaningless).  Use the latest known per-contract market_closed
+    // flag; if we have no signal row for this contract yet, assume open.
+    const mo = MARKET_OPEN_BY_CONTRACT[s.contract_id];
+    return (!mo || mo.open) ? "live" : "resolved";
   }}
-  return false;
+  if (s.action === "LIVE_BUY") {{
+    const held = s.yes_token_id
+              && LIVE_POS_BY_TOKEN[String(s.yes_token_id)] != null;
+    if (!held) return "stale";
+    const mo = MARKET_OPEN_BY_CONTRACT[s.contract_id];
+    return (!mo || mo.open) ? "live" : "resolved";
+  }}
+  return "stale";
+}}
+function _isActiveBuy(s) {{
+  // "Active" = countable in the live-BUYs KPI.  Resolved positions are
+  // no longer countable (the market is settled, the bet is over).
+  return _resolveBuyState(s) === "live";
 }}
 
 // Returns actual deployed $ for a single BUY row (API for live, signal for paper).
@@ -876,15 +918,19 @@ function _actualDeployedForBuy(s) {{
   return s.recommended_stake_usd || 0;
 }}
 
-// Reduce DATE_SIGNALS to one active BUY row PER CONTRACT.  A single
-// position can produce many LIVE_BUY rows (original purchase + multiple
-// topups), but the user has only one position per contract — so the KPI
-// "n BUYs" and the trades view should count contracts, not rows.  Keeps
-// the most-recent active row per contract.
-function _uniqueActiveBuys(signals) {{
+// Reduce DATE_SIGNALS to one BUY row PER CONTRACT, filtered by buy state.
+// A single position can produce many LIVE_BUY rows (original purchase
+// + multiple topups), but the user has only one position per contract.
+//
+//   acceptStates: set of "live" | "resolved" | "stale" to include.
+//     - KPI "live BUYs"     → {{"live"}}
+//     - Trades view         → {{"live", "resolved"}}   (show final P&L)
+//     - Forensics (future)  → {{"live", "resolved", "stale"}}
+function _uniqueBuysByState(signals, acceptStates) {{
   const latestByContract = {{}};
   for (const s of signals) {{
-    if (!matchesBuyMode(s) || !_isActiveBuy(s)) continue;
+    if (!matchesBuyMode(s)) continue;
+    if (!acceptStates.has(_resolveBuyState(s))) continue;
     const k = s.contract_id;
     if (!latestByContract[k]
         || (s.scanned_at_utc || "") > (latestByContract[k].scanned_at_utc || "")) {{
@@ -892,6 +938,12 @@ function _uniqueActiveBuys(signals) {{
     }}
   }}
   return Object.values(latestByContract);
+}}
+function _uniqueActiveBuys(signals) {{
+  return _uniqueBuysByState(signals, new Set(["live"]));
+}}
+function _uniqueHeldBuys(signals) {{
+  return _uniqueBuysByState(signals, new Set(["live", "resolved"]));
 }}
 
 function renderKPIs() {{
@@ -949,15 +1001,23 @@ function cToF(c) {{ return c * 9/5 + 32; }}
 function renderBinRow(b) {{
   const edgeClass = b.edge >= 0 ? "edge pos" : "edge neg";
   const edgeStr = (b.edge >= 0 ? "+" : "") + (b.edge*100).toFixed(1) + "%";
-  const action = b.action
-    ? `<span class="pill ${{b.action}}">${{b.action === 'LIVE_BUY' ? 'LIVE' : 'PAPER'}}</span>`
-    : '<span class="pill idle">—</span>';
+  // Action pill: LIVE / PAPER for active positions, RESOLVED for held
+  // positions whose market has settled, dash for idle bins.
+  let action;
+  if (b.buy_state === "resolved") {{
+    action = `<span class="pill RESOLVED" title="Market has settled — final P&L">RESOLVED</span>`;
+  }} else if (b.action) {{
+    action = `<span class="pill ${{b.action}}">${{b.action === 'LIVE_BUY' ? 'LIVE' : 'PAPER'}}</span>`;
+  }} else {{
+    action = '<span class="pill idle">—</span>';
+  }}
   const entry = b.entry_price !== null ? '$' + b.entry_price.toFixed(3) : '';
   const pnl = b.pnl_usd !== null
     ? `<span class="pnl ${{b.pnl_usd >= 0 ? 'pos' : 'neg'}}" title="${{b.pnl_source === 'api' ? 'from Polymarket API' : 'paper formula: stake × (current/entry − 1)'}}">${{b.pnl_usd >= 0 ? '+' : ''}}$${{b.pnl_usd.toFixed(2)}}${{b.pnl_source === 'api' ? '<sup style="font-size:8px;opacity:0.7">API</sup>' : ''}}</span>`
     : '';
   let rowCls = '';
-  if (b.action === 'LIVE_BUY') rowCls = 'bought live';
+  if (b.buy_state === "resolved") rowCls = 'bought resolved';
+  else if (b.action === 'LIVE_BUY') rowCls = 'bought live';
   else if (b.action === 'PAPER_BUY') rowCls = 'bought';
   if (b.is_top_p) rowCls += ' top-p';
   return `<tr class="${{rowCls}}">
@@ -1046,6 +1106,7 @@ function renderCityPanel(snap) {{
       <div>Forecast high: <span class="v">${{fcstDisplay}}</span></div>
       <div>Events: <span class="v">${{snap.eventCount}}</span></div>
       <div>Position(s): <span class="v">${{snap.nBuys || 0}}</span>
+        ${{snap.nResolved > 0 ? '<span class="resolved-count" title="positions whose market has settled">+ ' + snap.nResolved + ' resolved</span>' : ''}}
         ${{snap.totalDeployed > 0 ? '· $' + snap.totalDeployed.toFixed(2) + ' deployed' : ''}}
         ${{snap.totalPnl !== 0 ? '· P&L <span class="' + (snap.totalPnl >= 0 ? 'pnl pos' : 'pnl neg') + '">' + (snap.totalPnl >= 0 ? '+' : '') + '$' + snap.totalPnl.toFixed(2) + '</span>' : ''}}
       </div>
@@ -1177,10 +1238,12 @@ document.querySelectorAll("th").forEach(th => {{
 let TRADES_SORT_KEY = "scanned_at_utc", TRADES_SORT_DIR = -1;
 
 function buildTradesData() {{
-  // Active BUY rows in the current date range, deduped to one per
-  // contract (the bot writes a fresh LIVE_BUY row per topup, but the
-  // trades view should reflect one row per held position).
-  const buys = _uniqueActiveBuys(DATE_SIGNALS);
+  // HELD positions in the current date range, deduped to one per
+  // contract.  Includes both live AND resolved positions so the user
+  // can see final P&L on settled markets.  Stale BUY rows
+  // (placed/cancelled/never filled) are excluded — they're forensics,
+  // not trades.
+  const buys = _uniqueHeldBuys(DATE_SIGNALS);
   // Latest known market price per contract (any scan in this date)
   const latestByContract = {{}};
   for (const s of DATE_SIGNALS) {{
@@ -1220,6 +1283,7 @@ function buildTradesData() {{
       station:        b.settlement_station,
       bin_label:      b.bin_label,
       action:         b.action,
+      buy_state:      _resolveBuyState(b),
       entry_price:    entry,
       current_price:  cur,
       stake:          stake,
@@ -1240,11 +1304,17 @@ function tradeRow(t, addCityBreak) {{
   const pnlCls = t.pnl_usd >= 0 ? "pos" : "neg";
   const pnlSign = t.pnl_usd >= 0 ? "+" : "";
   let cls = modeCls + (addCityBreak ? " city-break" : "");
+  if (t.buy_state === "resolved") cls += " resolved";
+  // Show RESOLVED badge alongside the LIVE/PAPER label so the user can
+  // tell at a glance which trades have settled vs. which are still moving.
+  const stateBadge = t.buy_state === "resolved"
+    ? ` <span class="pill RESOLVED" title="Market has settled">RESOLVED</span>`
+    : "";
   return `<tr class="${{cls}}">
     <td class="tstamp">${{(t.scanned_at_utc || "").slice(0,16).replace("T"," ")}}</td>
     <td><b>${{t.city}}</b><br><span style="color:#64748b;font-size:10px">${{t.station || ""}}</span></td>
     <td><b>${{t.bin_label || ""}}</b></td>
-    <td><span class="pill ${{modeCls}}">${{modeLabel}}</span></td>
+    <td><span class="pill ${{modeCls}}">${{modeLabel}}</span>${{stateBadge}}</td>
     <td class="num">$${{t.entry_price.toFixed(3)}}</td>
     <td class="num">$${{t.current_price.toFixed(3)}}</td>
     <td class="num">$${{t.stake.toFixed(2)}}</td>

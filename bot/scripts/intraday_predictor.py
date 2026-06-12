@@ -197,11 +197,32 @@ def truncated_normal_prob(lo: float | None, hi: float | None,
 def fetch_nws_today_obs(icao: str, tz_str: str) -> list[dict]:
     """Return list of {hour_local, temp_c, wind_dir_deg, timestamp_utc} for
     today's observations from the given US airport station.  Uses the NWS
-    public API — same NOAA METAR feed Wunderground reads."""
+    public API — same NOAA METAR feed Wunderground reads.
+
+    Thin wrapper around fetch_nws_obs_with_raw — keeps the existing
+    signature stable so backtest scripts and tests don't break, while
+    the scan loop opts into the richer two-value return.
+    """
+    hourly, _raw = fetch_nws_obs_with_raw(icao, tz_str)
+    return hourly
+
+
+def fetch_nws_obs_with_raw(icao: str, tz_str: str
+                              ) -> tuple[list[dict], list[dict]]:
+    """Same as fetch_nws_today_obs, plus raw cycles.  Returns:
+       (hourly_max, raw_cycles)
+       hourly_max:  what the predictor consumes (one row per local hour, max temp)
+       raw_cycles:  every observation returned by NWS, preserving the rawMessage
+                    METAR text.  Used by the scan loop to populate
+                    `raw_metar_log` so future audits can diagnose
+                    settle_divergence cases from the raw obs, not just
+                    the parsed max.
+
+    Single HTTP call shared between the two outputs.
+    """
     tz = ZoneInfo(tz_str)
     now_local = datetime.now(tz)
     today_local = now_local.date()
-    # Start at local midnight, convert to UTC for the API
     start_local = datetime.combine(today_local, datetime.min.time(), tzinfo=tz)
     start_utc = start_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -213,19 +234,25 @@ def fetch_nws_today_obs(icao: str, tz_str: str) -> list[dict]:
         features = r.json().get("features", [])
     except Exception as e:
         log.warning(f"NWS fetch failed for {icao}: {e}")
-        return []
+        return [], []
 
-    # Group by local hour, keeping the MAX temp per hour (matches our
-    # max-per-hour fix in station_obs_pull)
     by_hour: dict[int, dict] = {}
+    raw_cycles: list[dict] = []
     for f in features:
         props = f.get("properties") or {}
         ts_str = props.get("timestamp")
         temp_obj = props.get("temperature") or {}
         wind_obj = props.get("windDirection") or {}
-        t_c = temp_obj.get("value")
-        wd  = wind_obj.get("value")
-        if not ts_str or t_c is None:
+        ws_obj   = props.get("windSpeed")   or {}
+        dew_obj  = props.get("dewpoint")    or {}
+        t_c  = temp_obj.get("value")
+        wd   = wind_obj.get("value")
+        ws   = ws_obj.get("value")
+        dewc = dew_obj.get("value")
+        present_weather = props.get("presentWeather") or []
+        raw_msg = props.get("rawMessage")
+
+        if not ts_str:
             continue
         try:
             ts_utc = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
@@ -233,6 +260,26 @@ def fetch_nws_today_obs(icao: str, tz_str: str) -> list[dict]:
             continue
         ts_local = ts_utc.astimezone(tz)
         if ts_local.date() != today_local:
+            continue
+
+        # Persist EVERY cycle to raw, even those without a temperature
+        # reading — a missing-temp METAR around peak hour is itself a
+        # diagnostic clue.  Hourly-max only takes valid temp rows.
+        raw_cycles.append({
+            "icao":                icao,
+            "event_date":          today_local.isoformat(),
+            "cycle_timestamp_utc": ts_str,
+            "raw_message":         raw_msg,
+            "temp_c":              float(t_c) if t_c is not None else None,
+            "dewpoint_c":          float(dewc) if dewc is not None else None,
+            "wind_dir_deg":        float(wd) if wd is not None else None,
+            "wind_speed_mps":      float(ws) if ws is not None else None,
+            "present_weather":     ",".join(p.get("rawString", "")
+                                              for p in present_weather)
+                                    if present_weather else None,
+        })
+
+        if t_c is None:
             continue
         h = ts_local.hour
         existing = by_hour.get(h)
@@ -243,7 +290,8 @@ def fetch_nws_today_obs(icao: str, tz_str: str) -> list[dict]:
                 "wind_dir_deg":  float(wd) if wd is not None else None,
                 "timestamp_utc": ts_str,
             }
-    return sorted(by_hour.values(), key=lambda r: r["hour_local"])
+    hourly = sorted(by_hour.values(), key=lambda r: r["hour_local"])
+    return hourly, raw_cycles
 
 
 # ---------------------------------------------------------------------------
@@ -954,6 +1002,10 @@ def predict_bins(event: dict, settlement_obs: list[dict],
             "market_prob":   round(market_p, 4),
             "edge":          round(edge, 4),
             "liquidity_usd": round(float(b.get("liquidity_usd") or 0), 0),
+            # Per-bin market resolution flag (True = market has settled).
+            # Lets the scan loop and dashboard answer "is this market still
+            # tradeable?" without inferring it from position value.
+            "closed":        bool(b.get("closed", False)),
         })
     return {
         "bins":               bin_results,

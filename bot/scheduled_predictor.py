@@ -60,6 +60,7 @@ from config      import DB_PATH  # type: ignore
 # Reuse the intraday predictor's plumbing instead of duplicating it
 from scripts.intraday_predictor import (  # type: ignore
     fetch_nws_today_obs,
+    fetch_nws_obs_with_raw,        # returns (hourly_max, raw_cycles) in one call
     fetch_nws_today_forecast,
     fetch_openmeteo_today,        # kept as fallback if NWS unreachable
     compute_neighbor_signal,
@@ -121,6 +122,12 @@ SCAN_INTERVAL_MIN    = int  (os.getenv("PREDICTOR_SCAN_MIN",     "15"))
 # TOPUP_MIN_USD: don't bother attempting topup orders smaller than this.
 TOPUP_TOLERANCE_PCT  = float(os.getenv("PREDICTOR_TOPUP_TOLERANCE_PCT", "0.05"))
 TOPUP_MIN_USD        = float(os.getenv("PREDICTOR_TOPUP_MIN_USD",       "1.50"))
+# Per-contract daily $ ceiling.  Belt-and-suspenders against runaway
+# topups when target_stake re-computes higher each scan against an
+# updating cost basis.  No single contract gets more than this many $
+# of fresh capital today, regardless of what target_stake says.
+# Disable with 0.
+MAX_PER_CONTRACT_USD = float(os.getenv("PREDICTOR_MAX_PER_CONTRACT_USD", "15.00"))
 # Weather cache TTL — NWS forecast + observation calls cached for this
 # many seconds.  Polymarket prices are always refreshed every scan; only
 # weather data is cached.  Default: 300s (5 min).  Combined with
@@ -169,7 +176,12 @@ CREATE TABLE IF NOT EXISTS paper_predictor_signals (
     mu_c                REAL,
     sigma_c             REAL,
     wind_octant         TEXT,
-    upwind_signal_strength REAL
+    upwind_signal_strength REAL,
+    -- Gamma's per-bin resolution state at scan time.  1 = market has
+    -- settled (sub-market closed); 0 = still tradeable.  Used by the
+    -- dashboard to distinguish RESOLVED held positions from LIVE ones
+    -- without inferring market state from position $-value.
+    market_closed       INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_pps_city_date
     ON paper_predictor_signals(city, event_date);
@@ -198,12 +210,59 @@ CREATE TABLE IF NOT EXISTS live_predictor_orders (
 );
 CREATE INDEX IF NOT EXISTS idx_lpo_placed
     ON live_predictor_orders(placed_at_utc);
+
+-- Raw METAR persistence.  Captures every NWS observation cycle as it
+-- comes in (rawMessage + parsed fields), one row per (icao, cycle).
+-- Cheap forward-path evidence: when a settle_divergence case surfaces
+-- weeks later, the original METAR strings around peak hour are
+-- recoverable here instead of having to reconstruct from Iowa State.
+-- Idempotent insert via UNIQUE — same cycle pulled multiple times in
+-- a scan window is a no-op.
+CREATE TABLE IF NOT EXISTS raw_metar_log (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    icao                 TEXT NOT NULL,
+    event_date           TEXT NOT NULL,
+    cycle_timestamp_utc  TEXT NOT NULL,
+    raw_message          TEXT,
+    temp_c               REAL,
+    dewpoint_c           REAL,
+    wind_dir_deg         REAL,
+    wind_speed_mps       REAL,
+    present_weather      TEXT,
+    persisted_at_utc     TEXT NOT NULL,
+    UNIQUE(icao, cycle_timestamp_utc)
+);
+CREATE INDEX IF NOT EXISTS idx_rml_icao_date
+    ON raw_metar_log(icao, event_date);
 """
 
 
 def ensure_schema() -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.executescript(_SCHEMA_SQL)
+        # === Live-running migrations ===
+        # Schemas above use CREATE TABLE IF NOT EXISTS, so columns added
+        # after the table first existed need explicit ALTERs.  Each block
+        # is idempotent — the OperationalError is swallowed if the column
+        # already exists.
+        def _add_column(table: str, col: str, type_sql: str) -> None:
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {type_sql}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
+        # market_closed: per-bin Gamma resolution state at scan time.
+        # Lets the dashboard show a RESOLVED badge for held tokens whose
+        # underlying market has settled (instead of inferring "is this
+        # market open?" from a $-value dust filter on positions).
+        _add_column("paper_predictor_signals", "market_closed", "INTEGER DEFAULT 0")
+        # data_quality_flag: reserved for W2 distribution rewrite.  Will
+        # carry one of {primary, empirical_fallback, gaussian_fallback}
+        # indicating which probability path produced our_prob for this
+        # row.  Defaults to NULL until W2 ships.  Created now so audits
+        # and dashboards can query it without a downstream migration.
+        _add_column("paper_predictor_signals", "data_quality_flag", "TEXT")
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -363,12 +422,23 @@ def _get_proxy_address() -> str | None:
 def fetch_polymarket_positions_by_token() -> dict[str, dict] | None:
     """Returns {token_id: {size, avg_price, deployed_usdc, cur_price, cash_pnl}}.
 
-    Used in the scan loop to determine actual deployed capital per
-    contract — driving topup decisions and dedup checks (live mode).
+    NO VALUE FILTER.  Returns EVERY token with size > 0 that the wallet
+    holds, including resolved-to-zero positions.  This is the raw
+    "what does our wallet hold?" signal used to build the three derived
+    signals downstream:
+
+      HELD_TOKENS:         set of token_ids in this dict
+                           → "have I bought this contract?"  (dedup, cap)
+      DEPLOYED_BY_TOKEN:   size * avg_price per token
+                           → "how much cost basis is deployed?"  (topup)
+      MARKET_OPEN per bin: comes from Gamma's `closed` flag at scan time,
+                           NOT from this dict
+                           → "is this position still tradeable?" (display
+                              + abort fresh-buy gate)
+
     Return value semantics (important for callers):
-      * dict (possibly EMPTY {}) — API call succeeded.  Empty = we have
-        zero open positions.  Callers should TRUST this (no positions =
-        no positions, slots are open for re-buy).
+      * dict (possibly EMPTY {}) — API call succeeded.  Empty = wallet
+        holds zero tokens.  Callers should TRUST this.
       * None — API call FAILED (network, missing creds).  Callers should
         fall back to DB-derived sums conservatively.
     """
@@ -386,7 +456,6 @@ def fetch_polymarket_positions_by_token() -> dict[str, dict] | None:
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.load(resp)
         out: dict[str, dict] = {}
-        n_dust = 0
         for p in data:
             token = p.get("asset") or p.get("token_id") or p.get("tokenId")
             if not token:
@@ -396,21 +465,6 @@ def fetch_polymarket_positions_by_token() -> dict[str, dict] | None:
             cur  = float(p.get("curPrice") or p.get("cur_price") or 0)
             if size <= 0 or avg <= 0:
                 continue
-            # POSITION-VALIDITY FILTER.  Polymarket's data API returns
-            # positions for any token the wallet holds — including:
-            #   - dust positions with sub-cent current value
-            #   - resolved-to-zero positions (market closed, cur≈0)
-            # Both should be treated as "we no longer hold this for
-            # trading purposes" so they don't block fresh buys via the
-            # at_target gate.
-            #
-            # A position is VALID (tradeable) only when all true:
-            #   1. cur > 0.005   — market is still tradeable (>0.5¢)
-            #   2. size * cur >= 0.50  — current value is meaningful
-            current_value = size * cur
-            if cur < 0.005 or current_value < 0.50:
-                n_dust += 1
-                continue
             out[str(token)] = {
                 "size":          size,
                 "avg_price":     avg,
@@ -418,8 +472,8 @@ def fetch_polymarket_positions_by_token() -> dict[str, dict] | None:
                 "cur_price":     cur,
                 "cash_pnl":      float(p.get("cashPnl") or p.get("cash_pnl") or 0),
             }
-        log.info(f"Polymarket positions: {len(out)} live positions fetched"
-                  f"{f' (+ {n_dust} dust/resolved filtered)' if n_dust else ''}")
+        log.info(f"Polymarket positions: {len(out)} held tokens fetched "
+                  f"(no value filter; market_open is decided per-bin from Gamma)")
         return out
     except Exception as e:
         log.warning(f"Polymarket positions API failed: {e} — topup falls back to DB")
@@ -473,6 +527,21 @@ def deployed_today_usd(conn, mode: str) -> float:
     return float(row[0]) if row else 0.0
 
 
+def deployed_today_for_contract(conn, mode: str, contract_id: str) -> float:
+    """Sum of stakes for THIS contract today.  Used by the per-contract
+    daily ceiling to prevent runaway scaling via repeated topups."""
+    today = _today_utc_date_str()
+    row = conn.execute(
+        """
+        SELECT COALESCE(SUM(recommended_stake_usd), 0) FROM paper_predictor_signals
+        WHERE action = ? AND substr(scanned_at_utc, 1, 10) = ?
+              AND contract_id = ?
+        """,
+        (_action_for_mode(mode), today, contract_id),
+    ).fetchone()
+    return float(row[0]) if row else 0.0
+
+
 def trades_today(conn, mode: str) -> int:
     """Count of today's buys IN THIS MODE only."""
     today = _today_utc_date_str()
@@ -506,6 +575,39 @@ def write_live_order(conn, row: dict) -> None:
         [row[c] for c in cols],
     )
     conn.commit()
+
+
+def persist_raw_metar_cycles(conn, raw_cycles: list[dict]) -> int:
+    """Insert raw METAR cycles into raw_metar_log.  Idempotent — the
+    UNIQUE(icao, cycle_timestamp_utc) constraint means re-running this
+    on the same cycles is a no-op.  Returns count of NEW rows inserted.
+
+    Cheap forward-path evidence: when W1 needs to investigate a
+    settle_divergence tuple, the raw METAR around peak hour for that
+    (icao, date) is here.  Persisting now even though W0 hasn't run
+    yet — evidence accumulates from this commit on, retroactive
+    recovery is via Iowa State for the audit window only.
+    """
+    if not raw_cycles:
+        return 0
+    now_iso = datetime.now(timezone.utc).isoformat()
+    inserted = 0
+    for c in raw_cycles:
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO raw_metar_log
+                 (icao, event_date, cycle_timestamp_utc, raw_message,
+                  temp_c, dewpoint_c, wind_dir_deg, wind_speed_mps,
+                  present_weather, persisted_at_utc)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (c.get("icao"), c.get("event_date"), c.get("cycle_timestamp_utc"),
+             c.get("raw_message"),
+             c.get("temp_c"), c.get("dewpoint_c"),
+             c.get("wind_dir_deg"), c.get("wind_speed_mps"),
+             c.get("present_weather"), now_iso),
+        )
+        inserted += cur.rowcount or 0
+    conn.commit()
+    return inserted
 
 
 # ---------------------------------------------------------------------------
@@ -614,6 +716,99 @@ def execute_live(conn, signal_id: int, city: str, ev: dict, b: dict,
 
 
 # ---------------------------------------------------------------------------
+# Order reconciliation — ask the CLOB about resting orders and
+# update their status to filled/cancelled.  Runs at the start of each
+# scan (before placing new orders) so the topup math uses an accurate
+# view of what's actually filled.
+# ---------------------------------------------------------------------------
+
+# How far back to look for orders to reconcile.  Older orders that are
+# still 'placed' get marked as 'stale' so they stop blocking topups.
+RECONCILE_LOOKBACK_HOURS = int(os.getenv("RECONCILE_LOOKBACK_HOURS", "12"))
+
+def reconcile_pending_orders(conn: sqlite3.Connection) -> dict:
+    """Sweep `live_predictor_orders` rows where status='placed' and ask
+    the CLOB for definitive resolution.  Updates each row to one of:
+       - filled    : order fully matched (size_matched >= original_size)
+       - cancelled : order was cancelled/expired
+       - stale     : couldn't determine after RECONCILE_LOOKBACK_HOURS
+       - placed    : still resting (unchanged)
+    Returns a summary dict for the scan log.
+    """
+    from datetime import datetime as _dt, timezone as _tz, timedelta
+    summary = {"checked": 0, "filled": 0, "cancelled": 0,
+               "stale": 0, "still_placed": 0, "errors": 0}
+
+    cutoff = (_dt.now(_tz.utc) - timedelta(hours=RECONCILE_LOOKBACK_HOURS))\
+              .isoformat()
+    rows = conn.execute(
+        """SELECT id, order_id, placed_at_utc, city, bin_label
+           FROM live_predictor_orders
+           WHERE status = 'placed'
+             AND order_id IS NOT NULL AND order_id != ''
+             AND placed_at_utc >= ?""",
+        (cutoff,),
+    ).fetchall()
+    if not rows:
+        return summary
+
+    client = _get_live_client()
+    if client is None:
+        log.debug("reconcile: no CLOB client, skipping")
+        return summary
+
+    try:
+        from execution import (get_order_status, is_order_fully_filled,
+                                 is_order_cancelled)
+    except Exception as e:
+        log.warning(f"reconcile: execution import failed: {e}")
+        return summary
+
+    for r in rows:
+        summary["checked"] += 1
+        try:
+            resp = get_order_status(r["order_id"], client)
+            if resp is None:
+                # Couldn't reach CLOB or got null — leave as placed.
+                # Stale-bump only fires below for the AGE cutoff branch.
+                summary["still_placed"] += 1
+                continue
+            if is_order_fully_filled(resp):
+                conn.execute(
+                    "UPDATE live_predictor_orders SET status = 'filled' WHERE id = ?",
+                    (r["id"],))
+                summary["filled"] += 1
+            elif is_order_cancelled(resp):
+                conn.execute(
+                    "UPDATE live_predictor_orders SET status = 'cancelled' WHERE id = ?",
+                    (r["id"],))
+                summary["cancelled"] += 1
+            else:
+                summary["still_placed"] += 1
+        except Exception as e:
+            log.warning(f"reconcile: order {r['order_id'][:12]} failed: {e}")
+            summary["errors"] += 1
+
+    # Mark genuinely-old "still placed" orders as stale.  A 12-hour-old
+    # 'placed' order with no fill is effectively dead — keeping it in the
+    # 'placed' state would distort future reconciliation runs.
+    stale_cutoff = (_dt.now(_tz.utc) - timedelta(hours=RECONCILE_LOOKBACK_HOURS))\
+                    .isoformat()
+    stale_cur = conn.execute(
+        """UPDATE live_predictor_orders SET status = 'stale'
+           WHERE status = 'placed' AND placed_at_utc < ?""",
+        (stale_cutoff,),
+    )
+    summary["stale"] = stale_cur.rowcount or 0
+    conn.commit()
+
+    log.info(f"reconcile: checked={summary['checked']} "
+             f"filled={summary['filled']} cancelled={summary['cancelled']} "
+             f"stale={summary['stale']} still_placed={summary['still_placed']}")
+    return summary
+
+
+# ---------------------------------------------------------------------------
 # Main scan
 # ---------------------------------------------------------------------------
 
@@ -687,6 +882,16 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
     n_events_skipped_not_today = 0
     n_events_skipped_already_bought = 0
     try:
+        # Reconcile any orders that were 'placed' but not yet resolved.
+        # Runs BEFORE we re-evaluate topup math so a freshly-filled order
+        # is reflected in actual_deployed via the position API, not via
+        # ghost-resting orders that distort cost basis.
+        if PREDICTOR_MODE == "live" and not dry_run:
+            try:
+                reconcile_pending_orders(conn)
+            except Exception as e:
+                log.warning(f"order reconciliation failed (non-fatal): {e}")
+
         deployed = deployed_today_usd(conn, PREDICTOR_MODE)
         n_trades = trades_today(conn, PREDICTOR_MODE)
 
@@ -730,7 +935,18 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                 ensemble_stats = w.get("ensemble_stats")
                 log.debug(f"weather cache HIT for {city} (age={cache_age:.0f}s)")
             else:
-                nws_obs = fetch_nws_today_obs(icao, tz_str)
+                # Pull hourly_max AND raw METAR cycles in a single HTTP call.
+                # nws_obs feeds the predictor unchanged; raw_cycles get
+                # persisted to raw_metar_log for future W1 audits — see
+                # persist_raw_metar_cycles docstring.
+                nws_obs, raw_cycles = fetch_nws_obs_with_raw(icao, tz_str)
+                try:
+                    n_new = persist_raw_metar_cycles(conn, raw_cycles)
+                    if n_new:
+                        log.debug(f"raw_metar_log: {icao} +{n_new} cycles")
+                except Exception as e:
+                    # Persistence failure must never block the scan.
+                    log.warning(f"raw_metar persistence failed for {icao}: {e}")
                 # PRIMARY: NWS forecast.  Fallback to Open-Meteo only if NWS down.
                 forecast = fetch_nws_today_forecast(lat, lon, tz_str)
                 if not forecast:
@@ -775,25 +991,38 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
 
                 # IMPORTANT: we always re-evaluate every event (even if it's
                 # already at the buy cap) so the dashboard sees fresh
-                # market_prob values every scan.  Previously we short-
-                # circuited cap-reached events to save the NWS call, but
-                # that froze the dashboard's market data and P&L.  The
-                # cap is now enforced as a per-bin gate below (every bin
-                # gets a SKIP row with reason "event_at_cap"), so prices
-                # stay live.
-                # Identify contracts that count as "currently bought" for
-                # this event.  Used to (a) allow topups to existing
-                # positions without re-tripping the cap, (b) prevent
-                # double-buying the same bin, AND (c) drive the
-                # event_at_cap decision below.
+                # market_prob values every scan.
+
+                # === THREE-SIGNAL POSITION MODEL ===
+                # Position tracking is decomposed into three independent
+                # signals so no single check has to do triple duty:
                 #
-                # LIVE mode: source of truth is the Polymarket API.  A DB
-                # LIVE_BUY row that no longer has an API position (closed
-                # manually, order failed, never filled, resolved to zero)
-                # does NOT count as "bought" — the slot is free for re-buy.
+                #   1. HELD set       — contracts whose token is currently
+                #                       in the wallet (LIVE_BUY rows whose
+                #                       token shows up in live_positions).
+                #                       This answers "did a fill happen?" —
+                #                       used for dedup + cap-counting.
+                #                       Resolved-to-zero positions ARE in
+                #                       this set (you own losing shares); we
+                #                       gate them out via MARKET_OPEN below.
                 #
-                # PAPER mode: DB is the truth (paper "fills" are simulated
-                # and persist as long as the row exists).
+                #   2. DEPLOYED $/contract — from live_positions: size × avg.
+                #                       Cost basis.  Used for topup sizing.
+                #
+                #   3. MARKET_OPEN per bin — from Gamma's `closed` flag
+                #                       (propagated through predict_bins).
+                #                       True = market is still tradeable.
+                #                       Used to (a) block fresh buys on
+                #                       resolved markets, (b) exclude
+                #                       resolved positions from the cap
+                #                       (closed market = settled, no
+                #                       longer occupying a slot), and
+                #                       (c) drive dashboard pills.
+                #
+                # PAPER mode: HELD = DB BUY rows (paper "fills" are
+                # simulated and persist).  No API.  MARKET_OPEN still
+                # applies — paper buys against a closed market are
+                # nonsense.
                 _action_str = _action_for_mode(PREDICTOR_MODE)
                 db_buys = {r["contract_id"]: r["yes_token_id"]
                             for r in conn.execute(
@@ -801,49 +1030,62 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                        FROM paper_predictor_signals
                        WHERE event_id = ? AND action = ?""",
                     (event_id, _action_str)).fetchall()}
+
+                # SIGNAL 1: HELD set — contracts whose token actually
+                # appears in the wallet (live) or whose buy row exists
+                # (paper, since paper fills are simulated).
                 if PREDICTOR_MODE == "live" and live_positions is not None:
-                    # Only count contracts whose token is currently in the
-                    # Polymarket API positions list.
-                    already_bought_contracts = {
+                    held_contracts = {
                         c for c, tok in db_buys.items()
                         if tok and str(tok) in live_positions
                     }
                 else:
-                    # Paper mode (or live with API unreachable) — all DB
-                    # buys count.  API-unreachable fallback is conservative
-                    # so we don't spam re-buys when we can't verify.
-                    already_bought_contracts = set(db_buys.keys())
+                    # Paper mode (or live with API unreachable) — DB-derived.
+                    # API-unreachable fallback stays conservative to avoid
+                    # spam-rebuys when we can't verify.
+                    held_contracts = set(db_buys.keys())
 
-                # Cap check derived from the API-FILTERED set, not the raw
-                # DB count.  A historical LIVE_BUY row whose position no
-                # longer exists on Polymarket does NOT count toward the cap.
-                buys_already = len(already_bought_contracts)
-                event_at_cap = buys_already >= MAX_BINS_PER_EVENT
-                if event_at_cap:
-                    n_events_skipped_already_bought += 1
-
-                # Now run the bin predictor (cheap — pure math on already-
-                # fetched obs+forecast).  We do this AFTER the cap check
-                # so the API-derived buys_already is what drives candidate
-                # selection below.
+                # Run the bin predictor — needed before MARKET_OPEN/cap
+                # checks because we need each bin's `closed` flag.
                 pred = predict_bins(ev, nws_obs, forecast, nbr_signal,
                                      now_local.hour, city=city,
                                      ensemble_stats=ensemble_stats)
                 if not pred.get("bins"):
                     continue
 
+                # SIGNAL 3: MARKET_OPEN per bin — Gamma's `closed` flag.
+                # Build a contract→open map so we can answer both
+                # "is this bin tradeable as a fresh buy?" and
+                # "does this held position still count toward the cap?"
+                market_open: dict[str, bool] = {
+                    b["contract_id"]: not bool(b.get("closed"))
+                    for b in pred["bins"]
+                }
+
+                # Cap is occupied ONLY by held contracts whose underlying
+                # market is still open.  A resolved-to-zero position is
+                # held but the market is closed — no slot occupied.
+                # (Topups against closed markets are also rejected below.)
+                already_bought_contracts = {
+                    c for c in held_contracts
+                    if market_open.get(c, True)
+                }
+                buys_already = len(already_bought_contracts)
+                event_at_cap = buys_already >= MAX_BINS_PER_EVENT
+                if event_at_cap:
+                    n_events_skipped_already_bought += 1
+
                 # Rank bins by OUR PROBABILITY descending.  Two kinds of
                 # candidates:
                 #   1. FRESH-BUY candidates: top P-rank bins NOT already
-                #      bought.  Limited to slots_remaining (cap-bound).
-                #   2. TOPUP candidates: bins ALREADY bought that may still
-                #      have headroom below the target stake.  Not cap-bound
-                #      because topping up an existing bin doesn't add a new
-                #      bin to the event.
+                #      held AND market still open.  Cap-bound.
+                #   2. TOPUP candidates: bins ALREADY held AND still open.
+                #      Not cap-bound (no new bin added to the event).
                 bins_by_p = sorted(pred["bins"], key=lambda x: -x["our_prob"])
 
                 fresh_bins = [b for b in bins_by_p
-                               if b["contract_id"] not in already_bought_contracts]
+                               if b["contract_id"] not in held_contracts
+                               and market_open.get(b["contract_id"], True)]
                 topup_bins = [b for b in bins_by_p
                                if b["contract_id"] in already_bought_contracts]
 
@@ -886,6 +1128,25 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                         PREDICTOR_MODE, live_positions,
                     )
                     remaining_to_target = max(0.0, target_stake - actual_deployed)
+
+                    # Per-contract daily $ ceiling.  Independent of
+                    # actual_deployed (which can drift with price moves
+                    # via cost basis).  Once we've staked MAX_PER_CONTRACT_USD
+                    # of fresh capital into this contract TODAY (across
+                    # initial + all topups recorded in the DB), no more
+                    # capital flows in until tomorrow.
+                    contract_ceiling_remaining = None
+                    if MAX_PER_CONTRACT_USD > 0:
+                        spent_today_here = deployed_today_for_contract(
+                            conn, PREDICTOR_MODE, contract_id,
+                        )
+                        contract_ceiling_remaining = max(
+                            0.0, MAX_PER_CONTRACT_USD - spent_today_here,
+                        )
+                        remaining_to_target = min(
+                            remaining_to_target, contract_ceiling_remaining,
+                        )
+
                     # "At target" if within TOPUP_TOLERANCE_PCT OR remaining
                     # is below TOPUP_MIN_USD (not worth a tiny order).
                     at_target_threshold = max(
@@ -893,14 +1154,28 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                         target_stake * TOPUP_TOLERANCE_PCT,
                     )
                     at_target = remaining_to_target < at_target_threshold
+                    # If the ceiling is what's cutting us off (not the
+                    # cost-basis-vs-target math), give the SKIP row a more
+                    # informative reason.
+                    contract_ceiling_hit = (
+                        contract_ceiling_remaining is not None
+                        and contract_ceiling_remaining < at_target_threshold
+                        and remaining_to_target == contract_ceiling_remaining
+                    )
 
                     if event_aborted:
                         ok = False
                         reason = "event_aborted (higher-P bin failed gates)"
                     elif at_target:
-                        ok = False
-                        reason = (f"at_target (deployed=${actual_deployed:.2f} "
-                                  f"/ target=${target_stake:.2f})")
+                        if contract_ceiling_hit:
+                            ok = False
+                            reason = (f"per_contract_daily_cap "
+                                      f"(spent=${MAX_PER_CONTRACT_USD - (contract_ceiling_remaining or 0):.2f} "
+                                      f"/ cap=${MAX_PER_CONTRACT_USD:.2f})")
+                        else:
+                            ok = False
+                            reason = (f"at_target (deployed=${actual_deployed:.2f} "
+                                      f"/ target=${target_stake:.2f})")
                     else:
                         # Note: already_acted is now False because we handle
                         # the "fully filled" case via at_target above.  Topups
@@ -990,6 +1265,7 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                         "sigma_c":                pred["sigma"],
                         "wind_octant":            wind_octant,
                         "upwind_signal_strength": nbr_signal.get("signal_strength"),
+                        "market_closed":          1 if b.get("closed") else 0,
                     }
                     if not dry_run:
                         signal_id = write_signal(conn, sig_row)
@@ -1011,7 +1287,14 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                 # data live even for events we've already bought.
                 for b in non_candidates:
                     n_bins_evaluated += 1
-                    reason = non_candidate_reason
+                    # A bin can land in non_candidates because (a) the
+                    # event was at cap, (b) it isn't top-P this scan, OR
+                    # (c) its underlying market has resolved.  Make case
+                    # (c) explicit so the dashboard can show a clear
+                    # "market_closed" SKIP reason instead of conflating it
+                    # with "not the top bin."
+                    reason = ("market_closed" if b.get("closed")
+                                else non_candidate_reason)
                     skips_by_reason[reason] = skips_by_reason.get(reason, 0) + 1
                     sig_row = {
                         "scanned_at_utc":         scan_start.isoformat(),
@@ -1043,6 +1326,7 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                         "sigma_c":                pred["sigma"],
                         "wind_octant":            wind_octant,
                         "upwind_signal_strength": nbr_signal.get("signal_strength"),
+                        "market_closed":          1 if b.get("closed") else 0,
                     }
                     if not dry_run:
                         write_signal(conn, sig_row)

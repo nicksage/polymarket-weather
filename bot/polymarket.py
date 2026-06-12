@@ -258,6 +258,14 @@ def _normalize_sub_market(raw: dict, event_title: str) -> dict | None:
         # at fill time; this is an at-discovery snapshot for diagnostics.
         fee_schedule = raw.get("feeSchedule") or {}
 
+        # MARKET RESOLUTION STATE — independent of position value.  Even
+        # though search_temp_high_events filters events with closed=false
+        # at the EVENT level, individual sub-markets within an open event
+        # can resolve at any time (one bin wins, others lose).  Propagate
+        # the per-market flag so downstream code can answer the
+        # MARKET_OPEN question without inferring it from a $-value filter.
+        closed = bool(raw.get("closed", False))
+
         return {
             "contract_id":      raw.get("conditionId") or raw.get("id"),
             "gamma_market_id":  str(raw.get("id", "")),   # numeric Gamma ID for /markets/{id} lookups
@@ -272,6 +280,7 @@ def _normalize_sub_market(raw: dict, event_title: str) -> dict | None:
             "liquidity_usd":    liquidity,
             "volume_usd":       volume,
             "resolution_date":  raw.get("endDate") or raw.get("resolutionDate", ""),
+            "closed":           closed,
             "accepting_orders": accepting_orders,
             "enable_order_book":enable_order_book,
             "neg_risk":         neg_risk,
