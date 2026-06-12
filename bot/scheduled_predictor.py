@@ -59,6 +59,7 @@ from config      import DB_PATH  # type: ignore
 
 # Reuse the intraday predictor's plumbing instead of duplicating it
 from scripts.intraday_predictor import (  # type: ignore
+    fetch_nws_today_obs,
     fetch_nws_obs_with_raw,        # returns (hourly_max, raw_cycles) in one call
     fetch_nws_today_forecast,
     fetch_openmeteo_today,        # kept as fallback if NWS unreachable
@@ -104,26 +105,9 @@ HIGH_MKT_THRESHOLD   = float(os.getenv("PREDICTOR_HIGH_MKT_THRESHOLD", "0.75"))
 # the model is almost certainly wrong (consensus aggregates a lot of info).
 # Default 0.15 = blocks any bin the market deems <15% likely.
 MIN_MARKET_PROB = float(os.getenv("PREDICTOR_MIN_MARKET_PROB", "0.15"))
-
-# W4 — market-anchored risk cap.  Blowup-preventer for the case where a
-# liquid market disagrees with our model by a huge margin.  Reasoning:
-# our_p = 95% and mkt_p = 5% on a $25k-liquid market is almost certainly
-# either (a) a stale model price (we missed an NWS update / NBM cycle)
-# or (b) a bug.  Either way, we shouldn't bet the farm.  This veto
-# operates ENTIRELY at the gate layer — it never touches the edge
-# calc, so our_p stays clean and the diagnostic signal stays measurable.
-#
-# Disable by setting MARKET_DISAGREEMENT_LIQ_THRESHOLD=0 (any value of
-# liquidity will compare false to that gate) or
-# MARKET_DISAGREEMENT_PP_THRESHOLD=1.1 (no real edge ever exceeds 1.0).
-MARKET_DISAGREEMENT_LIQ_THRESHOLD = float(
-    os.getenv("PREDICTOR_MARKET_DISAGREEMENT_LIQ_THRESHOLD", "10000"))
-MARKET_DISAGREEMENT_PP_THRESHOLD  = float(
-    os.getenv("PREDICTOR_MARKET_DISAGREEMENT_PP_THRESHOLD", "0.40"))
 MIN_LIQUIDITY_USD    = float(os.getenv("PREDICTOR_MIN_LIQUIDITY", "300"))
 MIN_TRIGGER_HOUR     = int  (os.getenv("PREDICTOR_MIN_HOUR",     "13"))
 MAX_TRIGGER_HOUR     = int  (os.getenv("PREDICTOR_MAX_HOUR",     "22"))
-MAX_MARKET_PRICE     = float(os.getenv("PREDICTOR_MAX_MKT_PRICE", "0.95"))
 MAX_DAILY_EXPOSURE   = float(os.getenv("PREDICTOR_MAX_DAILY_EXP", "200"))
 MAX_TRADES_PER_DAY   = int  (os.getenv("PREDICTOR_MAX_TRADES",   "25"))
 MAX_BINS_PER_EVENT   = int  (os.getenv("PREDICTOR_MAX_BINS_PER_EVENT", "1"))
@@ -249,6 +233,31 @@ CREATE TABLE IF NOT EXISTS raw_metar_log (
 );
 CREATE INDEX IF NOT EXISTS idx_rml_icao_date
     ON raw_metar_log(icao, event_date);
+
+-- Invariant guard violations.  Permanent observational record of every
+-- within-day monotonicity / coherence violation surfaced by the guards
+-- in scripts/invariant_guards.py.  WRITE-ONLY from this file's perspective:
+-- the scan loop and the prediction path NEVER read this table.  See the
+-- OBSERVATIONAL FOREVER design rule in invariant_guards.py.
+--
+-- Idempotent via UNIQUE — re-running guards on the same scan is a no-op.
+CREATE TABLE IF NOT EXISTS guard_violations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    detected_at_utc TEXT NOT NULL,
+    scan_at_utc     TEXT NOT NULL,
+    guard_name      TEXT NOT NULL,
+    city            TEXT NOT NULL,
+    event_date      TEXT,
+    prev_value      REAL,
+    curr_value      REAL,
+    delta           REAL,
+    detail          TEXT,
+    UNIQUE(scan_at_utc, guard_name, city)
+);
+CREATE INDEX IF NOT EXISTS idx_gv_detected
+    ON guard_violations(detected_at_utc);
+CREATE INDEX IF NOT EXISTS idx_gv_city_guard
+    ON guard_violations(city, guard_name);
 """
 
 
@@ -277,6 +286,12 @@ def ensure_schema() -> None:
         # row.  Defaults to NULL until W2 ships.  Created now so audits
         # and dashboards can query it without a downstream migration.
         _add_column("paper_predictor_signals", "data_quality_flag", "TEXT")
+        # cooling_confidence: from estimate_day_high_dist's detect_cooling
+        # output.  Persisted so the invariant_guards module can check the
+        # post-peak monotonicity invariant (cooling_confidence should be
+        # non-decreasing once forecast_peak_hour has passed; oscillation
+        # is the bin-lock-discontinuity churn surfacing as data).
+        _add_column("paper_predictor_signals", "cooling_confidence", "REAL")
         conn.commit()
 
 
@@ -345,19 +360,6 @@ def evaluate_gates(*, current_hour: int, edge: float, market_p: float,
     if edge < required_edge:
         return False, (f"low_edge ({edge:+.3f} < {required_edge:.2f}, "
                        f"mkt_p={market_p:.2f})")
-    # W4 — market-anchored risk cap.  On a LIQUID market, an extreme
-    # disagreement (>40pp by default) between our model and the market
-    # is more likely a stale-model / bug case than genuine edge.  Veto
-    # without affecting the edge calc — diagnostic signal stays clean.
-    # Operates AFTER the low_edge gate so it doesn't fire on normal
-    # small-edge buys; only the suspicious "huge edge on liquid book"
-    # case trips it.
-    if (liquidity >= MARKET_DISAGREEMENT_LIQ_THRESHOLD
-        and edge >= MARKET_DISAGREEMENT_PP_THRESHOLD):
-        return False, (f"liquid_market_strong_disagreement "
-                        f"(edge={edge:+.2f} >= {MARKET_DISAGREEMENT_PP_THRESHOLD:.2f}, "
-                        f"liq=${liquidity:.0f} >= "
-                        f"${MARKET_DISAGREEMENT_LIQ_THRESHOLD:.0f})")
     if market_p >= MAX_MARKET_PRICE:
         return False, f"priced_in (mkt={market_p:.3f} ≥ {MAX_MARKET_PRICE:.2f})"
     if liquidity < MIN_LIQUIDITY_USD:
@@ -603,53 +605,6 @@ def write_live_order(conn, row: dict) -> None:
         [row[c] for c in cols],
     )
     conn.commit()
-
-
-def recover_persisted_day_forecast(conn, city: str, event_date: str,
-                                      candidate_high_c: float,
-                                      candidate_peak_hour: int | None,
-                                      ) -> tuple[float, int | None]:
-    """Defend against the NWS `/forecastHourly` evening-scan bug.
-
-    NWS hourly only returns periods from "now" forward.  By late
-    afternoon, "today's" remaining periods describe the evening cooling
-    curve, not the day's actual high.  A late-day fetch therefore stores
-    artificially-low forecast_high_c values — the column ratchets DOWN
-    through the afternoon (verified against SF 2026-06-11: 28.33°C from
-    07:04 UTC stable through 23:06 UTC, then declining to 17.22°C by
-    23:24 UTC = 16:24 PDT, tracking the cooling curve exactly).
-
-    Fix: if a PRIOR scan for this (city, event_date) recorded a higher
-    forecast_high_c, use that.  Works as long as at least one earlier
-    scan ran while the hourly endpoint still contained the day's peak
-    periods.
-
-    Cold-start days where no morning scan ran cannot be recovered —
-    those rows must be filtered at calibration time (indicator: a
-    settled day where bot's observed_max_c ended up higher than its
-    own forecast_high_c by > 2°C).
-
-    Does NOT punish the Open-Meteo fallback path: Open-Meteo's
-    forecast_days=1 returns the full local day from midnight, so its
-    candidate_high_c is already correct.  Helper takes max(persisted,
-    candidate) so an accurate Open-Meteo candidate beats any stale
-    persisted value.
-    """
-    row = conn.execute(
-        """SELECT forecast_high_c, forecast_peak_hour
-           FROM paper_predictor_signals
-           WHERE city = ? AND event_date = ? AND forecast_high_c IS NOT NULL
-           ORDER BY forecast_high_c DESC LIMIT 1""",
-        (city, event_date),
-    ).fetchone()
-    if not row:
-        return candidate_high_c, candidate_peak_hour
-    prev_high = row[0] if not hasattr(row, "keys") else row["forecast_high_c"]
-    prev_peak = row[1] if not hasattr(row, "keys") else row["forecast_peak_hour"]
-    if prev_high is not None and prev_high > candidate_high_c:
-        recovered_peak = int(prev_peak) if prev_peak is not None else candidate_peak_hour
-        return float(prev_high), recovered_peak
-    return candidate_high_c, candidate_peak_hour
 
 
 def persist_raw_metar_cycles(conn, raw_cycles: list[dict]) -> int:
@@ -1029,27 +984,6 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                     forecast = fetch_openmeteo_today(lat, lon, tz_str)
                 if not forecast:
                     continue
-                # Defend forecast_high against the NWS hourly evening-scan
-                # bug.  See recover_persisted_day_forecast docstring.  Done
-                # BEFORE the cache write so every subsequent cache hit
-                # within this day inherits the recovered value.
-                try:
-                    recovered_high, recovered_peak = recover_persisted_day_forecast(
-                        conn, city, today_str_local,
-                        candidate_high_c   = float(forecast["forecast_high"]),
-                        candidate_peak_hour= forecast.get("forecast_peak_hour"),
-                    )
-                    if recovered_high > forecast["forecast_high"] + 0.01:
-                        log.info(
-                            f"forecast_high recovered for {city}: "
-                            f"{forecast['forecast_high']:.2f}°C → {recovered_high:.2f}°C "
-                            f"(NWS hourly evening-scan bug)"
-                        )
-                    forecast["forecast_high"] = recovered_high
-                    if recovered_peak is not None:
-                        forecast["forecast_peak_hour"] = recovered_peak
-                except Exception as e:
-                    log.warning(f"forecast_high recovery failed for {city}: {e}")
                 afternoon_winds = [r["wind_dir_deg"] for r in nws_obs
                                     if r["hour_local"] in range(11, 19)
                                     and r["wind_dir_deg"] is not None]
@@ -1363,6 +1297,7 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                         "upwind_signal_strength": nbr_signal.get("signal_strength"),
                         "market_closed":          1 if b.get("closed") else 0,
                         "data_quality_flag":      pred.get("cdf_used"),
+                        "cooling_confidence":     pred.get("cooling_confidence"),
                     }
                     if not dry_run:
                         signal_id = write_signal(conn, sig_row)
@@ -1425,10 +1360,21 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                         "upwind_signal_strength": nbr_signal.get("signal_strength"),
                         "market_closed":          1 if b.get("closed") else 0,
                         "data_quality_flag":      pred.get("cdf_used"),
+                        "cooling_confidence":     pred.get("cooling_confidence"),
                     }
                     if not dry_run:
                         write_signal(conn, sig_row)
     finally:
+        # Invariant guards.  PURE OBSERVATIONAL — see the "observational
+        # forever" design rule at the top of scripts/invariant_guards.py.
+        # Failures here are logged but never block the scan, and the
+        # guards' outputs never re-enter the prediction or trading path.
+        if not dry_run:
+            try:
+                from scripts.invariant_guards import run_invariant_checks
+                run_invariant_checks(conn, scan_start.isoformat())
+            except Exception as e:
+                log.warning(f"invariant_guards failed (non-fatal): {e}")
         conn.close()
 
     action_label = "live_buys" if PREDICTOR_MODE == "live" else "paper_buys"
