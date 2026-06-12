@@ -79,6 +79,88 @@ def get_station(city: str) -> tuple[str, str, str, float, float] | None:
     return CITY_STATIONS.get(city)
 
 
+# ---------------------------------------------------------------------------
+# Same-day model assignment per city  (HRRR ceiling, Phase 0 prereq).
+# ---------------------------------------------------------------------------
+#
+# Polymarket-weather expansion: which rapid-update CAM (convection-allowing
+# model) produces a same-day ceiling for each city?
+#
+# Values:
+#   "hrrr"       — High-Resolution Rapid Refresh, 3 km CONUS hourly
+#   "icon_d2"    — DWD ICON-D2, ~2 km Central Europe hourly
+#   None         — No fresh CAM available; same-day ceiling falls back to
+#                  observation-based logic (rising-floor + remaining-solar
+#                  heuristic), or is skipped entirely
+#
+# Edge-of-domain calls (London/Madrid/Helsinki) marked None pending
+# explicit ICON-D2 domain verification — see Open Question §10.1 in
+# docs/hrrr_ceiling_spec.md.
+SAME_DAY_MODEL_BY_CITY: dict[str, str | None] = {
+    # CONUS — full HRRR coverage
+    "Atlanta":       "hrrr",
+    "Austin":        "hrrr",
+    "Chicago":       "hrrr",
+    "Dallas":        "hrrr",
+    "Denver":        "hrrr",
+    "Houston":       "hrrr",
+    "Los Angeles":   "hrrr",
+    "Miami":         "hrrr",
+    "NYC":           "hrrr",
+    "San Francisco": "hrrr",
+    "Seattle":       "hrrr",
+
+    # Central Europe — ICON-D2 covers core of domain
+    "Munich":        "icon_d2",
+    "Milan":         "icon_d2",
+    "Paris":         "icon_d2",
+    "Warsaw":        "icon_d2",
+
+    # Edge-of-domain — pending verification
+    "London":        None,
+    "Madrid":        None,
+    "Helsinki":      None,
+    "Moscow":        None,
+
+    # No CAM available — observation-based logic only
+    "Ankara":        None,
+    "Beijing":       None,
+    "Buenos Aires":  None,
+    "Busan":         None,
+    "Cape Town":     None,
+    "Chengdu":       None,
+    "Chongqing":     None,
+    "Guangzhou":     None,
+    "Istanbul":      None,
+    "Jeddah":        None,
+    "Karachi":       None,
+    "Kuala Lumpur":  None,
+    "Lucknow":       None,
+    "Manila":        None,
+    "Mexico City":   None,
+    "Panama City":   None,
+    "Qingdao":       None,
+    "Sao Paulo":     None,
+    "Seoul":         None,
+    "Shanghai":      None,
+    "Shenzhen":      None,
+    "Singapore":     None,
+    "Taipei":        None,
+    "Tel Aviv":      None,
+    "Tokyo":         None,
+    "Toronto":       None,
+    "Wellington":    None,
+    "Wuhan":         None,
+}
+
+
+def get_same_day_model(city: str) -> str | None:
+    """Return the rapid-update model identifier for this city, or None
+    if no fresh CAM is available.  Used by the HRRR-ceiling dispatch
+    in predict_bins / estimate_day_high_dist."""
+    return SAME_DAY_MODEL_BY_CITY.get(city)
+
+
 def get_station_latlon(city: str) -> tuple[float, float] | None:
     """Just the station coordinates — for hitting forecast APIs."""
     s = CITY_STATIONS.get(city)

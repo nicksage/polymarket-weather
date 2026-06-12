@@ -288,6 +288,49 @@ CREATE TABLE IF NOT EXISTS raw_metar_log (
 CREATE INDEX IF NOT EXISTS idx_rml_icao_date
     ON raw_metar_log(icao, event_date);
 
+-- Resolution observations — Phase 0a of the HRRR ceiling plan.
+-- One row per resolved Polymarket market, decomposing the
+-- bot-vs-settlement gap into its component sources:
+--
+--   bot_observed_max_c    : what the bot recorded for the day
+--   metar_peak_body_c     : whole-°C body value at peak hour (no T-group)
+--   metar_peak_t_group_c  : T-group tenths-precision value at peak synoptic
+--   wunderground_high_c   : Wunderground's daily high display (settlement
+--                            reference for US markets)
+--   winning_range_low/high: from resolutions — the bin that won
+--
+-- This lets Phase 0b decompose any bot-vs-settlement gap:
+--   (body → t_group) gap = body-rounding error (which T-group fix
+--                            this turn should have closed)
+--   (t_group → wunderground) gap = DSM aggregation / source mismatch
+--                                    (separate fix if non-zero)
+--   (wunderground → winning_bin) gap = should be zero if Wunderground
+--                                        is the settlement source
+--
+-- Captured by bot/scripts/capture_resolution_truth.py, run nightly.
+-- WRITE-ONLY from the scan loop's perspective; never read by trading
+-- decisions.
+CREATE TABLE IF NOT EXISTS resolution_observations (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id               TEXT NOT NULL,
+    city                   TEXT,
+    event_date             TEXT,
+    icao                   TEXT,
+    bot_observed_max_c     REAL,
+    metar_peak_body_c      REAL,
+    metar_peak_t_group_c   REAL,
+    metar_peak_cycle_utc   TEXT,
+    wunderground_high_c    REAL,
+    winning_range_low      REAL,
+    winning_range_high     REAL,
+    winning_bin_label      TEXT,
+    captured_at_utc        TEXT NOT NULL,
+    capture_notes          TEXT,
+    UNIQUE(event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ro_city_date
+    ON resolution_observations(city, event_date);
+
 -- Invariant guard violations.  Permanent observational record of every
 -- within-day monotonicity / coherence violation surfaced by the guards
 -- in scripts/invariant_guards.py.  WRITE-ONLY from this file's perspective:
@@ -1368,28 +1411,55 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                     # spam-rebuys when we can't verify.
                     held_contracts = set(db_buys.keys())
 
+                # Compute cold-start suspect BEFORE predict_bins so we
+                # can pass it as a kwarg.  The HRRR ceiling dispatch
+                # inside predict_bins skips the rapid-model fetch on
+                # cold-start days (HRRR's "remaining hours" view can't
+                # recover a peak that already happened before the
+                # bot's first scan today).
+                cold_start_suspect = False
+                try:
+                    cold_start_suspect = is_cold_start_day(
+                        conn, city, today_str_local, tz_str,
+                        scan_start.isoformat())
+                except Exception as e:
+                    log.warning(f"cold-start detection failed for {city}: {e}")
+
                 # Run the bin predictor — needed before MARKET_OPEN/cap
                 # checks because we need each bin's `closed` flag.
+                # Pass lat/lon/tz_str so the HRRR ceiling dispatch can
+                # fetch the rapid-update CAM run.  When flag is off
+                # (PREDICTOR_USE_HRRR_CEILING=0), these are unused.
                 pred = predict_bins(ev, nws_obs, forecast, nbr_signal,
                                      now_local.hour, city=city,
-                                     ensemble_stats=ensemble_stats)
+                                     ensemble_stats=ensemble_stats,
+                                     cold_start_suspect=cold_start_suspect,
+                                     lat=lat, lon=lon, tz_str=tz_str)
                 if not pred.get("bins"):
                     continue
 
                 # Compose the data-quality flag for every signal row we
                 # write this event.  Starts with the CDF path that produced
                 # our_prob (e.g. "gaussian"), appends "cold_start_suspect"
-                # if today's first scan for this city was at or after the
-                # climatological peak hour — see data-quality contract.
+                # when set, and "hrrr_ceiling_applied" / "icon_d2_ceiling_applied"
+                # when the rapid-model ceiling fired (Spec §5).
                 _dq_components: list[str] = []
                 if pred.get("cdf_used"):
                     _dq_components.append(pred["cdf_used"])
-                try:
-                    if is_cold_start_day(conn, city, today_str_local, tz_str,
-                                           scan_start.isoformat()):
-                        _dq_components.append("cold_start_suspect")
-                except Exception as e:
-                    log.warning(f"cold-start detection failed for {city}: {e}")
+                if cold_start_suspect:
+                    _dq_components.append("cold_start_suspect")
+                if pred.get("hrrr_used"):
+                    # Distinguish HRRR vs ICON-D2 in the flag so audits
+                    # can segment by source.
+                    try:
+                        from station_meta import get_same_day_model  # type: ignore
+                        model = get_same_day_model(city)
+                    except Exception:
+                        model = None
+                    if model == "icon_d2":
+                        _dq_components.append("icon_d2_ceiling_applied")
+                    else:
+                        _dq_components.append("hrrr_ceiling_applied")
                 event_data_quality_flag = (
                     ",".join(_dq_components) if _dq_components else None)
                 event_size_factor = compute_data_quality_size_factor(

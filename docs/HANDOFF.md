@@ -830,7 +830,12 @@ similar would close this. Not started.
 ### 9.5 Old wall-clock σ narrowing branches in `estimate_day_high_dist`
 
 Will be deleted as part of W3's follow-up PR (separate from W3's
-introduction PR). See Section 7.4 step 5.
+introduction PR). See Section 7.4 step 5. **Note (2026-06-12 update):**
+the HRRR plateau signal is now another trigger for `day_has_likely_peaked`
+alongside wall-clock and observed-vs-forecast. Wall-clock branch
+stays as fallback for cold-start days and non-CAM cities; deletion
+discipline same as before — introduce alongside, don't couple
+removal with introduction.
 
 ### 9.6 Backfilling pre-June-12 contaminated `forecast_high_c`
 
@@ -884,6 +889,10 @@ not prioritized.
 - [docs/data_quality_contract.md](data_quality_contract.md) — degradation triggers + sizing scalar
 - [docs/w3_physical_ceiling.md](w3_physical_ceiling.md) — physical ceiling spec
 - [docs/deploy_safety.md](deploy_safety.md) — pre-commit hook setup
+- HRRR ceiling spec — Phase 0a (`capture_resolution_truth.py`) and
+  Phase 1 (Open-Meteo HRRR/ICON-D2 dispatch behind `PREDICTOR_USE_HRRR_CEILING`)
+  are shipped; activation has TWO gates: Phase 2 backtest improvement AND
+  Phase 0b confirming the T-group fix closed the observed_max-vs-settlement gap
 
 ### Core bot code
 - [bot/scheduled_predictor.py](../bot/scheduled_predictor.py) — scan loop, gate stack, recovery helper, cold-start detection, sizing scalar, data-quality flag composition

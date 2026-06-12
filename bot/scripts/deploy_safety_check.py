@@ -115,6 +115,11 @@ REQUIRED_NAMES: list[str] = [
     "def pending_stake_for_contract_today",  # $ sum of pending stakes per contract
     "committed_contracts",                   # held + pending — for cap check
     "committed_deployed",                    # actual + pending — for target math
+
+    # --- HRRR ceiling Phase 0 + Phase 1 (docs/hrrr_ceiling_spec.md) ---
+    "resolution_observations",               # Phase 0a audit table
+    "cold_start_suspect",                    # already required, but pulls
+                                              # into the HRRR dispatch path too
 ]
 
 

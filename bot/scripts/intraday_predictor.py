@@ -106,6 +106,41 @@ PREDICTOR_USE_CLIMATOLOGICAL_SIGMA = bool(int(
 PREDICTOR_CLIMATOLOGICAL_SIGMA_C = float(
     os.getenv("PREDICTOR_CLIMATOLOGICAL_SIGMA_C", "1.75"))
 
+# === HRRR ceiling — Phase 1 of the HRRR plan (docs/hrrr_ceiling_spec.md) ===
+#
+# When PREDICTOR_USE_HRRR_CEILING=1, predict_bins fetches the latest HRRR
+# (CONUS) or ICON-D2 (Central Europe) run via Open-Meteo for the
+# settlement station, then:
+#
+#   (a) Recenters μ on max(observed_max, hrrr_remaining_max) when HRRR
+#       is more pessimistic than the morning forecast — the "skepticism
+#       mechanism" the spec calls out as fixing forecast-as-gospel.
+#
+#   (b) Caps the distribution from above at hrrr_remaining_max + buffer
+#       (default 1.0°C) — the physical upper truncation that fixes
+#       the Atlanta/NYC upper-tail overconfidence pattern.
+#
+#   (c) Triggers post-peak σ narrowing when HRRR's next 2-3h trajectory
+#       is flat/falling — the "plateau signal" replacement for the
+#       wall-clock hours_since_observed_peak lag.  Wall-clock branch
+#       stays as fallback for cold-start days and non-CAM cities.
+#
+# Skipped automatically when:
+#   - city has no same_day_model assigned (non-US, non-CE)
+#   - cold_start_suspect flag is set on the event (HRRR's "remaining
+#     hours" view can't recover a peak that already happened)
+#   - HRRR fetch fails or returns implausible values (sanity gates)
+#
+# Activation has TWO gates: Phase 2 backtest improvement + Phase 0b
+# confirming the T-group fix actually closed the observed_max-vs-
+# settlement gap.  Both must pass before flipping this on.
+PREDICTOR_USE_HRRR_CEILING = bool(int(
+    os.getenv("PREDICTOR_USE_HRRR_CEILING", "0")))
+PREDICTOR_HRRR_CEILING_BUFFER_C = float(
+    os.getenv("PREDICTOR_HRRR_CEILING_BUFFER_C", "1.0"))
+PREDICTOR_HRRR_MAX_STALENESS_H = float(
+    os.getenv("PREDICTOR_HRRR_MAX_STALENESS_H", "3.0"))
+
 # Per-city σ calibration — loaded from data/forecast_calibration.json
 # (produced by scripts.forecast_rmse_calibration).  Falls back to the
 # default above for any city not present in the file or if the file
@@ -787,6 +822,201 @@ def fetch_openmeteo_today(lat: float, lon: float, tz_str: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# HRRR / ICON-D2 rapid-update fetch — Phase 1 of the HRRR ceiling plan
+# ---------------------------------------------------------------------------
+#
+# Pulls a rapid-update CAM (HRRR for CONUS, ICON-D2 for Central Europe)
+# via Open-Meteo's `models=` parameter.  Returns the "remaining-day max"
+# and the trajectory needed for both the upper-truncation ceiling AND
+# the plateau-signal post-peak narrowing.  Both are baseline (not
+# optional) per the spec discussion.
+#
+# Open-Meteo exposes both models without GRIB2 plumbing.  If Tier 1's
+# accuracy is insufficient at hard terrain/coastal stations (Phase 3
+# in the spec), this gets replaced by Herbie-based direct GRIB2 access
+# for controlled point extraction.
+#
+# Behavior under failure: returns None.  Callers must handle this and
+# fall back to the existing (HRRR-unaware) distribution path.  Cold-
+# start days (cold_start_suspect flag set) should skip the fetch
+# entirely — see the dispatch in scheduled_predictor.
+
+OPENMETEO_RAPID_URL = "https://api.open-meteo.com/v1/forecast"
+
+
+def fetch_rapid_model_remaining_max(
+    lat: float, lon: float, tz_str: str, model: str
+) -> dict | None:
+    """Fetch rapid-update CAM hourly forecast and extract:
+       {
+         "remaining_max_c": float — max 2m temperature from "now" through
+                                     end of station-local day
+         "trajectory":      list of dicts {hour_local, temp_c, cloud_pct}
+                              for the same window — used by the plateau
+                              signal (HRRR says day is done climbing)
+         "cycle_time":      ISO timestamp of latest model run available
+                              (for staleness check; Open-Meteo doesn't
+                              always expose this — best-effort)
+         "model":           the model identifier requested
+       }
+    Returns None if:
+       - the fetch fails (network, 4xx, etc.)
+       - no usable hourly data in the response
+       - all temperatures in the response window are missing
+
+    Caller is responsible for staleness/sanity gates and feature-flag.
+    """
+    if model not in ("hrrr", "icon_d2", "ncep_hrrr"):
+        log.warning(f"fetch_rapid_model: unsupported model {model!r}; "
+                     "returning None")
+        return None
+    try:
+        r = httpx.get(
+            OPENMETEO_RAPID_URL,
+            params={
+                "latitude":      lat,
+                "longitude":     lon,
+                "hourly":        "temperature_2m,cloud_cover",
+                "models":        model,
+                "timezone":      tz_str,
+                "forecast_days": 1,
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        log.warning(f"Open-Meteo rapid-model fetch failed "
+                    f"({model}) at ({lat:.3f},{lon:.3f}): {e}")
+        return None
+
+    h = data.get("hourly", {}) or {}
+    times = h.get("time") or []
+    temps = h.get("temperature_2m") or []
+    clouds = h.get("cloud_cover") or []
+    if not times or not temps:
+        return None
+
+    tz = ZoneInfo(tz_str)
+    now_local = datetime.now(tz)
+    today_local = now_local.date()
+    # "Remaining day" = hourly entries from current hour through end
+    # of today in local time.
+    trajectory: list[dict] = []
+    for i, t in enumerate(times):
+        try:
+            dt = datetime.strptime(t, "%Y-%m-%dT%H:%M")
+        except ValueError:
+            continue
+        # Open-Meteo returns times in the requested timezone already
+        if dt.date() != today_local:
+            continue
+        if dt.hour < now_local.hour:
+            continue
+        if i >= len(temps):
+            continue
+        v = temps[i]
+        if v is None:
+            continue
+        cloud_pct = (clouds[i] if i < len(clouds) and clouds[i] is not None
+                       else None)
+        trajectory.append({
+            "hour_local": dt.hour,
+            "temp_c":     float(v),
+            "cloud_pct":  float(cloud_pct) if cloud_pct is not None else None,
+        })
+
+    if not trajectory:
+        return None
+
+    remaining_max_c = max(pt["temp_c"] for pt in trajectory)
+    # Open-Meteo doesn't reliably expose the source model's cycle time
+    # in this endpoint.  Best-effort: use the response's earliest
+    # trajectory time as a proxy for "data is current as of at least
+    # this hour."
+    earliest_local_iso = (now_local.replace(hour=trajectory[0]["hour_local"],
+                                              minute=0, second=0,
+                                              microsecond=0)
+                              .isoformat())
+    return {
+        "remaining_max_c": round(remaining_max_c, 2),
+        "trajectory":      trajectory,
+        "cycle_time":      earliest_local_iso,
+        "model":           model,
+    }
+
+
+def _hrrr_data_passes_sanity(hrrr_data: dict,
+                               observed_max_c: float,
+                               forecast_high_c: float) -> bool:
+    """Sanity gates for HRRR data before we let it influence pricing.
+
+    Rejects HRRR data when:
+      - remaining_max is implausibly far from forecast or observed
+        (> 8°C delta — likely a model glitch or wrong-point extraction)
+      - trajectory contains NaN-ish values
+
+    Range-plausibility check is asymmetric: we accept HRRR being much
+    LOWER than forecast (that's the whole point — skepticism mechanism)
+    but reject HRRR being much HIGHER, because either it's spurious or
+    indicates the morning forecast was the conservative one.  In the
+    latter case we'd rather not over-anchor.
+
+    Staleness check is best-effort — Open-Meteo doesn't reliably
+    expose the source cycle time, so we use the response data's
+    earliest-hour value as a proxy.
+    """
+    remaining_max = hrrr_data.get("remaining_max_c")
+    if remaining_max is None:
+        return False
+    # Asymmetric range plausibility
+    if observed_max_c > -50:
+        # If we already have observations, HRRR can't be below observed
+        # (the day can't end colder than what's already happened).
+        # Allow 0.5°C slack for HRRR being slightly stale vs. our latest
+        # METAR cycle.
+        if remaining_max < observed_max_c - 0.5:
+            return False
+    # Reject obviously-broken cycles where HRRR is >8°C away from
+    # forecast in either direction.
+    if abs(remaining_max - forecast_high_c) > 8.0:
+        return False
+    trajectory = hrrr_data.get("trajectory") or []
+    if not trajectory:
+        return False
+    for pt in trajectory:
+        if pt.get("temp_c") is None:
+            return False
+    return True
+
+
+def is_rapid_model_trajectory_plateaued(
+    trajectory: list[dict],
+    plateau_tolerance_c: float = 0.3,
+    minimum_horizon_h: int = 2,
+) -> bool:
+    """Return True if the rapid-update model's trajectory says the day
+    has already topped out — i.e. the next `minimum_horizon_h` hours
+    show NO rise above the current value by more than `plateau_tolerance_c`.
+
+    This is the HRRR-driven replacement for the wall-clock
+    `hours_since_observed_peak` narrowing trigger.  When True, the
+    caller should accelerate the post-peak narrowing (start the σ
+    contraction immediately and pull μ aggressively toward observed_max)
+    regardless of clock time.
+
+    Returns False if the trajectory is too short or shows continued rise.
+    """
+    if not trajectory or len(trajectory) < minimum_horizon_h:
+        return False
+    # Compare each subsequent reading to the current (first) hour's value.
+    current_c = trajectory[0]["temp_c"]
+    horizon = trajectory[:max(minimum_horizon_h, len(trajectory))]
+    max_in_horizon = max(pt["temp_c"] for pt in horizon)
+    return (max_in_horizon - current_c) <= plateau_tolerance_c
+
+
+# ---------------------------------------------------------------------------
 # Neighbor signal — adjust posterior based on upwind neighbor cooling
 # ---------------------------------------------------------------------------
 
@@ -1020,6 +1250,8 @@ def estimate_day_high_dist(forecast_high: float, forecast_peak_hour: int,
                             base_sigma_c: float | None = None,
                             ensemble_stats: dict | None = None,
                             cooling_confidence: float = 0.0,
+                            hrrr_remaining_max: float | None = None,
+                            hrrr_plateau_signal: bool = False,
                             ) -> tuple[float, float]:
     """Returns (mu, sigma) of the day-high distribution after all adjustments.
 
@@ -1038,10 +1270,44 @@ def estimate_day_high_dist(forecast_high: float, forecast_peak_hour: int,
     narrows sigma proportionally on top of all other narrowing branches.
     Bin-lock (mu = bin_center) is applied separately in predict_bins
     when cooling_confidence >= STRONG_COOLING_THRESHOLD.
+
+    hrrr_remaining_max: optional fresh CAM (HRRR / ICON-D2) projection
+    of remaining-day max temperature.  When provided AND lower than the
+    morning forecast by >0.5°C, μ recenters from forecast_high toward
+    max(observed_max, hrrr_remaining_max).  This is the skepticism
+    mechanism: HRRR has assimilated today's actual conditions; if it
+    disagrees with the morning forecast, prefer it.  Spec §3.2.
+
+    hrrr_plateau_signal: True when HRRR's next 2-3h trajectory shows
+    no further rise (the day is done climbing).  When True, the
+    day_has_likely_peaked gate fires regardless of wall-clock — closes
+    the lag in the existing wall-clock branch.  Wall-clock stays as
+    fallback for cold-start days and non-CAM cities where HRRR isn't
+    available.  Spec §3.4.
     """
     mu = forecast_high
     sigma = base_sigma_c if base_sigma_c is not None else DEFAULT_FORECAST_SIGMA_C
     sigma_ceiling = sigma   # for later clamps that reference the prior
+
+    # === HRRR μ RECENTER (skepticism mechanism) ===
+    # When a fresh CAM run disagrees with the morning forecast by
+    # > 0.5°C in the cooler direction, prefer the CAM.  It has
+    # assimilated today's actual clouds / boundary-layer conditions
+    # that the morning forecast was blind to.  This is the Atlanta /
+    # NYC plateau case: morning forecast said 34°C, HRRR says
+    # remaining-day max is 32.5°C, observed_max is 32.8°C.  μ should
+    # be ~32.8 (HRRR-aligned), not 34 (forecast-anchored).
+    #
+    # We don't replace the existing observed_max-based pull (FIX 1a
+    # below); HRRR sets the starting μ, then observed_max can still
+    # override upward if obs exceeds HRRR.
+    if (hrrr_remaining_max is not None
+        and hrrr_remaining_max < forecast_high - 0.5):
+        # HRRR is materially more pessimistic — recenter on it.
+        # max(observed_max, hrrr_remaining_max) keeps the floor
+        # honest: μ never lands below what's already been observed.
+        obs_for_floor = observed_max if observed_max > -50 else -100.0
+        mu = max(obs_for_floor, hrrr_remaining_max)
 
     # ENSEMBLE PHASE 2 — mu blending toward neighbor consensus.  Done
     # BEFORE all the time-of-day adjustments so the obs-based logic
@@ -1109,6 +1375,7 @@ def estimate_day_high_dist(forecast_high: float, forecast_peak_hour: int,
         current_hour >= forecast_peak_hour            # past forecasted peak
         or (observed_max > -50
             and observed_max >= forecast_high - 1.0)  # obs reached forecast
+        or hrrr_plateau_signal                        # HRRR: trajectory flat
     )
     if (observed_max > -50
         and observed_peak_hour is not None
@@ -1221,12 +1488,26 @@ def bin_temp_range(bin_dict: dict) -> tuple[float | None, float | None]:
 def predict_bins(event: dict, settlement_obs: list[dict],
                   forecast: dict, neighbor_signal: dict,
                   current_hour: int, city: str | None = None,
-                  ensemble_stats: dict | None = None) -> dict:
+                  ensemble_stats: dict | None = None,
+                  cold_start_suspect: bool = False,
+                  lat: float | None = None,
+                  lon: float | None = None,
+                  tz_str: str | None = None) -> dict:
     """Per-event bin probability + edge + recommendation.
 
     ensemble_stats: optional output from compute_ensemble_stats() — when
     provided, the day-high mu/sigma estimation uses multi-station consensus
     for outlier detection (mu) and uncertainty calibration (sigma).
+
+    cold_start_suspect: when True, the HRRR ceiling dispatch is skipped
+    entirely (HRRR's "remaining hours" view can't recover a peak that
+    already happened before the bot's first scan).  Falls back to the
+    floor-only distribution path.  Computed by the scan loop's cold-
+    start detector in scheduled_predictor.
+
+    lat, lon, tz_str: settlement station coordinates and IANA timezone,
+    used to fetch the rapid-update CAM run.  Required for HRRR/ICON-D2
+    fetch; when None the HRRR ceiling dispatch is skipped.
     """
     bins = event.get("outcomes") or []
     if not bins or not forecast:
@@ -1265,6 +1546,41 @@ def predict_bins(event: dict, settlement_obs: list[dict],
         current_hour       = current_hour,
     )
 
+    # === HRRR ceiling dispatch (Phase 1, behind flag) ===
+    # When PREDICTOR_USE_HRRR_CEILING=1 and the city has a same_day_model
+    # assigned and the event isn't flagged cold-start, fetch the fresh
+    # CAM run.  Returns None on any failure → falls through to the
+    # legacy (HRRR-unaware) path.
+    hrrr_remaining_max: float | None = None
+    hrrr_plateau_signal = False
+    hrrr_used = False
+    if (PREDICTOR_USE_HRRR_CEILING
+        and not cold_start_suspect
+        and city is not None
+        and lat is not None and lon is not None and tz_str is not None):
+        try:
+            from station_meta import get_same_day_model  # type: ignore
+            model = get_same_day_model(city)
+        except Exception:
+            model = None
+        if model is not None:
+            try:
+                hrrr_data = fetch_rapid_model_remaining_max(
+                    lat, lon, tz_str, model)
+            except Exception as e:
+                log.warning(f"HRRR fetch raised for {city}: {e}")
+                hrrr_data = None
+            if hrrr_data and _hrrr_data_passes_sanity(hrrr_data,
+                                                        observed_max_c,
+                                                        bias_corrected_forecast):
+                hrrr_remaining_max = hrrr_data["remaining_max_c"]
+                hrrr_plateau_signal = is_rapid_model_trajectory_plateaued(
+                    hrrr_data["trajectory"])
+                hrrr_used = True
+                log.debug(f"HRRR {model} for {city}: "
+                          f"remaining_max={hrrr_remaining_max:.2f}°C, "
+                          f"plateau={hrrr_plateau_signal}")
+
     mu, sigma = estimate_day_high_dist(
         forecast_high       = bias_corrected_forecast,
         forecast_peak_hour  = forecast["forecast_peak_hour"],
@@ -1276,6 +1592,8 @@ def predict_bins(event: dict, settlement_obs: list[dict],
         base_sigma_c        = base_sigma,
         ensemble_stats      = ensemble_stats,
         cooling_confidence  = cooling_confidence,
+        hrrr_remaining_max  = hrrr_remaining_max,
+        hrrr_plateau_signal = hrrr_plateau_signal,
     )
 
     truncate_at = observed_max_c if observed_max_c > -100 else -100.0
@@ -1335,15 +1653,28 @@ def predict_bins(event: dict, settlement_obs: list[dict],
                      f"falling back to gaussian")
         day_high_cdf = make_gaussian_cdf(mu, sigma)
 
+    # Upper truncation from the HRRR ceiling (Phase 1 of the HRRR plan).
+    # When HRRR is active and passed sanity, cap the distribution at
+    # `hrrr_remaining_max + ceiling_buffer`.  Buffer is intentionally
+    # generous (default 1.0°C, asymmetric-loss reasoning per W3 spec):
+    # clipping a bin that wins is a total loss; leaving slightly too
+    # much upper tail is a mild misize.
+    #
+    # When HRRR isn't active, truncate_at_hi stays None and the
+    # distribution behaves exactly as it did pre-HRRR.
+    truncate_at_hi = None
+    if hrrr_used and hrrr_remaining_max is not None:
+        truncate_at_hi = hrrr_remaining_max + PREDICTOR_HRRR_CEILING_BUFFER_C
+
     bin_results = []
     for b in bins:
         c_lo, c_hi = bin_temp_range(b)
-        # Pre-W3: only the observed_max-derived lower truncation.  W3
-        # will add truncate_at_hi from the physical-ceiling model.
+        # truncate_at_lo: observed_max (the rising floor).
+        # truncate_at_hi: HRRR ceiling when active, else None (legacy).
         p = probability_in_bin(
             c_lo, c_hi, day_high_cdf,
             truncate_at_lo=truncate_at,
-            truncate_at_hi=None,
+            truncate_at_hi=truncate_at_hi,
         )
         market_p = float(b.get("yes_price") or 0)
         edge = p - market_p
@@ -1370,6 +1701,10 @@ def predict_bins(event: dict, settlement_obs: list[dict],
         "mu":                 round(mu, 2),
         "sigma":              round(sigma, 2),
         "cdf_used":           cdf_used,           # "gaussian" | "empirical"
+        "hrrr_used":          hrrr_used,
+        "hrrr_remaining_max": hrrr_remaining_max,
+        "hrrr_plateau_signal": hrrr_plateau_signal,
+        "truncate_at_hi":     truncate_at_hi,
         "cooling_confidence": round(cooling_confidence, 3),
         "cooling_reason":     cooling_reason,
         "bin_locked":         bin_locked,
