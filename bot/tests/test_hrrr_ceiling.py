@@ -357,3 +357,70 @@ def test_unknown_city_returns_none():
     added without same-day-model assignment yet."""
     assert get_same_day_model("Atlantis") is None
     assert get_same_day_model("") is None
+
+
+# ============================================================
+# Open-Meteo API model-name translation
+# ============================================================
+# Regression: 2026-06-13 the live VPS was returning HTTP 400 on every
+# HRRR fetch because the fetcher passed `models=hrrr`, but Open-Meteo
+# restructured the model identifiers — the correct values are now
+# `gfs_hrrr` (NOAA) and `dwd_icon_d2` (DWD).  The logical names stay
+# as-is (used in data_quality_flag / station_meta / tests); only the
+# HTTP-layer parameter is translated.
+
+def test_fetcher_translates_hrrr_to_gfs_hrrr(monkeypatch):
+    """Calling fetch_rapid_model_remaining_max(model='hrrr') must hit
+    Open-Meteo with models=gfs_hrrr.  If a future commit reverts this,
+    the live bot will silently 400 again on every CONUS city."""
+    from scripts import intraday_predictor as ip
+    captured = {}
+
+    class _FakeResp:
+        def raise_for_status(self): pass
+        def json(self):
+            return {"hourly": {"time": [], "temperature_2m": [], "cloud_cover": []}}
+
+    def _fake_get(url, params=None, timeout=None):
+        captured["url"] = url
+        captured["params"] = params
+        return _FakeResp()
+
+    monkeypatch.setattr(ip.httpx, "get", _fake_get)
+    ip.fetch_rapid_model_remaining_max(40.78, -73.88,
+                                          "America/New_York", "hrrr")
+    assert captured["params"]["models"] == "gfs_hrrr", (
+        f"Expected models=gfs_hrrr, got {captured['params'].get('models')!r}"
+    )
+
+
+def test_fetcher_translates_icon_d2_to_dwd_icon_d2(monkeypatch):
+    """Same regression coverage for ICON-D2: Open-Meteo's API name is
+    dwd_icon_d2, not the bare icon_d2."""
+    from scripts import intraday_predictor as ip
+    captured = {}
+
+    class _FakeResp:
+        def raise_for_status(self): pass
+        def json(self):
+            return {"hourly": {"time": [], "temperature_2m": [], "cloud_cover": []}}
+
+    monkeypatch.setattr(ip.httpx, "get",
+        lambda url, params=None, timeout=None: (
+            captured.update({"params": params}) or _FakeResp()))
+    ip.fetch_rapid_model_remaining_max(48.14, 11.58,
+                                          "Europe/Berlin", "icon_d2")
+    assert captured["params"]["models"] == "dwd_icon_d2"
+
+
+def test_fetcher_returns_none_on_unsupported_model(monkeypatch):
+    """Unknown logical model names short-circuit to None without
+    issuing an HTTP request."""
+    from scripts import intraday_predictor as ip
+    called = {"n": 0}
+    monkeypatch.setattr(ip.httpx, "get",
+        lambda *a, **k: called.__setitem__("n", called["n"] + 1))
+    result = ip.fetch_rapid_model_remaining_max(
+        40.0, -100.0, "UTC", "garbage_model")
+    assert result is None
+    assert called["n"] == 0, "should not issue HTTP for unknown model"

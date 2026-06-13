@@ -953,7 +953,21 @@ def fetch_rapid_model_remaining_max(
 
     Caller is responsible for staleness/sanity gates and feature-flag.
     """
-    if model not in ("hrrr", "icon_d2", "ncep_hrrr"):
+    # Logical name (used in data_quality_flag, station_meta, tests)
+    # → Open-Meteo API model name.  Open-Meteo restructured the model
+    # identifiers some time after the spec was written: HRRR is exposed
+    # as `gfs_hrrr` (NOAA branch), ICON-D2 as `dwd_icon_d2` (DWD branch).
+    # Verified live 2026-06-13 against the production VPS — the bare
+    # `models=hrrr` value returns HTTP 400 with no body; the prefixed
+    # form returns full hourly data.  Keep the logical names stable so
+    # the `*_ceiling_applied` data-quality flag values don't churn.
+    _API_MODEL_NAME = {
+        "hrrr":      "gfs_hrrr",
+        "ncep_hrrr": "gfs_hrrr",
+        "icon_d2":   "dwd_icon_d2",
+    }
+    api_model = _API_MODEL_NAME.get(model)
+    if api_model is None:
         log.warning(f"fetch_rapid_model: unsupported model {model!r}; "
                      "returning None")
         return None
@@ -964,7 +978,7 @@ def fetch_rapid_model_remaining_max(
                 "latitude":      lat,
                 "longitude":     lon,
                 "hourly":        "temperature_2m,cloud_cover",
-                "models":        model,
+                "models":        api_model,
                 "timezone":      tz_str,
                 "forecast_days": 1,
             },
