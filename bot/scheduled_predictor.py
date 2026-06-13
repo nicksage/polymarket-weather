@@ -1530,8 +1530,25 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                 # 18:32 because API hadn't seen 92-93°F fill yet, ended
                 # up holding both bins on a MAX_BINS_PER_EVENT=1 event).
                 # Pending orders are paper-mode no-op (empty set).
+                #
+                # FIX 3 (2026-06-13): scope _pending_today to THIS
+                # event's bins.  pending_contracts_today() returns the
+                # cross-event union; without this intersection, a
+                # single pending order on one city (e.g. Seattle)
+                # would propagate into every other event's
+                # committed_contracts and fire event_at_cap_today
+                # everywhere — observed live with one Seattle order
+                # capping Atlanta/Austin/Chicago/Dallas/Denver.  The
+                # cause was that market_open.get(c, True) defaulted
+                # to True for contracts not in the current event's
+                # bin map, so cross-event pending tokens slipped
+                # through the open-market filter.  Intersecting at
+                # the source keeps the NYC same-event guarantee while
+                # eliminating the cross-event pollution.
                 if PREDICTOR_MODE == "live":
-                    _pending_today = pending_contracts_today(conn)
+                    _this_event_contracts = set(market_open.keys())
+                    _pending_today = (pending_contracts_today(conn)
+                                       & _this_event_contracts)
                 else:
                     _pending_today = set()
                 committed_contracts = held_contracts | _pending_today

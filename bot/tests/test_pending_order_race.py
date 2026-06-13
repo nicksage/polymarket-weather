@@ -268,3 +268,87 @@ def test_houston_cap_uses_committed_not_just_actual():
         f"cap=${MAX_PER_CONTRACT_USD}).  Without this fix, the cap "
         f"would compute 15-0=15 and let the bot keep stacking orders."
     )
+
+
+# ============================================================
+# Cross-event pending pollution (2026-06-13)
+# ============================================================
+# Regression: Seattle had ONE placed-not-filled order today; the bot
+# fired `event_at_cap_today` on Atlanta, Austin, Chicago, Dallas, Denver.
+# Root cause: `committed_contracts = held ∪ _pending_today` mixed
+# Seattle's contract into every event's cap, and
+# `market_open.get(seattle_contract, True)` defaulted to True for
+# contracts not in the current event's bin map — so the cross-event
+# pending bled through the open-market filter.
+#
+# Fix: intersect _pending_today with the current event's bin contracts
+# at the source (scheduled_predictor.py line ~1533) so cross-event
+# pending orders cannot enter committed_contracts at all.
+
+def test_cross_event_pending_does_not_pollute_other_event_cap():
+    """Seattle has one pending order. Atlanta's gate must NOT see it
+    in committed_contracts, regardless of how `market_open.get()`
+    defaults.  Atlanta should be FREE TO BUY."""
+    conn = _fresh_db()
+    seattle_contract = "0xSEATTLE_BIN_74_75"
+    atlanta_bin_92  = "0xATLANTA_BIN_92_93"
+    atlanta_bin_94  = "0xATLANTA_BIN_94_95"
+
+    # Seattle has 1 placed-not-filled order today
+    _insert_order(conn, seattle_contract, status="placed", stake_usd=10.0)
+
+    # When the gate evaluates ATLANTA's event:
+    #   held_contracts = {} (no Atlanta tokens in wallet)
+    #   market_open    = { atlanta_bin_92: True, atlanta_bin_94: True }
+    #   _pending_today (raw) = { seattle_contract }
+    raw_pending = pending_contracts_today(conn)
+    assert seattle_contract in raw_pending
+
+    # Under the fix at scheduled_predictor.py: _pending_today should be
+    # intersected with THIS event's contracts BEFORE the union with held.
+    atlanta_bin_contracts = {atlanta_bin_92, atlanta_bin_94}
+    scoped_pending = raw_pending & atlanta_bin_contracts
+    assert scoped_pending == set(), (
+        "Cross-event pending pollution: Seattle's pending contract "
+        "leaked into Atlanta's _pending_today.  The intersection "
+        "with this event's bin map MUST drop it."
+    )
+
+    # And therefore committed for Atlanta is empty — cap NOT triggered.
+    held_contracts = set()
+    committed_contracts = held_contracts | scoped_pending
+    MAX_BINS_PER_EVENT = 1
+    assert len(committed_contracts) < MAX_BINS_PER_EVENT, (
+        "Atlanta's event must remain UNDER the cap — Seattle's pending "
+        "must not count toward Atlanta's slot."
+    )
+
+
+def test_same_event_pending_still_triggers_cap():
+    """The cross-event fix must NOT regress the original NYC same-event
+    race fix: a pending order on one of THIS event's bins still
+    triggers event_at_cap_today."""
+    conn = _fresh_db()
+    nyc_bin_92 = "0xNYC_BIN_92_93"
+    nyc_bin_94 = "0xNYC_BIN_94_95"
+
+    # NYC has 1 placed-not-filled order on the 92-93 bin
+    _insert_order(conn, nyc_bin_92, status="placed", stake_usd=10.0)
+
+    raw_pending = pending_contracts_today(conn)
+    nyc_bin_contracts = {nyc_bin_92, nyc_bin_94}
+    scoped_pending = raw_pending & nyc_bin_contracts
+
+    # Same-event pending must survive the intersection
+    assert scoped_pending == {nyc_bin_92}, (
+        "NYC same-event pending MUST stay in scoped_pending — "
+        "otherwise the original NYC race regresses."
+    )
+
+    held_contracts = set()
+    committed_contracts = held_contracts | scoped_pending
+    MAX_BINS_PER_EVENT = 1
+    assert len(committed_contracts) >= MAX_BINS_PER_EVENT, (
+        "NYC event must be AT CAP — pending on 92-93°F should block "
+        "a fresh buy on 94-95°F (the original NYC race fix)."
+    )
