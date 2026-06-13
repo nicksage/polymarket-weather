@@ -131,6 +131,25 @@ MIN_MARKET_PROB = float(os.getenv("PREDICTOR_MIN_MARKET_PROB", "0.15"))
 PREDICTOR_BUY_MODE = os.getenv("PREDICTOR_BUY_MODE", "edge").lower()
 PREDICTOR_MIN_PROB_TO_BUY = float(os.getenv("PREDICTOR_MIN_PROB_TO_BUY", "0.50"))
 
+# === Per-mode execution price ceiling (2026-06-13) ===
+# execute_signal in execution.py historically used MPV_MAX_PRICE (default
+# 0.32) as a global ceiling — that's correct for the MPV strategy which
+# specifically hunts for under-priced bins below 32¢.  But in
+# PREDICTOR_BUY_MODE=probability the bot is supposed to buy any bin
+# whose our_p clears the threshold, including expensive ones near $1.
+# MPV's 32¢ cap silently rejected every order whose best_ask exceeded
+# (0.32 - ORDERBOOK_WALK_CENTS/100) — observed live on 2026-06-13 when
+# Atlanta/Austin/Dallas/Denver/NYC orders posted at limit=0.32 against
+# best_asks of 0.37–0.95 and sat with sweepable=$0.00.
+#
+# Fix: probability mode uses its OWN ceiling (default 0.85), passed via
+# the signal dict to execute_signal.  Edge mode and external callers
+# unaffected — they still fall back to MPV_MAX_PRICE.  Set to 0.95+ if
+# you want to buy near-certainty bins (small profit ceiling); 0.85 is a
+# sane balance between aggression and "don't pay $0.95 for a $1 token."
+PREDICTOR_PROBABILITY_MAX_PRICE = float(
+    os.getenv("PREDICTOR_PROBABILITY_MAX_PRICE", "0.85"))
+
 # W4 — market-anchored risk cap.  Blowup-preventer for the case where a
 # liquid market disagrees with our model by a huge margin.  Reasoning:
 # our_p = 95% and mkt_p = 5% on a $25k-liquid market is almost certainly
@@ -1059,6 +1078,16 @@ def execute_live(conn, signal_id: int, city: str, ev: dict, b: dict,
         write_live_order(conn, row)
         return row
 
+    # Per-mode execution price ceiling.  Probability mode wants to
+    # buy expensive high-confidence bins (e.g., $0.70 YES on a bin we
+    # think is 90% likely); MPV_MAX_PRICE=0.32 would silently reject
+    # all of those.  Edge mode keeps the MPV default by passing None
+    # (execute_signal falls back to its own MPV_MAX_PRICE import).
+    if PREDICTOR_BUY_MODE == "probability":
+        _max_price_cap = PREDICTOR_PROBABILITY_MAX_PRICE
+    else:
+        _max_price_cap = None   # → execute_signal uses MPV_MAX_PRICE
+
     sig_for_exec = {
         "contract_id":      b["contract_id"],
         "yes_token_id":     b.get("yes_token_id"),
@@ -1078,6 +1107,7 @@ def execute_live(conn, signal_id: int, city: str, ev: dict, b: dict,
         "range_low":        b.get("range_low"),
         "range_high":       b.get("range_high"),
         "unit":             b.get("unit"),
+        "max_price_cap":    _max_price_cap,
     }
     try:
         result = execute_signal(sig_for_exec, client=client)

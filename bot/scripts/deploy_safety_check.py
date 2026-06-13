@@ -130,6 +130,12 @@ REQUIRED_NAMES: list[str] = [
     "PREDICTOR_BUY_MODE",
     "PREDICTOR_MIN_PROB_TO_BUY",
     "low_prob",                              # probability-mode gate reason
+
+    # --- Per-mode execution price ceiling (2026-06-13) ---
+    # Probability mode must thread its own max_price_cap to execute_signal,
+    # otherwise expensive bins silently hit MPV_MAX_PRICE=0.32 and never fill.
+    "PREDICTOR_PROBABILITY_MAX_PRICE",
+    "max_price_cap",                         # key in sig_for_exec dict
 ]
 
 

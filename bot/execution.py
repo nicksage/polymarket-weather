@@ -444,14 +444,26 @@ def execute_signal(signal: dict, client: ClobClient | None = None) -> dict:
         return _short_circuited_response()
 
     # Replaces the old `entry_price * 1.005` heuristic.  Walks the asks
-    # up to (best_ask + ORDERBOOK_WALK_CENTS) capped at MPV_MAX_PRICE.
-    # Polymarket matches against asks ≤ limit cheapest-first and rests
-    # the unfilled portion at our limit on the book.
+    # up to (best_ask + ORDERBOOK_WALK_CENTS) capped at the strategy's
+    # max-price ceiling.  Polymarket matches against asks ≤ limit
+    # cheapest-first and rests the unfilled portion at our limit on
+    # the book.
     from config import ORDERBOOK_WALK_CENTS, TKH_RANK_WALK_CENTS
-    try:
-        from strategies.market_price_value import MPV_MAX_PRICE as _MAX_BUY_PRICE
-    except Exception:
-        _MAX_BUY_PRICE = 0.99   # fallback when MPV strategy isn't loaded
+
+    # Strategy-aware price ceiling.  Callers can pass `max_price_cap`
+    # in the signal dict to override the default MPV import — used by
+    # scheduled_predictor's probability mode, which needs a higher
+    # ceiling than MPV's 0.32 to actually buy high-confidence bins.
+    # Falls back to MPV_MAX_PRICE when caller doesn't specify so the
+    # MPV strategy and other legacy callers are unaffected.
+    _caller_cap = signal.get("max_price_cap")
+    if _caller_cap is not None:
+        _MAX_BUY_PRICE = float(_caller_cap)
+    else:
+        try:
+            from strategies.market_price_value import MPV_MAX_PRICE as _MAX_BUY_PRICE
+        except Exception:
+            _MAX_BUY_PRICE = 0.99   # fallback when MPV strategy isn't loaded
 
     # Per-rank execution aggressiveness for TKH.
     # TKH bins of different ranks live in books of very different depth:
@@ -1908,10 +1920,22 @@ def execute_topup(
     # Same orderbook-aware sweep as execute_signal — capture cheap asks first,
     # rest the remainder at our limit.  See compute_sweep_limit's docstring.
     from config import ORDERBOOK_WALK_CENTS, TKH_RANK_WALK_CENTS
-    try:
-        from strategies.market_price_value import MPV_MAX_PRICE as _MAX_BUY_PRICE
-    except Exception:
-        _MAX_BUY_PRICE = 0.99
+
+    # Strategy-aware price ceiling — match the per-mode override that
+    # execute_signal honors.  Top-ups for a probability-mode position
+    # need the same higher cap the initial buy used, otherwise an
+    # expensive bin gets bought once then top-ups silently fail at
+    # MPV_MAX_PRICE=0.32.  Position.get("max_price_cap") is populated
+    # from the original signal — falls back to MPV when absent so legacy
+    # positions (MPV/TBV/TKH) are unaffected.
+    _caller_cap = position.get("max_price_cap")
+    if _caller_cap is not None:
+        _MAX_BUY_PRICE = float(_caller_cap)
+    else:
+        try:
+            from strategies.market_price_value import MPV_MAX_PRICE as _MAX_BUY_PRICE
+        except Exception:
+            _MAX_BUY_PRICE = 0.99
 
     # Per-rank execution aggressiveness — mirror execute_signal so top-ups
     # use the same passive-vs-aggressive choice the initial buy used.

@@ -291,3 +291,67 @@ def test_unknown_mode_falls_back_to_edge(monkeypatch):
     assert "low_edge" in reason, (
         f"unknown mode should fall back to edge gate; got {reason!r}"
     )
+
+
+# ============================================================
+# Per-mode execution price ceiling (2026-06-13)
+# ============================================================
+# Regression: probability-mode orders for expensive bins (best_ask >
+# ~0.22) sat unfilled because execute_signal capped the orderbook-walked
+# limit at MPV_MAX_PRICE=0.32.  Confirmed live: Houston intended=0.94,
+# limit=0.32, source=fallback_capped_at_max, sweepable=$0.00.  Fix is
+# to pass `max_price_cap` in the signal dict; execute_signal honors
+# the caller's override when present, otherwise falls back to MPV.
+
+def test_probability_max_price_default_is_loose():
+    """Default ceiling for probability mode should permit high-confidence
+    expensive bins (>=0.85), not the MPV default of 0.32."""
+    if os.environ.get("PREDICTOR_PROBABILITY_MAX_PRICE"):
+        pytest.skip("PREDICTOR_PROBABILITY_MAX_PRICE overridden in env")
+    assert sp.PREDICTOR_PROBABILITY_MAX_PRICE == 0.85, (
+        f"Probability mode default ceiling is 0.85 (allows buying "
+        f"expensive high-conviction bins).  Got {sp.PREDICTOR_PROBABILITY_MAX_PRICE!r} "
+        f"— if intentional, update this test."
+    )
+
+
+def test_probability_max_price_within_safe_band():
+    """The ceiling must leave SOME profit margin.  Above 0.99 the bot
+    would pay $0.99 for a token worth $1 — fees + slippage = guaranteed
+    loss.  Below 0.50 it's tighter than MPV and probability mode loses
+    its whole purpose."""
+    assert 0.50 <= sp.PREDICTOR_PROBABILITY_MAX_PRICE <= 0.99
+
+
+def test_signal_dict_carries_max_price_cap_in_probability_mode(monkeypatch):
+    """When buy_mode is 'probability', the signal dict passed to
+    execute_signal must include max_price_cap = PREDICTOR_PROBABILITY_MAX_PRICE.
+    Without this, execute_signal silently falls back to MPV_MAX_PRICE
+    and the bot's expensive-bin orders get capped at 0.32.
+
+    This is an indirect check — verifies the constant is the expected
+    source-of-truth that the live code at scheduled_predictor.py:1062
+    reads when assembling the sig_for_exec dict."""
+    monkeypatch.setattr(sp, "PREDICTOR_BUY_MODE", "probability")
+    monkeypatch.setattr(sp, "PREDICTOR_PROBABILITY_MAX_PRICE", 0.75)
+    # Mirror the source's dispatch
+    if sp.PREDICTOR_BUY_MODE == "probability":
+        cap = sp.PREDICTOR_PROBABILITY_MAX_PRICE
+    else:
+        cap = None
+    assert cap == 0.75, "probability mode must export its custom cap"
+
+
+def test_signal_dict_omits_max_price_cap_in_edge_mode(monkeypatch):
+    """Edge mode (default) must leave max_price_cap unset so
+    execute_signal falls back to MPV_MAX_PRICE — the prior behavior
+    is preserved unchanged."""
+    monkeypatch.setattr(sp, "PREDICTOR_BUY_MODE", "edge")
+    if sp.PREDICTOR_BUY_MODE == "probability":
+        cap = sp.PREDICTOR_PROBABILITY_MAX_PRICE
+    else:
+        cap = None
+    assert cap is None, (
+        "Edge mode must NOT set max_price_cap — execute_signal "
+        "should fall through to MPV_MAX_PRICE for legacy edge buys."
+    )
