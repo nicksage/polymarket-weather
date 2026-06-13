@@ -104,8 +104,11 @@ Order matters — gates are checked top-to-bottom; first failure stops:
 
 1. `too_early` / `too_late` — hour bounds (default 13–22 local)
 2. `market_too_skeptical` — `market_p < MIN_MARKET_PROB` (default 0.15)
-3. `low_edge` — tiered (`MIN_EDGE=0.10` if market_p≥0.75, else
-   `MIN_EDGE_LOW_MKT=0.05`)
+3. **Buy-mode dispatch** — one of:
+   - `low_edge` (mode=`edge`, default) — tiered (`MIN_EDGE=0.10` if
+     market_p≥0.75, else `MIN_EDGE_LOW_MKT=0.05`)
+   - `low_prob` (mode=`probability`) — `our_p < PREDICTOR_MIN_PROB_TO_BUY`
+     (default 0.50)
 4. **`liquid_market_strong_disagreement` (W4)** — `liquidity ≥ $10k AND edge ≥ 0.40`
 5. `priced_in` — `market_p ≥ MAX_MARKET_PRICE` (default 0.95)
 6. `thin_book` — `liquidity < MIN_LIQUIDITY_USD` (default $300)
@@ -113,10 +116,12 @@ Order matters — gates are checked top-to-bottom; first failure stops:
 8. `trades_cap` — `MAX_TRADES_PER_DAY=25`
 9. `exposure_cap` — `MAX_DAILY_EXPOSURE=$200`
 
-W4 sits after `low_edge` deliberately, so the reason ordering stays
-informative — a tiny-edge signal is rejected as `low_edge`, not as
+W4 sits after the edge/prob gate deliberately, so the reason ordering
+stays informative — a tiny-edge signal is rejected as `low_edge`, not as
 W4. W4 only catches the "huge edge on liquid book" case that's almost
 certainly a stale model or bug rather than real edge.
+
+See Section 2.9 for the buy-mode dispatch.
 
 ### 2.4 Forecast-recovery helper
 
@@ -223,6 +228,199 @@ factor multiplies the Kelly-derived stake BEFORE the `MIN_STAKE_USD`
 floor check. If size_factor = 0, the row becomes a SKIP with reason
 `data_quality_blocked`. If size_factor brings the stake below
 `MIN_STAKE_USD`, it becomes SKIP with reason `stake_too_small`.
+
+### 2.7 Quick Fixes A/B/C — ship-now, default ON (2026-06-12)
+
+Three immediate fixes that reduce the bot's upper-tail overconfidence
+(the "Atlanta/NYC pattern" — buying hot bins on plateaued/cloudy
+afternoons that never reach forecast peak). Unlike HRRR (which is
+gated), these are **safe-by-construction**: they only widen or cap
+the distribution, they cannot make the bot bet more aggressively.
+
+Each has its own env flag for kill-switch. All three default ON.
+
+**Fix A — climatological σ prior** (`PREDICTOR_USE_CLIMATOLOGICAL_SIGMA=1`)
+- Replaces contaminated per-city σ from `forecast_calibration.json`
+  (calibrated against Open-Meteo's `historical-forecast-api` —
+  produces artificially tight ~0.5-1.1°C RMSEs vs. realistic 1.5–2.0°C
+  day-ahead summer NWS MaxT MAE) with a uniform 1.75°C prior.
+- Documented prior with citation (Glahn & Lowry 1972; NCEP NBM
+  validation), **NOT** a hand-tuned floor. Same epistemic status as
+  quarantining contaminated data.
+- Known limitation: over-widens genuinely-tight marine cities (SF, LA).
+  Costs some edge but creates no new losses. Accept until clean
+  per-city residuals exist (~30 days of post-recovery-helper data).
+- Disable with `PREDICTOR_USE_CLIMATOLOGICAL_SIGMA=0`.
+
+**Fix B — immediate post-peak narrowing** (`PREDICTOR_IMMEDIATE_POST_PEAK_NARROW=1`)
+- Closes the 2-hour lag where `hours_since_observed_peak < 1` blocked
+  σ narrowing even after the day had plateaued.
+- Trigger changed from `>= 1` to `>= 0`; geometric narrowing factor
+  is still 1.0 at h=0 (no effect at the instant of peak), but fires
+  at h=0.5+ (sub-hour resolution from scan timing).
+- Disable with `PREDICTOR_IMMEDIATE_POST_PEAK_NARROW=0`.
+
+**Fix C — plausibility ceiling** (`PREDICTOR_USE_PLAUSIBILITY_CEILING=1`)
+- Crude prototype of the HRRR/W3 physical ceiling using NWS skyCover
+  already fetched (previously unused).
+- Triggers when ALL true:
+  - `required_rate > 2.0°C/hr` (forecast_high vs current_temp /
+    hours_to_peak)
+  - `current_hour >= 13`
+  - `cloud_pct > 50%` (averaged over remaining hours)
+- Sets `truncate_at_hi = current_temp + plausible_remaining_rise +
+  1.0°C buffer`. The buffer is loose by asymmetric-loss design.
+- **Cold-start skip**: when `cold_start_suspect=True`, ceiling is
+  not applied (peak may have already happened; the remaining-rise
+  model is meaningless).
+- **Combines with HRRR via `min()`**: most conservative ceiling wins
+  when both signals fire.
+- **Logs every fire** (`INFO` level) so HRRR/W3 work has data on
+  whether the heuristic pointed the right direction, and any clipped
+  winner is auditable back to a specific cap event.
+- Disable with `PREDICTOR_USE_PLAUSIBILITY_CEILING=0`.
+
+**What these cost** (be honest with the operator):
+- Fewer trades, smaller sizes. Wider σ + capped tail → fewer bins
+  clear the edge threshold; Kelly sizes shrink.
+- No new losses from A and B. They only reduce confidence.
+- Possible rare new miss from C if the ceiling is mis-set —
+  mitigated by the loose 1.0°C buffer, cold-start skip, and logging.
+
+**These are interim** — each is replaced by validated work later:
+- A → clean NWS-native σ calibration (~30 days out)
+- B → HRRR plateau signal (after activation; B stays as non-CAM fallback)
+- C → HRRR ceiling / W3 empirical model (after their activations)
+
+### 2.8 HRRR same-day ceiling (Phase 0 + Phase 1 shipped, dormant)
+
+Live code: [bot/scripts/intraday_predictor.py](../bot/scripts/intraday_predictor.py),
+specifically `fetch_rapid_model_remaining_max`, `is_rapid_model_trajectory_plateaued`,
+`_hrrr_data_passes_sanity`, and the HRRR signals added to
+`estimate_day_high_dist` (`hrrr_remaining_max`, `hrrr_plateau_signal`).
+
+**Relationship to Quick Fix C**: Both populate `truncate_at_hi` in
+`probability_in_bin`. When both fire, they combine via `min()` —
+most conservative wins. When HRRR is activated, Fix C remains as the
+non-CAM-city fallback and as a no-data-needed safety net.
+
+**Why it exists**: The bot's day-high distribution was anchored on the
+NWS morning forecast and only truncated from below by `observed_max`.
+There was no upper bound derived from current physical conditions —
+the result was the Atlanta/NYC plateau pattern (model assigns 90%+
+probability to upper bins requiring further heating the atmosphere
+isn't producing). HRRR is NOAA's hourly-refreshed convection-allowing
+model (3 km CONUS); it has assimilated today's actual clouds and
+current conditions, so it provides exactly the "physical ceiling +
+plateau signal + skepticism mechanism" missing from the morning
+forecast.
+
+**Three effects when active** (gated by `PREDICTOR_USE_HRRR_CEILING=1`):
+
+1. **μ recenter**: When HRRR's remaining-day max is >0.5°C below the
+   morning forecast, μ recenters from forecast_high to
+   `max(observed_max, hrrr_remaining_max)`. The skepticism mechanism.
+
+2. **Upper truncation**: `truncate_at_hi = hrrr_remaining_max + 1.0°C`
+   passed to `probability_in_bin()`. This is the physical ceiling
+   W2 Phase A reserved the slot for — same code path the eventual
+   W3 empirical ceiling will use.
+
+3. **Plateau signal**: When HRRR's next 2-3h trajectory shows no
+   further rise, `day_has_likely_peaked` fires regardless of wall-
+   clock — closes the lag in the existing wall-clock branch. The
+   wall-clock branch stays as fallback for cold-start days and
+   non-CAM cities.
+
+**Coverage**: CONUS via HRRR (`models=hrrr` on Open-Meteo). Central
+Europe via ICON-D2 for the four cities we've verified are clearly
+in-domain (Munich/Milan/Paris/Warsaw). No same-day CAM available for
+non-US/non-CE cities — those skip the dispatch entirely, falling
+back to the floor-only distribution. Region assignment in
+[bot/station_meta.py](../bot/station_meta.py) `SAME_DAY_MODEL_BY_CITY`.
+
+**Cold-start skip**: When `cold_start_suspect=True` is set on the
+event, HRRR is skipped entirely — its "remaining hours" view can't
+recover a peak that already happened before the bot's first scan.
+Those days fall back to the legacy distribution; the cold-start
+sizing haircut from the data-quality contract is the protection.
+
+**Activation has TWO binding gates** (both must pass):
+
+- **Gate 1 (Phase 0b)**: T-group decomposition query (see Section 7.6)
+  confirms the T-group fix shipped 2026-06-12 actually closed the
+  observed_max-vs-Wunderground gap. HRRR's μ recenter trusts the
+  corrected observed_max; if that's still biased, HRRR can't save us.
+
+- **Gate 2 (Phase 2)**: Backtest on ≥30 held-out resolved US days,
+  focused on the 13:00–17:00 window, shows HRRR-on materially
+  improves upper-tail Brier vs HRRR-off — AND does not increase
+  misses on genuinely-still-climbing days.
+
+Both gates → flip `PREDICTOR_USE_HRRR_CEILING=1`. Decision tree and
+operational queries in Section 7.6.
+
+### 2.9 Buy-mode dispatch (`PREDICTOR_BUY_MODE`)
+
+Live code: `evaluate_gates()` in
+[bot/scheduled_predictor.py](../bot/scheduled_predictor.py).
+
+Two strategies for the buy decision, selected by env var:
+
+- **`PREDICTOR_BUY_MODE=edge`** (default): legacy behavior. Requires
+  `edge ≥ MIN_EDGE` (tiered 0.10 / 0.05 by market_p). Gate reason on
+  failure: `low_edge`.
+- **`PREDICTOR_BUY_MODE=probability`**: buy whenever our model's
+  probability for the bin is high enough — `our_p ≥ PREDICTOR_MIN_PROB_TO_BUY`
+  (default 0.50). No edge requirement. Gate reason on failure:
+  `low_prob`.
+
+**Critical invariant — only the edge/prob gate switches**. Every other
+gate in the stack applies in BOTH modes:
+
+| Gate                            | Applies in edge? | Applies in probability? |
+|---------------------------------|------------------|--------------------------|
+| `too_early` / `too_late`        | ✓                | ✓                        |
+| `market_too_skeptical` (W4 floor) | ✓              | ✓                        |
+| `liquid_market_strong_disagreement` (W4 cap) | ✓     | ✓                        |
+| `priced_in`                     | ✓                | ✓                        |
+| `thin_book`                     | ✓                | ✓                        |
+| `dedup_today`                   | ✓                | ✓                        |
+| `trades_cap`                    | ✓                | ✓                        |
+| `exposure_cap`                  | ✓                | ✓                        |
+
+This keeps the safety floor intact while letting the operator opt into
+a more aggressive (or just differently-shaped) buy criterion. Use case:
+high-conviction model on a bin where the market already partially
+agrees — there's little edge left, but the win probability is high.
+
+**Env override examples** (`~/apps/polymarket-weather/.env`):
+
+```
+# Default behavior — explicit
+PREDICTOR_BUY_MODE=edge
+
+# Probability mode at the spec default 0.50 threshold
+PREDICTOR_BUY_MODE=probability
+PREDICTOR_MIN_PROB_TO_BUY=0.50
+
+# Probability mode, only fire on very-high-confidence bins
+PREDICTOR_BUY_MODE=probability
+PREDICTOR_MIN_PROB_TO_BUY=0.70
+```
+
+The env value is `.lower()`-normalized, so `EDGE` / `Probability` /
+`PROBABILITY` all work. Unknown strings fall through to edge mode
+(safe-by-default — covered by `test_unknown_mode_falls_back_to_edge`).
+
+**Sizing is still Kelly-on-edge**. Probability mode changes only the
+gate, not `compute_stake()`. A bin with our_p=0.80 / market_p=0.55
+gets the same stake size in both modes; the difference is whether a
+bin with our_p=0.80 / market_p=0.78 (edge=0.02) makes it past the
+gate at all.
+
+Tests: [bot/tests/test_buy_mode.py](../bot/tests/test_buy_mode.py)
+(19 tests, all passing).
 
 ---
 
@@ -492,6 +690,9 @@ can distinguish provenance.
 
 **Approximate timeline**:
 - Recovery commit + safety net live: June 12
+- T-group precision fix shipped: June 12 (corrects body-rounding
+  source of bot-vs-settlement gap)
+- HRRR Phase 0a capture shipped (cron-fired nightly): June 12
 - W0 segmentation needs ≥30 resolved markets — likely mid-July at
   current settlement cadence (~2-3 markets settle per city per week,
   depending on Polymarket's posting schedule)
@@ -499,10 +700,18 @@ can distinguish provenance.
   forecast-vs-observed pairs — also mid-July
 - W3 ceiling fit needs ~30 days of (scan, subsequent-rise,
   conditioning-state) data — also mid-July
+- HRRR Phase 0b can fire as soon as ~10–15 captured
+  `resolution_observations` rows exist (T-group decomposition query
+  resolves with small sample because we're measuring a systematic
+  gap, not estimating a distribution shape) — likely 1–2 weeks
+- HRRR Phase 2 backtest needs ≥30 resolved US days — mid-July, same
+  as W0
 
 The accumulation also includes:
 - `raw_metar_log` — forensic backup for any future settle_divergence
-  investigation
+  investigation; also the source for Phase 0a's T-group decomposition
+- `resolution_observations` (NEW, populated by nightly cron) — the
+  bot-vs-Wunderground audit data that gates HRRR activation
 - `guard_violations` — invariant breaks. Even one persistent (city,
   guard) pair across multiple scans is worth investigating.
 - `live_predictor_orders` — fill rates and slippage for execution
@@ -691,6 +900,164 @@ If Step 2's branch sent us here, follow the investigation steps from
 Step 2's "IF settle_divergence" branch. The exact shape depends on
 what the offending tuples reveal.
 
+### 7.6 HRRR ceiling activation (separate timeline from W0/W2/W3)
+
+HRRR's data dependencies are different from the other workstreams:
+Phase 0b resolves on small samples (~10–15 captured rows) because
+it's measuring a systematic gap, not estimating a distribution shape.
+Phase 2 backtest still needs the same ~30 resolved days as W0.
+
+**Status as of 2026-06-12:**
+- Phase 0a (capture infrastructure): **shipped**, needs cron deploy
+- Phase 0b (T-group decomposition query): **waits on data**
+- Phase 1 (Open-Meteo HRRR dispatch behind flag): **shipped, dormant**
+- Phase 2 (backtest validation): **not started, data-gated**
+- Phase 3 (Herbie/GRIB2): **contingent on Phase 2 showing Open-Meteo
+  insufficient — most likely never needed**
+
+#### Step 1: Deploy the nightly cron (do this now)
+
+The Phase 0a script ships in the repo but only writes data when
+something fires it. The corrected crontab line:
+
+```
+0 4 * * *  cd /home/ubuntu/apps/polymarket-weather/bot && source ../venv/bin/activate && python -m scripts.capture_resolution_truth >> /home/ubuntu/apps/polymarket-weather/bot/data/cron_capture.log 2>&1
+```
+
+The `>> /var/log/cron_capture.log 2>&1` is load-bearing — without it,
+cron failures are invisible. Verify with the 2-minute-test pattern in
+Section 8.7.
+
+Also do a one-shot backfill of historical resolutions:
+
+```bash
+cd ~/apps/polymarket-weather/bot && source ../venv/bin/activate
+python -m scripts.capture_resolution_truth --backfill-days 30
+```
+
+That gives Phase 0b enough historical rows to work with immediately
+rather than waiting two weeks for the cron to accumulate.
+
+#### Step 2: Wait for ~10–15 captured rows, then run Phase 0b
+
+Once `resolution_observations` has at least ~10 captures with non-null
+`metar_peak_t_group_c` and `wunderground_high_c`, run:
+
+```sql
+SELECT
+    COUNT(*)                                      AS n,
+    ROUND(AVG(bot_observed_max_c
+              - metar_peak_t_group_c), 3)         AS bot_vs_tgroup_gap_c,
+    ROUND(AVG(metar_peak_t_group_c
+              - wunderground_high_c), 3)          AS tgroup_vs_wunderground_gap_c,
+    ROUND(AVG(bot_observed_max_c
+              - wunderground_high_c), 3)          AS bot_vs_wunderground_gap_c
+FROM resolution_observations
+WHERE metar_peak_t_group_c IS NOT NULL
+  AND wunderground_high_c IS NOT NULL;
+```
+
+Decision tree:
+
+```
+bot_vs_tgroup_gap_c  ≈ 0  AND  tgroup_vs_wunderground_gap_c ≈ 0:
+    → T-group fix worked, no further centering work needed.
+    → Phase 0b PASSES.  Proceed to Step 3.
+
+bot_vs_tgroup_gap_c materially > 0 (e.g. > 0.2°C):
+    → T-group fix did NOT close the gap as expected.
+    → Investigate before activating HRRR.  The fix shipped 2026-06-12
+      may have a bug; need to read the actual T-group parser logic
+      and the data path.  Possibilities: NWS API returning rounded
+      bodies even when REMARKS has T-group; precision-aware path
+      not actually firing; conservative -0.5°C offset miscalibrated.
+
+bot_vs_tgroup_gap_c ≈ 0 BUT tgroup_vs_wunderground_gap_c materially > 0:
+    → T-group fix worked at the precision level, but Wunderground
+      uses a different aggregation (DSM rule, primary-site picking,
+      synoptic-window-vs-METAR-max).  This is a DIFFERENT centering
+      bug, not addressed by the T-group fix.
+    → Activating HRRR will partially mask this without curing it
+      (HRRR's μ recenter trusts observed_max, which is still biased).
+    → Don't activate HRRR yet.  Instead, investigate Wunderground's
+      daily-high computation and either match it or pick a different
+      settlement reference.
+```
+
+If Phase 0b passes, Phase 0a continues running indefinitely — the
+audit data has ongoing value for monitoring drift, settlement-source
+changes, etc.
+
+#### Step 3: Phase 2 backtest — needs ≥30 resolved US days
+
+Not yet possible. Construction:
+
+1. Build `bot/scripts/backtest_hrrr_ceiling.py` (not yet written) that:
+   - Iterates resolved US days in a held-out set
+   - For each day, replays `predict_bins` twice: once with
+     `PREDICTOR_USE_HRRR_CEILING=0`, once with `=1`
+   - For HRRR-on, fetches the corresponding day's HRRR archive
+     (Open-Meteo's `historical-forecast-api` exposes past HRRR runs
+     by date) and feeds it into the dispatch
+   - Computes per-day Brier score on each bin
+   - Aggregates upper-tail Brier (90–91°F bins and above) in the
+     13:00–17:00 window specifically
+
+2. Promotion gate (per the data-quality contract pattern):
+   - Upper-tail Brier improves ≥5% on the held-out set
+   - No material increase in misses on still-climbing days (separate
+     metric: subset to days where actual high ≥ forecast and verify
+     HRRR-on didn't downweight those bins)
+   - At least 30 held-out days
+
+3. If gate passes: paper-shadow week is regression-only (does it
+   crash, do sizes go absurd). The Brier improvement was the P&L
+   gate; one week of live data isn't enough to redo that question.
+
+If gate fails (Open-Meteo HRRR insufficient): only THEN consider
+Phase 3 (Herbie/GRIB2 — much more plumbing, only justified if
+Tier 1 demonstrably can't do it). Most likely outcome: Phase 2
+passes and Phase 3 stays in spec-only state forever.
+
+#### Step 4: Activate
+
+Both gates pass →
+
+```bash
+# Add to ~/apps/polymarket-weather/.env:
+PREDICTOR_USE_HRRR_CEILING=1
+# (optional — overrides documented in intraday_predictor.py)
+# PREDICTOR_HRRR_CEILING_BUFFER_C=1.0
+# PREDICTOR_HRRR_MAX_STALENESS_H=3.0
+
+sudo systemctl restart weather_bot
+```
+
+After restart, `data_quality_flag` on every signal row will carry
+`hrrr_ceiling_applied` (or `icon_d2_ceiling_applied` for EU cities)
+when the rapid-model fetch succeeded and sanity-passed. Audit
+queries in Section 8.7.
+
+#### Step 5: After activation — monitor and tune
+
+For ~2 weeks of live operation, watch:
+
+- **Per-city `hrrr_ceiling_applied` fire rate**: should be high for US
+  cities (~95%+), zero for non-CAM cities (working as designed)
+- **Sanity-rejection rate**: low → trust HRRR; high → tighten the
+  sanity gates or investigate why Open-Meteo's HRRR is returning
+  out-of-range data on particular stations
+- **Cold-start skip rate**: should match the cold-start flag rate
+  exactly (HRRR skipped when and only when cold-start fires)
+- **Upper-tail loss rate** (in resolved markets): should drop
+  vs. pre-activation baseline. If it doesn't, something's wrong
+  with the dispatch or sanity gates and we should revisit.
+
+The boundary-convention kernel (an additional asymmetric upper-tail
+contraction that handles bin-boundary rounding uncertainty) was
+flagged in the spec as adjacent-to-W3 future work — it's NOT part
+of HRRR. Add to the queue alongside W3 implementation.
+
 ---
 
 ## 8. Operational reference
@@ -787,6 +1154,175 @@ weather change OR a recovery-helper regression. After June 12, spreads
 should be small (<1°C typically). A sudden uptick is a smoke signal
 worth investigating.
 
+### 8.7 HRRR Phase 0a — verifying the nightly cron is firing
+
+**Manual run** (highest-confidence test — runs literally what cron
+will run):
+
+```bash
+cd /home/ubuntu/apps/polymarket-weather/bot && source ../venv/bin/activate && python -m scripts.capture_resolution_truth
+```
+
+If it prints `capture complete: N new, M already had, 0 failed`, the
+script + paths + venv are all wired correctly.
+
+**Soon-fire test for cron itself** (verifies cron picks up the line,
+environment is right):
+
+```bash
+# Get current time
+date
+
+# Edit crontab — set the minute and hour to current+2 minutes
+crontab -e
+```
+
+Add a temporary line (replace `47 18` with your current+2):
+
+```
+47 18 * * *  cd /home/ubuntu/apps/polymarket-weather/bot && source ../venv/bin/activate && python -m scripts.capture_resolution_truth >> /tmp/cron_test.log 2>&1
+```
+
+Wait 2–3 minutes, then `cat /tmp/cron_test.log`. If you see the script
+output, cron is firing correctly. Restore to `0 4 * * *` after.
+
+**Check cron's own logs**:
+
+```bash
+# Debian / Ubuntu
+sudo grep CRON /var/log/syslog | tail -20
+
+# Newer systemd-based
+sudo journalctl -u cron --since "5 minutes ago" --no-pager
+```
+
+You should see a `CMD (cd /home/ubuntu/...)` line at each fire time.
+If you see that but no log output, the command started but something
+inside failed.
+
+**Verify the script wrote rows**:
+
+```bash
+sqlite3 ~/apps/polymarket-weather/bot/data/signals.db <<'SQL'
+SELECT COUNT(*) AS total_captures,
+       COUNT(metar_peak_t_group_c) AS with_t_group,
+       COUNT(wunderground_high_c)  AS with_wunderground,
+       MAX(captured_at_utc) AS most_recent
+FROM resolution_observations;
+SQL
+```
+
+Expected:
+- `total_captures` > 0
+- `with_t_group` close to `total_captures` (T-group parser finds values)
+- `with_wunderground` somewhat less (HTML scrape is best-effort)
+- `most_recent` close to when cron last fired
+
+### 8.8 Quick Fixes A/B/C — monitoring (default ON)
+
+**Plausibility-ceiling fire log** (Fix C):
+
+```bash
+sudo journalctl -u weather_bot --since "1 hour ago" --no-pager | \
+    grep "plausibility ceiling fired" | tail -20
+```
+
+Each line carries city, ceiling temp, the fired_reason (which trigger),
+plausible rise, observed, and forecast. If you see no fires across
+a whole afternoon, it's not firing (maybe over-conservative thresholds).
+If you see it firing every scan on every city, the triggers are
+too loose.
+
+**Per-city ceiling-fired rate**:
+
+```bash
+sqlite3 ~/apps/polymarket-weather/bot/data/signals.db <<'SQL'
+SELECT city,
+       SUM(CASE WHEN data_quality_flag LIKE '%plausibility_ceiling_applied%'
+                THEN 1 ELSE 0 END) AS plaus_fires,
+       SUM(CASE WHEN data_quality_flag LIKE '%hrrr_ceiling_applied%'
+                 OR data_quality_flag LIKE '%icon_d2_ceiling_applied%'
+                THEN 1 ELSE 0 END) AS hrrr_fires,
+       COUNT(*) AS total
+FROM paper_predictor_signals
+WHERE event_date >= date('now', '-3 days')
+GROUP BY city ORDER BY plaus_fires DESC;
+SQL
+```
+
+**Trade-volume sanity check** (Fix A widens σ → fewer trades):
+
+```bash
+sqlite3 ~/apps/polymarket-weather/bot/data/signals.db <<'SQL'
+SELECT event_date,
+       SUM(CASE WHEN action='LIVE_BUY' THEN 1 ELSE 0 END) AS buys,
+       SUM(CASE WHEN action='LIVE_BUY' THEN recommended_stake_usd ELSE 0 END) AS deployed
+FROM paper_predictor_signals
+WHERE event_date >= date('now', '-7 days')
+GROUP BY event_date ORDER BY event_date DESC;
+SQL
+```
+
+If buys/deployed drop to ~zero overnight, the σ prior may be too wide
+for your current edge thresholds. Consider lowering `PREDICTOR_MIN_EDGE`
+or temporarily setting `PREDICTOR_USE_CLIMATOLOGICAL_SIGMA=0` to
+diagnose.
+
+**Disable any one fix without affecting the others**:
+
+```bash
+# In ~/apps/polymarket-weather/.env:
+PREDICTOR_USE_CLIMATOLOGICAL_SIGMA=0       # disable Fix A
+PREDICTOR_IMMEDIATE_POST_PEAK_NARROW=0    # disable Fix B
+PREDICTOR_USE_PLAUSIBILITY_CEILING=0      # disable Fix C
+# Then: sudo systemctl restart weather_bot
+```
+
+### 8.9 HRRR-specific data-quality queries (post-activation)
+
+Once `PREDICTOR_USE_HRRR_CEILING=1`, monitor with:
+
+**Per-city HRRR fire rate** (should be ~95%+ for US cities, 0% for
+non-CAM cities):
+
+```bash
+sqlite3 ~/apps/polymarket-weather/bot/data/signals.db <<'SQL'
+SELECT city,
+       SUM(CASE WHEN data_quality_flag LIKE '%hrrr_ceiling_applied%'
+                 OR data_quality_flag LIKE '%icon_d2_ceiling_applied%'
+                THEN 1 ELSE 0 END) AS hrrr_fires,
+       SUM(CASE WHEN data_quality_flag LIKE '%cold_start_suspect%'
+                THEN 1 ELSE 0 END) AS cold_start_skips,
+       COUNT(*) AS total_rows
+FROM paper_predictor_signals
+WHERE event_date >= date('now', '-3 days')
+GROUP BY city
+ORDER BY city;
+SQL
+```
+
+**Settle_divergence monitor** (running comparison of bot reading to
+Wunderground; one row per resolved market, populated by Phase 0a):
+
+```bash
+sqlite3 ~/apps/polymarket-weather/bot/data/signals.db <<'SQL'
+SELECT city,
+       ROUND(AVG(bot_observed_max_c - wunderground_high_c), 3) AS bot_vs_wg_c,
+       ROUND(AVG(metar_peak_t_group_c - wunderground_high_c), 3) AS tgroup_vs_wg_c,
+       COUNT(*) AS n
+FROM resolution_observations
+WHERE wunderground_high_c IS NOT NULL
+  AND event_date >= date('now', '-30 days')
+GROUP BY city
+ORDER BY ABS(bot_vs_wg_c) DESC;
+SQL
+```
+
+Cities with `bot_vs_wg_c` consistently > 0.5°C are showing
+settle_divergence and need investigation — HRRR's μ recenter
+trusts bot's observed_max, so a divergent reading limits HRRR's
+value on those stations.
+
 ---
 
 ## 9. Deliberately deferred
@@ -849,6 +1385,50 @@ as contaminated by their date; calibration filters them out.
 Will be added as part of the W3 implementation PR, not before. See
 Section 7.4 step 1.
 
+### 9.8 HRRR Phase 2 backtest harness
+
+`bot/scripts/backtest_hrrr_ceiling.py` is sketched in Section 7.6
+step 3 but not yet written. Construction waits on ~30 resolved US
+days existing — the same data-accumulation gate that blocks W0.
+Half-day to a day of work once data exists. Architecture: replay
+`predict_bins` twice per held-out day (flag off / on), fetch HRRR's
+historical run for that date via Open-Meteo's `historical-forecast-api`,
+compute per-bin Brier with focus on upper-tail in the 13:00–17:00
+window.
+
+### 9.9 HRRR Phase 3 (Herbie/GRIB2 canonical path)
+
+Spec'd in the HRRR document as contingent — only build if Phase 2
+shows Open-Meteo's HRRR exposure is materially insufficient at hard
+terrain/coastal stations (LAX, SFO, Denver Front Range). Most likely
+outcome: Phase 2 passes on Open-Meteo and Phase 3 never gets built.
+If Phase 3 does fire, the work is ~1–2 weeks: `cfgrib` plumbing,
+Herbie's `pick_points` for controlled extraction, mini-ensemble across
+recent runs for spread estimation. Don't build before Phase 2 proves
+necessity.
+
+### 9.10 ICON-D2 domain verification for edge-of-domain EU cities
+
+[bot/station_meta.py](../bot/station_meta.py) currently sets London,
+Madrid, Helsinki, and Moscow to `None` for `same_day_model`, pending
+explicit verification of whether they fall inside ICON-D2's nominal
+domain. ICON-D2 covers Central Europe with a defined boundary; some
+of these cities may be inside, some outside. Verification step:
+inspect ICON-D2's published domain extent against each station's
+lat/lon. Deferred until EU trading is live, since the answer doesn't
+affect US-book operation.
+
+### 9.11 Boundary-convention kernel
+
+W3-adjacent (NOT part of HRRR). The asymmetric upper-tail contraction
+that handles bin-boundary rounding uncertainty — when observed_max
+sits right at a bin edge, the distribution should bleed mass to the
+adjacent bin proportional to settlement-quantization uncertainty.
+Currently the Atlanta 2026-06-12 case is mitigated by HRRR pulling
+μ down and away from the boundary, but if HRRR isn't available and
+μ lands at a bin edge, the boundary-effect bug still bites. Add to
+the W3 implementation queue.
+
 ---
 
 ## 10. Open questions for future sessions
@@ -880,6 +1460,37 @@ behind W2 Phase C. The `bin_temp_range` rounding semantics need a
 unit-aware audit before any live exposure to °C markets. Noted but
 not prioritized.
 
+### 10.5 HRRR ceiling_buffer — should it tighten over time?
+
+Currently set to 1.0°C (upper end of the documented 0.5–1.0°C band)
+on the asymmetric-loss reasoning that clipping a winner is total
+loss while leaving slightly too much upper tail is mild misize.
+Once Phase 2 backtest data exists, worth re-evaluating: if the
+buffer is consistently leaving 0.3–0.5°C of usable upper tail across
+many days, it can probably be tightened to 0.7 or 0.8°C without
+clipping winners. Same data-driven tuning approach as W3's
+98th-percentile + safety buffer.
+
+### 10.6 HRRR μ-recenter weighting
+
+Currently μ recenters to `max(observed_max, hrrr_remaining_max)`
+when HRRR is >0.5°C below the morning forecast. This is a binary
+override — either HRRR-anchored or forecast-anchored. The spec
+flagged an open question: should μ blend (e.g. weight by
+hours-remaining or HRRR confidence) rather than fully override?
+Defer until backtest shows whether the binary version is suboptimal.
+
+### 10.7 HRRR cycle-time staleness from Open-Meteo
+
+Open-Meteo's `/forecast` endpoint doesn't reliably expose the source
+model's actual cycle time in its response. We currently use a
+proxy (the earliest trajectory hour) for the staleness check, but
+this could mask genuinely-stale data when Open-Meteo's CDN serves
+a cached older cycle. If Phase 2 backtest shows accuracy degradation
+correlated with time-since-cycle, switching to Herbie/GRIB2 (which
+has the exact cycle time) becomes more attractive. Defer until
+Phase 2.
+
 ---
 
 ## 11. Files index
@@ -889,31 +1500,41 @@ not prioritized.
 - [docs/data_quality_contract.md](data_quality_contract.md) — degradation triggers + sizing scalar
 - [docs/w3_physical_ceiling.md](w3_physical_ceiling.md) — physical ceiling spec
 - [docs/deploy_safety.md](deploy_safety.md) — pre-commit hook setup
-- HRRR ceiling spec — Phase 0a (`capture_resolution_truth.py`) and
-  Phase 1 (Open-Meteo HRRR/ICON-D2 dispatch behind `PREDICTOR_USE_HRRR_CEILING`)
-  are shipped; activation has TWO gates: Phase 2 backtest improvement AND
-  Phase 0b confirming the T-group fix closed the observed_max-vs-settlement gap
+- HRRR ceiling spec (external to repo — pasted into HANDOFF Section
+  2.7 and 7.6 as the canonical reference). Phase 0a + Phase 1 shipped
+  2026-06-12. Activation has TWO gates: Phase 0b (T-group decomposition
+  query, Section 7.6 step 2) and Phase 2 backtest improvement
+  (Section 7.6 step 3).
 
 ### Core bot code
-- [bot/scheduled_predictor.py](../bot/scheduled_predictor.py) — scan loop, gate stack, recovery helper, cold-start detection, sizing scalar, data-quality flag composition
-- [bot/scripts/intraday_predictor.py](../bot/scripts/intraday_predictor.py) — prediction pipeline, CDF integrator, empirical residual CDF, σ calibration loader
+- [bot/scheduled_predictor.py](../bot/scheduled_predictor.py) — scan loop, gate stack, recovery helper, cold-start detection, sizing scalar, data-quality flag composition, pending-order race fixes, `cold_start_suspect` boolean threaded to predict_bins, HRRR flag composition
+- [bot/scripts/intraday_predictor.py](../bot/scripts/intraday_predictor.py) — prediction pipeline, CDF integrator, empirical residual CDF, σ calibration loader, σ climatological prior, T-group parser, HRRR fetcher + dispatch (`fetch_rapid_model_remaining_max`, `is_rapid_model_trajectory_plateaued`, `_hrrr_data_passes_sanity`, HRRR signals in `estimate_day_high_dist`)
+- [bot/station_meta.py](../bot/station_meta.py) — city → station metadata + `SAME_DAY_MODEL_BY_CITY` region map
 - [bot/scripts/invariant_guards.py](../bot/scripts/invariant_guards.py) — observational guards, "observational forever" enforcement
 - [bot/polymarket.py](../bot/polymarket.py) — Gamma API market discovery (closed flag propagation)
 - [bot/scripts/predictor_dashboard.py](../bot/scripts/predictor_dashboard.py) — dashboard with three-signal position rendering
 
 ### Scripts (one-shot tools)
 - [bot/scripts/failure_segmentation.py](../bot/scripts/failure_segmentation.py) — W0 audit
+- [bot/scripts/capture_resolution_truth.py](../bot/scripts/capture_resolution_truth.py) — HRRR Phase 0a nightly cron; captures bot-vs-Wunderground decomposition data per resolved market
 - [bot/scripts/forecast_rmse_calibration.py](../bot/scripts/forecast_rmse_calibration.py) — current per-city σ calibration (Open-Meteo-based, to be replaced)
 - [bot/scripts/deploy_safety_check.py](../bot/scripts/deploy_safety_check.py) — pre-deploy assertion
 - [bot/scripts/install_hooks.py](../bot/scripts/install_hooks.py) — installs the pre-commit hook
 - [bot/scripts/git_hooks/pre-commit](../bot/scripts/git_hooks/pre-commit) — hook template
 
-### Tests
-- [bot/tests/test_predictor.py](../bot/tests/test_predictor.py) — 41 tests
+### Tests (187 total)
+- [bot/tests/test_predictor.py](../bot/tests/test_predictor.py) — 44 tests (predictor + σ prior + B fix)
 - [bot/tests/test_gates.py](../bot/tests/test_gates.py) — 8 tests
 - [bot/tests/test_forecast_recovery.py](../bot/tests/test_forecast_recovery.py) — 7 tests
 - [bot/tests/test_invariant_guards.py](../bot/tests/test_invariant_guards.py) — 15 tests
 - [bot/tests/test_data_quality.py](../bot/tests/test_data_quality.py) — 15 tests
+- [bot/tests/test_per_contract_cap.py](../bot/tests/test_per_contract_cap.py) — 6 tests (Dallas cap regression)
+- [bot/tests/test_pending_order_race.py](../bot/tests/test_pending_order_race.py) — 11 tests (NYC + Houston race fix)
+- [bot/tests/test_metar_precision.py](../bot/tests/test_metar_precision.py) — 11 tests (T-group parser + Atlanta scenario)
+- [bot/tests/test_hrrr_ceiling.py](../bot/tests/test_hrrr_ceiling.py) — 22 tests (HRRR plateau / sanity / μ recenter / zero-diff guarantee / region map)
+- [bot/tests/test_quick_fixes.py](../bot/tests/test_quick_fixes.py) — 22 tests (Quick Fix A/B/C — default-ON, plausibility ceiling, etc.)
+- [bot/tests/test_buy_mode.py](../bot/tests/test_buy_mode.py) — 19 tests (PREDICTOR_BUY_MODE dispatch — edge vs probability)
+- Plus 6 empirical CDF tests in test_predictor.py
 
 ---
 
@@ -927,9 +1548,18 @@ If you're a Claude instance reading this in a new session:
 - **Then check `SELECT MIN(event_date), MAX(event_date) FROM paper_predictor_signals WHERE forecast_high_c IS NOT NULL`**
   to see how much data exists. If `event_date` range is ≥30 days
   from June 12, the wait is over and Section 7 applies.
+- **For HRRR specifically**: check
+  `SELECT COUNT(*), MAX(captured_at_utc) FROM resolution_observations`.
+  If COUNT > ~10, Phase 0b can run (Section 7.6 step 2). If MAX is
+  several days old, the nightly cron has stopped firing — investigate
+  before doing anything else HRRR-related.
 - **Read Sections 4 (failure modes) and 5 (design rules) before
   proposing any work.** These are the institutional knowledge that
   isn't in the code.
+- **HRRR is the most recently-shipped major feature** (2026-06-12)
+  and the most important data-gated activation in the near term.
+  If the user mentions HRRR or asks about plateau / Atlanta / NYC
+  upper-tail patterns, Section 7.6 is the action checklist.
 - **The user is technically sharp and patient.** Pressure-testing
   reasoning is welcome; pretending alignment isn't. If the user's
   framing is wrong, push back substantively. If they push back on

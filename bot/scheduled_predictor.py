@@ -106,6 +106,31 @@ HIGH_MKT_THRESHOLD   = float(os.getenv("PREDICTOR_HIGH_MKT_THRESHOLD", "0.75"))
 # Default 0.15 = blocks any bin the market deems <15% likely.
 MIN_MARKET_PROB = float(os.getenv("PREDICTOR_MIN_MARKET_PROB", "0.15"))
 
+# === Buy mode (2026-06-12) ===
+# Two strategies for deciding whether the top-P bin is buyable:
+#
+#   "edge"        — default; existing behavior.  Requires edge (our_p -
+#                    market_p) to exceed MIN_EDGE (or MIN_EDGE_LOW_MKT
+#                    when market_p is in the cheap tier).  This is the
+#                    classic edge-trading strategy: buy when we think
+#                    we know more than the market.
+#
+#   "probability" — buy whenever our_p >= MIN_PROB_TO_BUY, regardless
+#                    of edge or market price.  The bet is on our model
+#                    being right, not on outperforming the market.
+#                    Useful when you have high model confidence and
+#                    don't care whether the market agrees.
+#
+# Other gates (MIN_MARKET_PROB sanity floor, W4 liquidity cap,
+# priced_in, thin_book, dedup, trade/exposure caps) apply in BOTH
+# modes.  Only the edge gate switches.
+#
+# To use probability mode:
+#   PREDICTOR_BUY_MODE=probability
+#   PREDICTOR_MIN_PROB_TO_BUY=0.50    # adjust to taste
+PREDICTOR_BUY_MODE = os.getenv("PREDICTOR_BUY_MODE", "edge").lower()
+PREDICTOR_MIN_PROB_TO_BUY = float(os.getenv("PREDICTOR_MIN_PROB_TO_BUY", "0.50"))
+
 # W4 — market-anchored risk cap.  Blowup-preventer for the case where a
 # liquid market disagrees with our model by a huge margin.  Reasoning:
 # our_p = 95% and mkt_p = 5% on a $25k-liquid market is almost certainly
@@ -442,8 +467,18 @@ def marketable_limit(market_price: float) -> float:
 
 def evaluate_gates(*, current_hour: int, edge: float, market_p: float,
                     liquidity: float, deployed_today: float,
-                    trades_today: int, already_acted: bool) -> tuple[bool, str]:
-    """Returns (pass, reason).  reason is empty when pass=True."""
+                    trades_today: int, already_acted: bool,
+                    our_p: float | None = None) -> tuple[bool, str]:
+    """Returns (pass, reason).  reason is empty when pass=True.
+
+    our_p is required when PREDICTOR_BUY_MODE="probability"; in edge
+    mode (default) it can be omitted and is derived as market_p + edge.
+    """
+    # Derive our_p from edge + market_p when not provided.  Used by
+    # tests that don't yet pass our_p explicitly.
+    if our_p is None:
+        our_p = market_p + edge
+
     if current_hour < MIN_TRIGGER_HOUR:
         return False, f"too_early (hour={current_hour} < {MIN_TRIGGER_HOUR})"
     if current_hour > MAX_TRIGGER_HOUR:
@@ -451,20 +486,30 @@ def evaluate_gates(*, current_hour: int, edge: float, market_p: float,
     # Market sanity floor — bin must have at least MIN_MARKET_PROB market
     # confidence.  Catches catastrophic model errors: if market thinks a
     # bin has <15% chance, our model claiming 100% is almost certainly
-    # a bug, not edge.  Runs BEFORE edge calc so we don't burn cycles on
-    # garbage signals.
+    # a bug, not edge.  Applies in BOTH edge and probability modes —
+    # the model-vs-market-sanity check is independent of which strategy
+    # the operator chose for the buy decision.
     if market_p < MIN_MARKET_PROB:
         return False, (f"market_too_skeptical (mkt={market_p:.3f} < "
                        f"{MIN_MARKET_PROB:.2f})")
-    # Tiered edge gate: stricter when market_p is "expensive" (>= 0.75),
-    # looser when cheap (<0.75).  The original MIN_EDGE=0.10 was designed
-    # to filter out high-priced bins where we'd lose the full stake on the
-    # wrong side; for cheaper bins the same edge is more attractive on
-    # expected-value terms.
-    required_edge = MIN_EDGE if market_p >= HIGH_MKT_THRESHOLD else MIN_EDGE_LOW_MKT
-    if edge < required_edge:
-        return False, (f"low_edge ({edge:+.3f} < {required_edge:.2f}, "
-                       f"mkt_p={market_p:.2f})")
+    # Buy-mode dispatch.  Edge mode (default) requires meaningful edge
+    # over the market; probability mode requires high model confidence
+    # regardless of edge.  Other gates (W4, priced_in, thin_book,
+    # dedup, trade caps) apply in both modes.
+    if PREDICTOR_BUY_MODE == "probability":
+        if our_p < PREDICTOR_MIN_PROB_TO_BUY:
+            return False, (f"low_prob (our_p={our_p:.3f} < "
+                           f"{PREDICTOR_MIN_PROB_TO_BUY:.2f})")
+    else:
+        # Tiered edge gate: stricter when market_p is "expensive"
+        # (>= 0.75), looser when cheap (<0.75).  MIN_EDGE=0.10 was
+        # designed to filter out high-priced bins where we'd lose the
+        # full stake on the wrong side; for cheaper bins the same edge
+        # is more attractive on expected-value terms.
+        required_edge = MIN_EDGE if market_p >= HIGH_MKT_THRESHOLD else MIN_EDGE_LOW_MKT
+        if edge < required_edge:
+            return False, (f"low_edge ({edge:+.3f} < {required_edge:.2f}, "
+                           f"mkt_p={market_p:.2f})")
     # W4 — market-anchored risk cap.  On a LIQUID market, an extreme
     # disagreement (>40pp by default) between our model and the market
     # is more likely a stale-model / bug case than genuine edge.  Veto
@@ -1460,6 +1505,8 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                         _dq_components.append("icon_d2_ceiling_applied")
                     else:
                         _dq_components.append("hrrr_ceiling_applied")
+                if pred.get("plausibility_ceiling_fired"):
+                    _dq_components.append("plausibility_ceiling_applied")
                 event_data_quality_flag = (
                     ",".join(_dq_components) if _dq_components else None)
                 event_size_factor = compute_data_quality_size_factor(
@@ -1657,6 +1704,7 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                             deployed_today  = deployed,
                             trades_today    = n_trades,
                             already_acted   = False,
+                            our_p           = our_p,
                         )
                         # Per-scan cap — only counts FRESH buys (topups don't
                         # add new bins to the event)

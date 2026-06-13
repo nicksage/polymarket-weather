@@ -90,12 +90,17 @@ def test_dallas_scenario_unfilled_intent_does_not_block_topup():
     MAX_PER_CONTRACT_USD - $6.68."""
     conn = _fresh_db()
     contract = "dallas_88_89"
+    # Use today's UTC date so deployed_today_for_contract's date filter
+    # matches (otherwise the filter looks at a different "today" than
+    # the test's fixture date and the query returns 0).
+    from datetime import datetime as _dt, timezone as _tz
+    today_str = _dt.now(_tz.utc).strftime("%Y-%m-%d")
     # The filled buy
-    _insert_live_buy(conn, contract, "2026-06-12T16:00:00Z", 6.68)
+    _insert_live_buy(conn, contract, f"{today_str}T16:00:00Z", 6.68)
     # Three unfilled topup attempts as Dallas dropped through 6¢ / 5¢ / 4¢
-    _insert_live_buy(conn, contract, "2026-06-12T18:00:00Z", 5.00)
-    _insert_live_buy(conn, contract, "2026-06-12T18:15:00Z", 5.00)
-    _insert_live_buy(conn, contract, "2026-06-12T18:30:00Z", 5.00)
+    _insert_live_buy(conn, contract, f"{today_str}T18:00:00Z", 5.00)
+    _insert_live_buy(conn, contract, f"{today_str}T18:15:00Z", 5.00)
+    _insert_live_buy(conn, contract, f"{today_str}T18:30:00Z", 5.00)
 
     # Show the deprecated function returns the misleading intent sum
     intent_sum = deployed_today_for_contract(conn, "live", contract)

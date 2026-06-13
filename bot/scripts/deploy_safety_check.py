@@ -120,6 +120,16 @@ REQUIRED_NAMES: list[str] = [
     "resolution_observations",               # Phase 0a audit table
     "cold_start_suspect",                    # already required, but pulls
                                               # into the HRRR dispatch path too
+
+    # --- Quick Fixes A/B/C — default ON, ship-now, not data-gated ---
+    "plausibility_ceiling_applied",          # data_quality_flag value
+
+    # --- Buy-mode dispatch (PREDICTOR_BUY_MODE) ---
+    # Switching this to "probability" must not raise NameError on the
+    # threshold constant or the gate-reason string.
+    "PREDICTOR_BUY_MODE",
+    "PREDICTOR_MIN_PROB_TO_BUY",
+    "low_prob",                              # probability-mode gate reason
 ]
 
 

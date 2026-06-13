@@ -19,6 +19,7 @@ Run with:
 import sqlite3
 import pandas as pd
 import plotly.express as px
+import os
 import plotly.graph_objects as go
 import streamlit as st
 from datetime import datetime, timezone
@@ -26,6 +27,14 @@ from functools import lru_cache
 from streamlit_autorefresh import st_autorefresh
 
 from config import DB_PATH
+
+
+# Historical-window lookback for the Contract Data tab's date dropdown.
+# Default 60 days — covers ~2 months of past resolved events for P&L
+# review without dragging the page render on multi-month datasets.
+# Override via env var if you want more (e.g., quarterly review).
+DASHBOARD_DATE_LOOKBACK_DAYS = int(
+    os.getenv("DASHBOARD_DATE_LOOKBACK_DAYS", "60"))
 
 
 def _connect_db(timeout: float = 30.0):
@@ -124,11 +133,16 @@ st_autorefresh(interval=_REFRESH_INTERVAL_MS, limit=None, key="global_autorefres
 
 @st.cache_data(ttl=_CACHE_TTL_SHORT)
 def load_events() -> pd.DataFrame:
-    """Load the most recent scan row for each event (city+date)."""
+    """Load the most recent scan row for each event (city+date).
+
+    Includes events from the past DASHBOARD_DATE_LOOKBACK_DAYS days
+    so the Contract Data tab's date dropdown lets the operator pick
+    past dates to review what the bot purchased + the realized P&L.
+    """
     try:
         conn = _connect_db()
         df = pd.read_sql(
-            """
+            f"""
             SELECT e.* FROM temp_events e
             INNER JOIN (
                 SELECT event_id, MAX(scan_timestamp) AS max_ts
@@ -136,7 +150,7 @@ def load_events() -> pd.DataFrame:
                 GROUP BY event_id
             ) latest ON e.event_id = latest.event_id
                     AND e.scan_timestamp = latest.max_ts
-            WHERE e.date >= date('now')
+            WHERE e.date >= date('now', '-{DASHBOARD_DATE_LOOKBACK_DAYS} days')
             ORDER BY e.city, e.date
             """,
             conn,
@@ -181,7 +195,7 @@ def load_outcomes(signals_only: bool = False) -> pd.DataFrame:
                 GROUP BY event_id
             ) latest ON e.event_id = latest.event_id
                     AND e.scan_timestamp = latest.max_ts
-            WHERE e.date >= date('now')
+            WHERE e.date >= date('now', '-{DASHBOARD_DATE_LOOKBACK_DAYS} days')
             {where}
             ORDER BY o.ev DESC
             """,
@@ -422,20 +436,30 @@ def _show_event_modal(city: str, date_str: str, rows: list[dict]) -> None:
 
     rows_sorted = sorted(rows, key=_modal_sort_key, reverse=True)
 
-    # Load open positions for this event to show held status
+    # Load OPEN positions for this event to show held status + unrealized P&L
     _open_pos_by_contract: dict[str, dict] = {}
+    # Load CLOSED positions so past-date views show realized P&L per
+    # contract instead of a blank "Status / P&L" column.  Same (city,
+    # date) key — closed rows simply have status='closed' and a
+    # populated pnl / pnl_net.
+    _closed_pos_by_contract: dict[str, dict] = {}
     try:
         _pos_conn = _connect_db()
         _pos_conn.row_factory = sqlite3.Row
         _pos_rows = _pos_conn.execute(
-            "SELECT contract_id, side, size_usdc, target_size_usdc, unrealized_pnl "
-            "FROM positions WHERE city = ? AND date = ? AND status = 'open' "
+            "SELECT contract_id, side, size_usdc, target_size_usdc, "
+            "unrealized_pnl, status, pnl, pnl_net "
+            "FROM positions WHERE city = ? AND date = ? "
             "AND fill_status = 'filled'",
             (city, date_str),
         ).fetchall()
         _pos_conn.close()
         for _p in _pos_rows:
-            _open_pos_by_contract[_p["contract_id"]] = dict(_p)
+            _row = dict(_p)
+            if _row.get("status") == "open":
+                _open_pos_by_contract[_row["contract_id"]] = _row
+            elif _row.get("status") == "closed":
+                _closed_pos_by_contract[_row["contract_id"]] = _row
     except Exception:
         pass
 
@@ -452,10 +476,12 @@ def _show_event_modal(city: str, date_str: str, rows: list[dict]) -> None:
         edge   = r.get("edge")
         ev     = r.get("ev")
 
-        # Position status: show HELD YES/NO if we have an open position,
-        # otherwise show the strategy's signal recommendation
+        # Position status: HELD if we have an open position, CLOSED
+        # (with realized P&L) if a closed position exists for this
+        # contract, otherwise the strategy's signal recommendation.
         cid = r.get("contract_id")
         held = _open_pos_by_contract.get(cid)
+        closed = _closed_pos_by_contract.get(cid) if not held else None
         if held:
             size = float(held.get("size_usdc") or 0)
             target = held.get("target_size_usdc")
@@ -464,6 +490,10 @@ def _show_event_modal(city: str, date_str: str, rows: list[dict]) -> None:
                 status = f"HELD {side_label} ${size:.0f}/${float(target):.0f}"
             else:
                 status = f"HELD {side_label} ${size:.0f}"
+        elif closed:
+            size = float(closed.get("size_usdc") or 0)
+            side_label = closed["side"]
+            status = f"CLOSED {side_label} ${size:.0f}"
         else:
             # Show signal based on active strategy's criteria, not edge-disagreement
             from config import ACTIVE_STRATEGY, ALLOWED_SIDES as _allowed
@@ -491,10 +521,18 @@ def _show_event_modal(city: str, date_str: str, rows: list[dict]) -> None:
             else:
                 status = "--"
 
-        # P&L for held positions
+        # P&L: unrealized for open, realized (net of fees if available)
+        # for closed.  Past-date views surface realized P&L per contract.
         _pnl_val = None
         if held:
             _pnl_val = float(held.get("unrealized_pnl") or 0)
+        elif closed:
+            _net = closed.get("pnl_net")
+            _gross = closed.get("pnl")
+            if _net is not None and not pd.isna(_net):
+                _pnl_val = float(_net)
+            elif _gross is not None and not pd.isna(_gross):
+                _pnl_val = float(_gross)
 
         ml_p = r.get("ml_bin_prob")
         table_rows.append({
@@ -822,6 +860,14 @@ with _tab_contract:
         _all_cities  = sorted(outcomes_df["city"].dropna().unique().tolist())
         _all_dates   = sorted(outcomes_df["date"].dropna().unique().tolist())
 
+        # Default selection: today + future-dated markets only.  Past
+        # dates are in _all_dates (so the dropdown exposes them for
+        # P&L review), but selecting them by default would render every
+        # historical event card on first page load — slow and noisy
+        # for the common "what's in flight right now" view.
+        _today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        _default_dates = [d for d in _all_dates if d >= _today_str] or _all_dates
+
         _sigma_vals  = outcomes_df["forecast_sigma_c"].dropna()
         _sigma_min   = float(round(_sigma_vals.min(), 1)) if not _sigma_vals.empty else 0.0
         _sigma_max   = float(round(_sigma_vals.max(), 1)) if not _sigma_vals.empty else 10.0
@@ -839,7 +885,10 @@ with _tab_contract:
 
         with r1c2:
             sel_dates = st.multiselect(
-                "Date", _all_dates, default=_all_dates, key="f_dates",
+                "Date", _all_dates, default=_default_dates, key="f_dates",
+                help=(f"Past dates (up to {DASHBOARD_DATE_LOOKBACK_DAYS} days "
+                      f"back) are selectable — pick one to review what the "
+                      f"bot purchased and the realized P&L."),
             )
 
         with r1c3:

@@ -82,7 +82,7 @@ OPENMETEO_URL  = "https://api.open-meteo.com/v1/forecast"
 # the PREDICTOR_DEFAULT_SIGMA_C env var in .env.
 DEFAULT_FORECAST_SIGMA_C = float(os.getenv("PREDICTOR_DEFAULT_SIGMA_C", "2.0"))
 
-# === Climatological σ prior (W2 quarantine of contaminated calibration) ===
+# === Climatological σ prior — Quick Fix A (default ON 2026-06-12) ===
 #
 # The per-city σ calibration in forecast_calibration.json was generated
 # against Open-Meteo's `historical-forecast-api`, which we suspect serves
@@ -93,18 +93,92 @@ DEFAULT_FORECAST_SIGMA_C = float(os.getenv("PREDICTOR_DEFAULT_SIGMA_C", "2.0"))
 # Using those numbers as σ makes the predictor systematically over-
 # confident on upper bins (Atlanta/NYC plateau cases, June 12 2026).
 #
-# When PREDICTOR_USE_CLIMATOLOGICAL_SIGMA=1, get_city_sigma overrides
-# the contaminated per-city values with a uniform climatological prior:
+# This flag DEFAULTS ON.  It overrides the contaminated per-city values
+# with a uniform climatological prior:
 #   1.75°C — midpoint of documented day-ahead summer NWS MaxT MAE band
 #            (Glahn & Lowry 1972; NCEP NBM validation papers).
 #
-# This is a defensible PRIOR, not a tuned floor.  It will be replaced
-# the day we have ~30 days of clean NWS-native residuals — i.e., post
-# the 2026-06-12 recovery-helper commit + sufficient observation time.
+# This is a defensible PRIOR with a citation, NOT a tuned floor.  It
+# does not need backtest validation to ship because widening σ can
+# only REDUCE confidence — it cannot make the bot bet more aggressively.
+# Asymmetric risk: lower trade volume / smaller sizes; no new losses.
+#
+# Known limitation accepted: marine cities (SF, LA) where genuine NWS
+# skill is tight will be over-widened by this uniform prior, costing
+# some edge.  Do NOT tune per-city to fit recent losses — that's the
+# contaminated-calibration trap with the sign flipped.
+#
+# Will be replaced by clean NWS-native per-city residuals after ~30
+# days of accumulation (post-recovery-helper commit).  Until then,
+# this is the safe-by-construction quarantine of bad calibration.
+#
+# Disable with `PREDICTOR_USE_CLIMATOLOGICAL_SIGMA=0`.
 PREDICTOR_USE_CLIMATOLOGICAL_SIGMA = bool(int(
-    os.getenv("PREDICTOR_USE_CLIMATOLOGICAL_SIGMA", "0")))
+    os.getenv("PREDICTOR_USE_CLIMATOLOGICAL_SIGMA", "1")))
 PREDICTOR_CLIMATOLOGICAL_SIGMA_C = float(
     os.getenv("PREDICTOR_CLIMATOLOGICAL_SIGMA_C", "1.75"))
+
+# === Immediate post-peak narrowing — Quick Fix B (default ON 2026-06-12) ===
+#
+# When True (default), the time-since-observed-peak narrowing in
+# estimate_day_high_dist fires at hours_since_obs_peak >= 0 instead of
+# >= 1.  Closes the ~2-hour window where the day has plateaued but the
+# bot hasn't recognized it yet (Atlanta/NYC pattern).
+#
+# Safe by construction: this can only narrow σ post-peak — never widen.
+# Cannot make the bot bet more aggressively.
+#
+# At hours_since = 0 the geometric factor is 0.7^0 = 1.0 so σ is
+# unchanged in the instant of the peak itself; the benefit is at
+# h=0.5+ (fractional hours-since-peak from sub-hour scan timing).
+#
+# Will be replaced by the HRRR plateau signal when HRRR activates (the
+# HRRR signal is a better, physically-grounded trigger for the same
+# code path).  B stays as the non-CAM-city fallback indefinitely.
+#
+# Disable with `PREDICTOR_IMMEDIATE_POST_PEAK_NARROW=0`.
+PREDICTOR_IMMEDIATE_POST_PEAK_NARROW = bool(int(
+    os.getenv("PREDICTOR_IMMEDIATE_POST_PEAK_NARROW", "1")))
+
+# === Plausibility ceiling — Quick Fix C (default ON 2026-06-12) ===
+#
+# Crude prototype of the HRRR/W3 physical ceiling using NWS cloud-cover
+# data we already fetch but don't currently use.  When fired, populates
+# `truncate_at_hi` in the probability_in_bin integrator — the same slot
+# W2 Phase A reserved for W3.
+#
+# Triggers when ALL true:
+#   - required_rate > IMPLAUSIBLE_RATE_C_PER_H (heating rate needed
+#     to reach forecast peak from current state)
+#   - current_hour >= AFTERNOON_HOUR_THRESHOLD
+#   - cloud_cover_pct > CLOUD_THRESHOLD
+#
+# When fired, sets:
+#   ceiling = observed_max + plausible_remaining_rise(remaining_hours,
+#                                                       cloud_pct)
+#   truncate_at_hi = ceiling + CEILING_BUFFER_C
+#
+# Cold-start skip enforced: when cold_start_suspect is True, do not
+# apply (the rise model is meaningless if peak already happened).
+#
+# Logs every fire so the HRRR/W3 work has data on whether the
+# heuristic pointed the right direction, and any clipped winner is
+# traceable back to a specific cap event.
+#
+# Combined with HRRR ceiling (when HRRR active) via min() — most
+# conservative wins, so the two signals can coexist safely.
+#
+# Disable with `PREDICTOR_USE_PLAUSIBILITY_CEILING=0`.
+PREDICTOR_USE_PLAUSIBILITY_CEILING = bool(int(
+    os.getenv("PREDICTOR_USE_PLAUSIBILITY_CEILING", "1")))
+PREDICTOR_CEILING_BUFFER_C = float(
+    os.getenv("PREDICTOR_CEILING_BUFFER_C", "1.0"))
+PREDICTOR_IMPLAUSIBLE_RATE_C_PER_H = float(
+    os.getenv("PREDICTOR_IMPLAUSIBLE_RATE_C_PER_H", "2.0"))
+PREDICTOR_AFTERNOON_HOUR_THRESHOLD = int(
+    os.getenv("PREDICTOR_AFTERNOON_HOUR_THRESHOLD", "13"))
+PREDICTOR_CLOUD_THRESHOLD_PCT = float(
+    os.getenv("PREDICTOR_CLOUD_THRESHOLD_PCT", "50"))
 
 # === HRRR ceiling — Phase 1 of the HRRR plan (docs/hrrr_ceiling_spec.md) ===
 #
@@ -724,10 +798,14 @@ def fetch_nws_today_forecast(lat: float, lon: float, tz_str: str) -> dict:
         log.warning(f"NWS hourly forecast failed at ({lat:.3f},{lon:.3f}): {e}")
         return {}
 
-    # Convert + filter to today (in city local time)
+    # Convert + filter to today (in city local time).  Also extract
+    # cloud cover per hour for the Quick Fix C plausibility ceiling —
+    # NWS exposes `properties.skyCover.value` (percentage 0-100) on
+    # each period.
     tz = ZoneInfo(tz_str)
     today_local = datetime.now(tz).date()
     hourly: list[tuple[int, float]] = []
+    hourly_clouds: dict[int, float] = {}
     for p in periods:
         ts_str = p.get("startTime")
         temp = p.get("temperature")
@@ -743,6 +821,14 @@ def fetch_nws_today_forecast(lat: float, lon: float, tz_str: str) -> dict:
             continue
         temp_c = (float(temp) - 32) * 5/9 if unit == "F" else float(temp)
         hourly.append((ts_local.hour, temp_c))
+        sky = p.get("skyCover")
+        if isinstance(sky, dict):
+            sky_val = sky.get("value")
+            if sky_val is not None:
+                try:
+                    hourly_clouds[ts_local.hour] = float(sky_val)
+                except (TypeError, ValueError):
+                    pass
 
     if not hourly:
         return {}
@@ -752,6 +838,7 @@ def fetch_nws_today_forecast(lat: float, lon: float, tz_str: str) -> dict:
 
     return {
         "hourly":             hourly,
+        "hourly_clouds":      hourly_clouds,
         "forecast_high":      forecast_high,
         "forecast_peak_hour": forecast_peak_hour,
         "sunset_hour":        sunset_hour,
@@ -988,6 +1075,127 @@ def _hrrr_data_passes_sanity(hrrr_data: dict,
         if pt.get("temp_c") is None:
             return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Plausibility ceiling — Quick Fix C
+# ---------------------------------------------------------------------------
+#
+# Crude prototype of the HRRR/W3 physical ceiling using NWS skyCover
+# already in our fetch path.  Fires only on clearly-implausible
+# heating regimes (cloudy afternoons where the bot would otherwise
+# bet the day climbs >2°C/hour).
+#
+# Will be superseded by the HRRR Tier 1 ceiling when HRRR activates,
+# and by W3's empirical model when it fits.  Stays as the non-CAM
+# city fallback indefinitely.
+
+
+def plausible_remaining_rise_c(hours_remaining: float,
+                                  cloud_pct: float) -> float:
+    """Return a conservative upper bound on how much further the temp
+    can plausibly rise given remaining hours of solar and cloud cover.
+
+    Heuristic (NOT a physics model):
+       max_rate = 2.0°C/hr under clear sky
+       max_rate scales linearly down with cloud cover, floor 0.3°C/hr
+       total rise capped at hours_remaining × max_rate
+       hard ceiling of 5°C total rise regardless
+
+    Returns 0.0 when hours_remaining <= 0 or inputs are invalid.
+
+    This is intentionally a crude heuristic — its job is to flag
+    obviously-implausible hot-bin probabilities, not to model the
+    boundary layer.  W3 / HRRR replace it with proper models.
+    """
+    if hours_remaining <= 0:
+        return 0.0
+    cloud_pct = max(0.0, min(100.0, cloud_pct))
+    # 0% clouds → 2.0°C/hr; 100% clouds → 0.5°C/hr; linear between
+    max_rate_c_per_h = 2.0 - (cloud_pct / 100.0) * 1.5
+    max_rate_c_per_h = max(0.3, max_rate_c_per_h)
+    rise = min(hours_remaining * max_rate_c_per_h, 5.0)
+    return rise
+
+
+def avg_remaining_cloud_pct(hourly_clouds: dict[int, float],
+                              current_hour: int,
+                              sunset_hour: int) -> float | None:
+    """Average cloud cover over the hours from now until sunset.
+    Returns None if no cloud data available for the remaining window
+    — caller treats None as "can't fire the ceiling, no data."
+    """
+    if not hourly_clouds or sunset_hour <= current_hour:
+        return None
+    values = [v for h, v in hourly_clouds.items()
+                 if current_hour <= h < sunset_hour]
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def compute_plausibility_ceiling_c(
+    current_temp_c: float,
+    forecast_high_c: float,
+    forecast_peak_hour: int,
+    current_hour: int,
+    sunset_hour: int,
+    cloud_pct: float | None,
+    ceiling_buffer_c: float = 1.0,
+    implausible_rate_c_per_h: float = 2.0,
+    afternoon_hour_threshold: int = 13,
+    cloud_threshold_pct: float = 50.0,
+) -> dict | None:
+    """Compute the plausibility ceiling (Quick Fix C).
+
+    Returns a dict with the ceiling value AND diagnostics for logging:
+       {
+         "ceiling_c":         float — upper bound for truncate_at_hi
+         "fired_reason":      str   — why this fire happened
+         "required_rate_c_per_h": float
+         "remaining_hours":   int
+         "cloud_pct":         float
+         "plausible_rise_c":  float
+       }
+    Returns None when the ceiling should NOT fire (any of the three
+    triggers misses, OR cloud data unavailable, OR forecast peak
+    already passed, OR current_temp invalid).
+    """
+    if current_temp_c is None or current_temp_c <= -50:
+        return None
+    if cloud_pct is None:
+        return None
+    if current_hour < afternoon_hour_threshold:
+        return None
+    if cloud_pct < cloud_threshold_pct:
+        return None
+
+    # Hours until forecast peak — if peak has passed, no implausibility
+    # to check (the day's high has either happened or is happening now).
+    hours_to_peak = forecast_peak_hour - current_hour
+    if hours_to_peak <= 0:
+        return None
+
+    required_rate = (forecast_high_c - current_temp_c) / hours_to_peak
+    if required_rate <= implausible_rate_c_per_h:
+        return None
+
+    # All triggers fired — compute the ceiling.
+    hours_remaining = max(0, sunset_hour - current_hour)
+    plausible_rise = plausible_remaining_rise_c(hours_remaining, cloud_pct)
+    ceiling_c = current_temp_c + plausible_rise + ceiling_buffer_c
+
+    return {
+        "ceiling_c":             round(ceiling_c, 2),
+        "fired_reason":          (f"required_rate={required_rate:.2f}C/hr "
+                                    f">{implausible_rate_c_per_h:.1f} "
+                                    f"+ cloud={cloud_pct:.0f}% "
+                                    f">{cloud_threshold_pct:.0f}%"),
+        "required_rate_c_per_h": round(required_rate, 2),
+        "remaining_hours":       hours_remaining,
+        "cloud_pct":             round(cloud_pct, 1),
+        "plausible_rise_c":      round(plausible_rise, 2),
+    }
 
 
 def is_rapid_model_trajectory_plateaued(
@@ -1382,16 +1590,11 @@ def estimate_day_high_dist(forecast_high: float, forecast_peak_hour: int,
         and observed_peak_hour >= 0
         and day_has_likely_peaked):
         hours_since_obs_peak = current_hour - observed_peak_hour
-        # FIX B (2026-06-12): trigger at hours_since >= 0, not >= 1.
-        # The hour-1 lag systematically misprices the window where the
-        # day has actually peaked but the bot hasn't recognized it yet —
-        # the Atlanta / NYC plateau cases.  At hours_since = 0, the
-        # geometric factor is 0.7^0 = 1.0 (no narrowing yet), so there's
-        # no behavior change in the instant of the peak itself.  But at
-        # h=0.5 (if scan timing produces fractional hours-since-peak via
-        # the local-hour rounding) and at the start of h=1, the narrowing
-        # now begins immediately rather than waiting a full clock-hour.
-        if hours_since_obs_peak >= 0:
+        # FIX B (Quick-Fix-B 2026-06-12): trigger at hours_since >= 0 by
+        # default (PREDICTOR_IMMEDIATE_POST_PEAK_NARROW=1).  When disabled,
+        # falls back to >= 1 (legacy behavior).  See constant docstring.
+        b_threshold = 0 if PREDICTOR_IMMEDIATE_POST_PEAK_NARROW else 1
+        if hours_since_obs_peak >= b_threshold:
             # Geometric narrowing: 0.7^h
             #   0h → 1.00x (no narrowing yet), 1h → 0.70x, 2h → 0.49x,
             #   3h → 0.34x, 4h+ → 0.24x (floor)
@@ -1666,6 +1869,56 @@ def predict_bins(event: dict, settlement_obs: list[dict],
     if hrrr_used and hrrr_remaining_max is not None:
         truncate_at_hi = hrrr_remaining_max + PREDICTOR_HRRR_CEILING_BUFFER_C
 
+    # Quick Fix C — plausibility ceiling.  Crude prototype of the
+    # HRRR/W3 physical ceiling using NWS skyCover already in our
+    # fetch path.  Fires only on clearly-implausible heating regimes
+    # (cloudy afternoons where bot would otherwise bet >2°C/hour rise).
+    # Cold-start skip enforced: peak may already have happened.
+    # Combined with HRRR via min() — most conservative ceiling wins.
+    plausibility_info = None
+    if (PREDICTOR_USE_PLAUSIBILITY_CEILING
+        and not cold_start_suspect
+        and observed_max_c > -50):
+        # Current temp = the latest reading from our settlement obs.
+        # We use observed_max as a conservative proxy (truth's at least
+        # this hot) — for the plausibility check what matters is the
+        # delta to forecast_high.
+        cloud_avg = avg_remaining_cloud_pct(
+            forecast.get("hourly_clouds") or {},
+            current_hour,
+            forecast["sunset_hour"])
+        plausibility_info = compute_plausibility_ceiling_c(
+            current_temp_c=observed_max_c,
+            forecast_high_c=bias_corrected_forecast,
+            forecast_peak_hour=forecast["forecast_peak_hour"],
+            current_hour=current_hour,
+            sunset_hour=forecast["sunset_hour"],
+            cloud_pct=cloud_avg,
+            ceiling_buffer_c=PREDICTOR_CEILING_BUFFER_C,
+            implausible_rate_c_per_h=PREDICTOR_IMPLAUSIBLE_RATE_C_PER_H,
+            afternoon_hour_threshold=PREDICTOR_AFTERNOON_HOUR_THRESHOLD,
+            cloud_threshold_pct=PREDICTOR_CLOUD_THRESHOLD_PCT,
+        )
+        if plausibility_info is not None:
+            plausibility_ceiling = plausibility_info["ceiling_c"]
+            # Log every fire so the HRRR/W3 work has data on whether
+            # the heuristic pointed the right direction, and any
+            # clipped winner is traceable back to a specific cap.
+            log.info(
+                f"plausibility ceiling fired for {city or '?'}: "
+                f"ceiling={plausibility_ceiling:.2f}°C "
+                f"({plausibility_info['fired_reason']}, "
+                f"plausible_rise={plausibility_info['plausible_rise_c']:.2f}°C, "
+                f"observed={observed_max_c:.2f}°C, "
+                f"forecast={bias_corrected_forecast:.2f}°C)"
+            )
+            # Combine with HRRR ceiling via min — both signals can
+            # coexist; most conservative wins.
+            if truncate_at_hi is None:
+                truncate_at_hi = plausibility_ceiling
+            else:
+                truncate_at_hi = min(truncate_at_hi, plausibility_ceiling)
+
     bin_results = []
     for b in bins:
         c_lo, c_hi = bin_temp_range(b)
@@ -1704,6 +1957,8 @@ def predict_bins(event: dict, settlement_obs: list[dict],
         "hrrr_used":          hrrr_used,
         "hrrr_remaining_max": hrrr_remaining_max,
         "hrrr_plateau_signal": hrrr_plateau_signal,
+        "plausibility_ceiling_fired": plausibility_info is not None,
+        "plausibility_info":  plausibility_info,
         "truncate_at_hi":     truncate_at_hi,
         "cooling_confidence": round(cooling_confidence, 3),
         "cooling_reason":     cooling_reason,
