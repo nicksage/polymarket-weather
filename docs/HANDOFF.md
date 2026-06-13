@@ -419,8 +419,35 @@ gets the same stake size in both modes; the difference is whether a
 bin with our_p=0.80 / market_p=0.78 (edge=0.02) makes it past the
 gate at all.
 
+**Execution price ceiling — `PREDICTOR_PROBABILITY_MAX_PRICE`**
+(default `0.85`, added 2026-06-13). Edge mode and MPV inherit
+`MPV_MAX_PRICE=0.32` from the MPV strategy, which is correct for
+"hunt for under-priced bins" trading. Probability mode passes its
+own `max_price_cap` via the signal dict to `execute_signal` so
+expensive high-conviction bins (e.g., 70¢ YES on a bin we think
+90% likely) actually fill instead of being silently capped at 32¢.
+This is the fix for the live failure mode where Atlanta/Austin/Dallas/
+Denver/Houston orders sat with `source=fallback_capped_at_max,
+sweepable=$0.00` because best_ask exceeded the MPV cap.
+
+To raise / lower the ceiling without code changes:
+
+```
+PREDICTOR_PROBABILITY_MAX_PRICE=0.85   # default — sensible balance
+PREDICTOR_PROBABILITY_MAX_PRICE=0.95   # very aggressive — accept thin profit margins
+PREDICTOR_PROBABILITY_MAX_PRICE=0.70   # conservative — skip the most expensive bins
+```
+
+Known limitation: top-ups for probability-mode positions don't yet
+read the override. `execute_topup` looks at `position.get("max_price_cap")`,
+but the `positions` table has no such column — so top-ups fall back to
+MPV. A future migration can persist the cap with the position; until
+then, initial buys benefit from the override but top-ups on expensive
+bins will silently no-op.
+
 Tests: [bot/tests/test_buy_mode.py](../bot/tests/test_buy_mode.py)
-(19 tests, all passing).
+(23 tests) + [tests/test_max_price_cap_override.py](../tests/test_max_price_cap_override.py)
+(4 tests covering the execute_signal threading).
 
 ---
 
@@ -1522,7 +1549,7 @@ Phase 2.
 - [bot/scripts/install_hooks.py](../bot/scripts/install_hooks.py) — installs the pre-commit hook
 - [bot/scripts/git_hooks/pre-commit](../bot/scripts/git_hooks/pre-commit) — hook template
 
-### Tests (187 total)
+### Tests (196 total — bot suite)
 - [bot/tests/test_predictor.py](../bot/tests/test_predictor.py) — 44 tests (predictor + σ prior + B fix)
 - [bot/tests/test_gates.py](../bot/tests/test_gates.py) — 8 tests
 - [bot/tests/test_forecast_recovery.py](../bot/tests/test_forecast_recovery.py) — 7 tests
@@ -1533,7 +1560,8 @@ Phase 2.
 - [bot/tests/test_metar_precision.py](../bot/tests/test_metar_precision.py) — 11 tests (T-group parser + Atlanta scenario)
 - [bot/tests/test_hrrr_ceiling.py](../bot/tests/test_hrrr_ceiling.py) — 22 tests (HRRR plateau / sanity / μ recenter / zero-diff guarantee / region map)
 - [bot/tests/test_quick_fixes.py](../bot/tests/test_quick_fixes.py) — 22 tests (Quick Fix A/B/C — default-ON, plausibility ceiling, etc.)
-- [bot/tests/test_buy_mode.py](../bot/tests/test_buy_mode.py) — 19 tests (PREDICTOR_BUY_MODE dispatch — edge vs probability)
+- [bot/tests/test_buy_mode.py](../bot/tests/test_buy_mode.py) — 23 tests (PREDICTOR_BUY_MODE dispatch + PREDICTOR_PROBABILITY_MAX_PRICE override)
+- [tests/test_max_price_cap_override.py](../tests/test_max_price_cap_override.py) — 4 tests (execute_signal threads signal['max_price_cap'] through compute_sweep_limit)
 - Plus 6 empirical CDF tests in test_predictor.py
 
 ---
