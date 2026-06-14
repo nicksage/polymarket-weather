@@ -23,6 +23,7 @@ import sys
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from datetime import datetime
 
 from config import LOG_LEVEL, PAPER_TRADE, DB_PATH, ACTIVE_STRATEGY
@@ -1059,14 +1060,39 @@ def main():
         coalesce=True,
     )
 
-    # Stale topup re-pricing: every 5 minutes (Lightweight Option B).
-    # When a topup's limit becomes stale relative to the current best_ask
-    # (drift > TOPUP_REPRICE_THRESHOLD_CENTS, default 1.5¢), cancel + re-
-    # issue at the fresh price.  Fixes the "topup sits at $0.30 forever
-    # while asks are now $0.40" failure mode where the position would
-    # otherwise never reach target size despite available liquidity.
-    # Direction-aware: only fires on UPWARD ask drift; downward drift is
-    # already handled by Polymarket's matching at the better price.
+    # Stale entry / topup repricer cadence.  PHASE 1 (2026-06-13):
+    # repriced from CronTrigger(minute="*/5") to IntervalTrigger so the
+    # cadence is sub-minute-tunable via env.  Default 60s — chases asks
+    # within one minute of drift instead of within 0-5 minutes.
+    #
+    # SAFETY: every cancel/replace cycle re-fetches the position's
+    # committed_usdc from the DB and sizes the new order at
+    # (target - committed).  See refresh_stale_ensure_fill_entries'
+    # _capture_partial_fills_before_cancel step for the explicit
+    # pre-cancel reconciliation that prevents the Houston $74.99
+    # over-allocation bug.  Speeding the cron up does NOT increase
+    # overrun risk because:
+    #   - cancel_order is synchronous + confirmed
+    #   - committed_usdc is re-read AFTER cancel succeeds
+    #   - new order size = max(0, target - committed)
+    #   - _refresh_stale_*_lock serializes invocations
+    #
+    # Don't set this below 10s — every cycle hits the CLOB orderbook
+    # endpoint per pending order; high-frequency reruns can trip
+    # Polymarket's per-API-key rate limit.  60s is the sweet spot for
+    # responsiveness vs. API budget.  Set to 0 to disable repricing
+    # entirely (falls back to once-per-restart static limits).
+    import os as _os
+    _REPRICE_INTERVAL_S = int(_os.getenv("PREDICTOR_REPRICE_INTERVAL_S", "60"))
+
+    # Stale TOPUP re-pricing.  When a topup's limit becomes stale relative
+    # to the current best_ask (drift > TOPUP_REPRICE_THRESHOLD_CENTS,
+    # default 1.5¢), cancel + re-issue at the fresh price.  Fixes the
+    # "topup sits at $0.30 forever while asks are now $0.40" failure mode
+    # where the position would otherwise never reach target size despite
+    # available liquidity.  Direction-aware: only fires on UPWARD ask
+    # drift; downward drift is already handled by Polymarket's matching
+    # at the better price.
     def _stale_topup_refresh_job() -> None:
         try:
             from monitor import run_stale_topup_refresh_fast
@@ -1074,22 +1100,26 @@ def main():
         except Exception as e:
             logger.exception(f"Stale topup refresh job failed (non-fatal): {e}")
 
-    scheduler.add_job(
-        _stale_topup_refresh_job,
-        trigger=CronTrigger(minute="*/5", timezone="UTC"),
-        id="stale_topup_refresh",
-        name="Stale topup re-pricing (5-min)",
-        misfire_grace_time=120,
-        coalesce=True,
-    )
+    if _REPRICE_INTERVAL_S > 0:
+        scheduler.add_job(
+            _stale_topup_refresh_job,
+            trigger=IntervalTrigger(seconds=_REPRICE_INTERVAL_S),
+            id="stale_topup_refresh",
+            name=f"Stale topup re-pricing ({_REPRICE_INTERVAL_S}s)",
+            misfire_grace_time=30,
+            coalesce=True,    # if multiple runs queue up, collapse to one
+            max_instances=1,  # belt-and-suspenders vs lock
+        )
 
-    # Stale ENTRY-order repricer for ensure-fill strategies (TKH).
-    # Without this, TKH's hedged-bin entries placed at best_ask + 1c
-    # would rest below the new ask whenever the market drifted up, sit
-    # unfilled, and eventually get nuked by the cancel sweep -- locking
-    # the event out of re-entry forever via TKH per-event dedup.  This
-    # job chases the moving best_ask until the order crosses, ensuring
-    # all K bins per event ultimately fill.
+    # Stale ENTRY-order repricer.  Covers ensure-fill strategies (TKH)
+    # AND the intraday predictor (added 2026-06-13).  Without this, an
+    # entry placed at best_ask + walk_cents would rest below the new ask
+    # whenever the market drifted up, sit unfilled, and eventually get
+    # nuked by the cancel sweep.  This job chases the moving best_ask
+    # until the order crosses (or the position reaches target).
+    # _capture_partial_fills_before_cancel in the repricer is the
+    # overrun guard — any chunks that filled between snapshot and cancel
+    # are applied to the position row BEFORE the replacement is sized.
     def _stale_entry_refresh_job() -> None:
         try:
             from monitor import run_stale_entry_refresh_fast
@@ -1097,14 +1127,16 @@ def main():
         except Exception as e:
             logger.exception(f"Stale entry refresh job failed (non-fatal): {e}")
 
-    scheduler.add_job(
-        _stale_entry_refresh_job,
-        trigger=CronTrigger(minute="*/5", timezone="UTC"),
-        id="stale_entry_refresh",
-        name="Stale ensure-fill entry re-pricing (5-min)",
-        misfire_grace_time=120,
-        coalesce=True,
-    )
+    if _REPRICE_INTERVAL_S > 0:
+        scheduler.add_job(
+            _stale_entry_refresh_job,
+            trigger=IntervalTrigger(seconds=_REPRICE_INTERVAL_S),
+            id="stale_entry_refresh",
+            name=f"Stale entry-order re-pricing ({_REPRICE_INTERVAL_S}s)",
+            misfire_grace_time=30,
+            coalesce=True,
+            max_instances=1,
+        )
 
     # Aggressive REST trade-fill polling -- DISABLED 2026-05-03.
     #

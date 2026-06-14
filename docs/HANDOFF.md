@@ -449,6 +449,54 @@ Tests: [bot/tests/test_buy_mode.py](../bot/tests/test_buy_mode.py)
 (23 tests) + [tests/test_max_price_cap_override.py](../tests/test_max_price_cap_override.py)
 (4 tests covering the execute_signal threading).
 
+### 2.10 Stale-order repricer cadence — `PREDICTOR_REPRICE_INTERVAL_S`
+
+Phase 1 of the fill-chaser work (2026-06-13). Two changes:
+
+1. **Cron switched from every-5-minutes to env-tunable interval**
+   (default 60s). The previous `CronTrigger(minute="*/5")` only fired
+   on minute boundaries; the new `IntervalTrigger(seconds=N)` allows
+   sub-minute cadence. Don't set below 10s — each cycle hits the CLOB
+   orderbook endpoint per pending order and could trip Polymarket's
+   per-API-key rate limit. Set to `0` to disable repricing entirely.
+
+2. **Intraday predictor entries are now repriced.** Previously only
+   `top_k_hedged` strategy entries were covered by
+   `refresh_stale_ensure_fill_entries`. Adding `"intraday_predictor"`
+   to `_ENSURE_FILL_STRATEGIES` at [monitor.py:1295](../bot/monitor.py#L1295)
+   AND the cancel-sweep skip at [monitor.py:200](../bot/monitor.py#L200)
+   means the intraday loop's probability-mode buys now get chased
+   when the ask drifts up past `TOPUP_REPRICE_THRESHOLD_CENTS`
+   (default 1.5¢).
+
+**Overrun protection** is the load-bearing safety property here.
+Cancel/replace cycles run every 60s instead of every 5min — that's
+5× more chances per hour to misfire. Three guards keep the Houston
+$74.99 / NYC pid=107 over-allocation bug from regressing:
+
+| Guard | Where | What it does |
+|---|---|---|
+| Pre-cancel partial-fill capture | `_capture_partial_fills_before_cancel` ([monitor.py:1298](../bot/monitor.py#L1298)) | Fetches Polymarket trades for the order being cancelled BEFORE the cancel arrives, applies any chunks that filled during the race to the position row. Both entry repricer (existing) and topup repricer (Phase 1 addition) now do this. |
+| Synchronous cancel-then-confirm | `cancel_order` ([execution.py:754](../bot/execution.py#L754)) | Waits for Polymarket's cancel response before returning. If cancel fails (e.g. order already fully filled), the repricer skips the replacement. |
+| Re-read `committed_usdc` from DB | Both repricers, after cancel | Sizes the replacement at `max(0, target - committed_usdc)`, where `committed_usdc` reflects the captured partials. If 80% of the original filled during the race, only 20% gets re-placed. |
+
+Plus structural guards:
+- `_refresh_stale_*_lock` mutexes prevent two repricer cycles overlapping
+- `max_instances=1` + `coalesce=True` on the APScheduler jobs means a slow cycle won't get queue-stacked
+- Direction-aware drift check: only chase asks moving UP. Downward drift fills automatically via Polymarket's matcher.
+
+**Env knobs**:
+
+```
+PREDICTOR_REPRICE_INTERVAL_S=60            # default — 1 minute cadence
+PREDICTOR_REPRICE_INTERVAL_S=30            # aggressive — twice a minute
+PREDICTOR_REPRICE_INTERVAL_S=0             # disabled — fallback to scan-cadence only
+TOPUP_REPRICE_THRESHOLD_CENTS=1.5          # drift threshold (cents) to fire reprice
+```
+
+Tests: [bot/tests/test_repricer_coverage.py](../bot/tests/test_repricer_coverage.py)
+(9 tests covering coverage, cadence, and the pre-cancel capture wiring).
+
 ---
 
 ## 3. Data being collected
@@ -1549,7 +1597,7 @@ Phase 2.
 - [bot/scripts/install_hooks.py](../bot/scripts/install_hooks.py) — installs the pre-commit hook
 - [bot/scripts/git_hooks/pre-commit](../bot/scripts/git_hooks/pre-commit) — hook template
 
-### Tests (196 total — bot suite)
+### Tests (205 total — bot suite)
 - [bot/tests/test_predictor.py](../bot/tests/test_predictor.py) — 44 tests (predictor + σ prior + B fix)
 - [bot/tests/test_gates.py](../bot/tests/test_gates.py) — 8 tests
 - [bot/tests/test_forecast_recovery.py](../bot/tests/test_forecast_recovery.py) — 7 tests
@@ -1562,6 +1610,7 @@ Phase 2.
 - [bot/tests/test_quick_fixes.py](../bot/tests/test_quick_fixes.py) — 22 tests (Quick Fix A/B/C — default-ON, plausibility ceiling, etc.)
 - [bot/tests/test_buy_mode.py](../bot/tests/test_buy_mode.py) — 23 tests (PREDICTOR_BUY_MODE dispatch + PREDICTOR_PROBABILITY_MAX_PRICE override)
 - [tests/test_max_price_cap_override.py](../tests/test_max_price_cap_override.py) — 4 tests (execute_signal threads signal['max_price_cap'] through compute_sweep_limit)
+- [bot/tests/test_repricer_coverage.py](../bot/tests/test_repricer_coverage.py) — 9 tests (Phase 1 repricer cadence + intraday_predictor coverage + pre-cancel partial-fill capture)
 - Plus 6 empirical CDF tests in test_predictor.py
 
 ---

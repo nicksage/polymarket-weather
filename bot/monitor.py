@@ -197,7 +197,12 @@ def _cancel_pending_orders(client) -> int:
     # For these, the stale-entry repricer (run_stale_tkh_entry_refresh_fast)
     # cancels-and-replaces at the new best_ask instead of the cancel sweep
     # marking them dead.
-    _ENSURE_FILL_STRATEGIES = {"top_k_hedged"}
+    # IMPORTANT: keep in sync with _ENSURE_FILL_STRATEGIES at module-level
+    # (used by refresh_stale_ensure_fill_entries).  If they drift apart,
+    # an intraday_predictor entry would either be (a) cancelled by the
+    # sweep before the repricer can chase it, or (b) repriced indefinitely
+    # past expiry.
+    _ENSURE_FILL_STRATEGIES = {"top_k_hedged", "intraday_predictor"}
 
     for pos in pending:
         pos_id   = pos["id"]
@@ -1019,6 +1024,34 @@ def refresh_stale_topups(client) -> int:
             if drift_cents <= TOPUP_REPRICE_THRESHOLD_CENTS + 1e-6:
                 continue
 
+            # PHASE 1 hardening (2026-06-13): pre-cancel partial-fill
+            # capture, mirroring refresh_stale_ensure_fill_entries.
+            # Closes the race where chunks crossed our resting topup
+            # between the snapshot read and the cancel arriving at
+            # Polymarket.  Without this, the captured fills would not
+            # be reflected in committed_usdc when we recompute below,
+            # causing the replacement topup to be sized as if those
+            # chunks never landed — and the next fill stacks on top.
+            # This is the same overrun pattern as the New York pid=107
+            # bug, just on the topup path instead of the entry path.
+            cid = pos.get("contract_id") or ""
+            token_id_for_capture = (pos.get("yes_token_id") if side == "YES"
+                                       else pos.get("no_token_id"))
+            try:
+                _capture_partial_fills_before_cancel(
+                    client,
+                    position_id = pid,
+                    contract_id = cid,
+                    token_id    = token_id_for_capture or "",
+                    old_oid     = old_oid,
+                )
+            except Exception as _e:
+                logger.warning(
+                    f"[REPRICE] pid={pid} pre-cancel partial-fill capture "
+                    f"raised: {_e}; proceeding anyway (committed_usdc will "
+                    f"reflect whatever WS has delivered)"
+                )
+
             # Cancel the stale order.  Our cancel_order patches both the
             # ledger row (status='cancelled') AND clears the parent's
             # pending_topup_order_id, so the next execute_topup sees
@@ -1043,7 +1076,12 @@ def refresh_stale_topups(client) -> int:
             fresh_pos = dict(fresh_row)
 
             # Recompute the gap from scratch (committed_usdc reflects the
-            # cancel — the cancelled topup no longer counts).
+            # cancel + any partial fills captured above — the cancelled
+            # topup no longer counts; any chunks that landed before the
+            # cancel ARE counted via add_position_entry_fill).  This is
+            # the overrun protection: if 80% of the topup actually filled
+            # during the cancel race, `remaining` shrinks accordingly so
+            # the replacement only chases the remaining 20%.
             target    = float(fresh_pos.get("target_size_usdc") or 0)
             committed = get_committed_usdc(pid)
             remaining = target - committed
@@ -1290,9 +1328,24 @@ def run_trade_fill_poll_fast() -> dict:
 
 _refresh_stale_entries_lock = _threading.Lock()
 
-# Strategies whose entry orders must keep being chased until they fill
-# (matches the same set in _cancel_pending_orders).
-_ENSURE_FILL_STRATEGIES = {"top_k_hedged"}
+# Strategies whose entry orders should be chased by the stale-entry
+# repricer until they fill (or the per-event/per-contract cap binds).
+# Includes:
+#   - "top_k_hedged"        — TKH bins MUST own every bin in the basket;
+#                              without chasing, a missed bin breaks the
+#                              hedge thesis.
+#   - "intraday_predictor"  — Phase 1 repricer coverage (2026-06-13).
+#                              The intraday loop's probability-mode buys
+#                              were sitting at stale limits while ask
+#                              prices drifted up.  Chasing them via the
+#                              entry repricer (with its built-in
+#                              partial-fill capture + DB re-read pattern)
+#                              lets us shorten the cron without risking
+#                              the Houston $74.99 over-allocation bug —
+#                              every cancel/replace cycle re-checks
+#                              committed_usdc before sizing the next
+#                              order.
+_ENSURE_FILL_STRATEGIES = {"top_k_hedged", "intraday_predictor"}
 
 
 def _capture_partial_fills_before_cancel(
