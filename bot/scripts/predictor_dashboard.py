@@ -195,6 +195,210 @@ def load_live_orders(db: str, since_utc: datetime) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# City detail — drilldown shown when the operator clicks a city in the
+# Analysis table.  Time-series of temperature + model_p + market_p for
+# the bought bin AND the winning bin, plus context (bin distribution at
+# final scan, sunset/peak hour markers, summary card data).
+# ---------------------------------------------------------------------------
+
+def _load_city_detail(conn: sqlite3.Connection, *, city: str,
+                       event_date: str, bought_contract_id: str | None,
+                       winning_contract_id: str | None,
+                       ) -> dict:
+    """Build the detail-view blob for one (city, event_date) event.
+
+    Returns a dict with:
+      summary:       headline metadata for the summary card
+      timeseries:    one row per scan with shared context
+                       (scanned_at_utc, observed_max_c, forecast_high_c,
+                        mu_c, sigma_c)
+      bought_series: per-scan our_prob/market_prob for the bought bin
+      winning_series: same for the winning bin
+      bin_distribution: final-scan probability vector across ALL bins
+                         (used for the bar-chart drawer at the bottom)
+      forecast_peak_hour, sunset_hour: scalar markers (best-effort)
+    """
+    out: dict = {
+        "summary":            {},
+        "timeseries":         [],
+        "bought_series":      [],
+        "winning_series":     [],
+        "bin_distribution":   [],
+        "forecast_peak_hour": None,
+        "sunset_hour":        None,
+    }
+
+    # ---- Per-scan shared context (mu, sigma, observed/forecast highs) ----
+    # We pick ONE bin per scan to avoid replicating shared context.
+    # Use MIN(bin_label) as a stable selector; the shared columns
+    # (observed_max_c, mu_c, sigma_c, forecast_high_c) are bin-invariant.
+    try:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT
+                scanned_at_utc,
+                observed_max_c,
+                forecast_high_c,
+                forecast_peak_hour,
+                mu_c,
+                sigma_c
+            FROM paper_predictor_signals
+            WHERE city = ?
+              AND event_date = ?
+            GROUP BY scanned_at_utc
+            ORDER BY scanned_at_utc ASC
+            """,
+            (city, event_date),
+        ).fetchall()
+        out["timeseries"] = [
+            {
+                "t":              r["scanned_at_utc"],
+                "observed_max_c": r["observed_max_c"],
+                "forecast_high_c": r["forecast_high_c"],
+                "mu_c":           r["mu_c"],
+                "sigma_c":        r["sigma_c"],
+            }
+            for r in rows
+        ]
+        # First non-null forecast_peak_hour wins (it's per-scan but
+        # usually stable across the day).
+        for r in rows:
+            if r["forecast_peak_hour"] is not None:
+                out["forecast_peak_hour"] = int(r["forecast_peak_hour"])
+                break
+    except sqlite3.OperationalError as e:
+        log.warning(f"_load_city_detail shared-context query failed: {e}")
+
+    # ---- Per-bin series — bought + winning ----
+    def _bin_series(contract_id: str | None) -> list[dict]:
+        if not contract_id:
+            return []
+        try:
+            rows = conn.execute(
+                """
+                SELECT scanned_at_utc, our_prob, market_prob
+                FROM paper_predictor_signals
+                WHERE city = ?
+                  AND event_date = ?
+                  AND contract_id = ?
+                ORDER BY scanned_at_utc ASC
+                """,
+                (city, event_date, contract_id),
+            ).fetchall()
+            return [
+                {
+                    "t":           r["scanned_at_utc"],
+                    "our_prob":    r["our_prob"],
+                    "market_prob": r["market_prob"],
+                }
+                for r in rows
+            ]
+        except sqlite3.OperationalError:
+            return []
+
+    out["bought_series"]  = _bin_series(bought_contract_id)
+    out["winning_series"] = _bin_series(winning_contract_id)
+
+    # ---- Final-scan distribution: every bin's our_p + market_p ----
+    # Tells the operator "at the moment the market resolved, what did
+    # we think vs what did the market think across the full bin range."
+    try:
+        latest = conn.execute(
+            "SELECT MAX(scanned_at_utc) FROM paper_predictor_signals "
+            "WHERE city = ? AND event_date = ?",
+            (city, event_date),
+        ).fetchone()
+        latest_ts = latest[0] if latest else None
+        if latest_ts:
+            rows = conn.execute(
+                """
+                SELECT
+                    bin_label, bin_range_low, bin_range_high, unit,
+                    our_prob, market_prob, contract_id
+                FROM paper_predictor_signals
+                WHERE city = ? AND event_date = ?
+                  AND scanned_at_utc = ?
+                ORDER BY bin_range_low ASC
+                """,
+                (city, event_date, latest_ts),
+            ).fetchall()
+            out["bin_distribution"] = [
+                {
+                    "bin_label":    r["bin_label"],
+                    "range_low":    r["bin_range_low"],
+                    "range_high":   r["bin_range_high"],
+                    "unit":         r["unit"],
+                    "our_prob":     r["our_prob"],
+                    "market_prob":  r["market_prob"],
+                    "contract_id":  r["contract_id"],
+                    "is_bought":    (r["contract_id"] == bought_contract_id),
+                    "is_winning":   (r["contract_id"] == winning_contract_id),
+                }
+                for r in rows
+            ]
+    except sqlite3.OperationalError as e:
+        log.warning(f"_load_city_detail distribution query failed: {e}")
+
+    return out
+
+
+def _load_city_details_for_purchases(conn: sqlite3.Connection,
+                                        purchases: list[dict]) -> dict:
+    """Loop through unique (city, event_date) pairs in the purchases
+    set and build a detail blob for each.  Bought/winning contract_ids
+    come straight from the already-loaded purchase row, so this only
+    adds one query batch per event (not per purchase row)."""
+    details: dict[str, dict] = {}
+    seen: set[tuple[str, str]] = set()
+    for p in purchases:
+        city = p.get("city") or ""
+        date = p.get("event_date") or ""
+        if not city or not date:
+            continue
+        key = (city, date)
+        if key in seen:
+            continue
+        seen.add(key)
+        bought_cid  = p.get("contract_id")
+        # winning_contract_id isn't selected into purchases yet — derive
+        # by re-using the win_lo / win_hi pair to find the matching
+        # contract_id from the latest scan.
+        winning_cid = None
+        win_lo, win_hi = p.get("win_lo"), p.get("win_hi")
+        if win_lo is not None and win_hi is not None:
+            try:
+                latest_ts_row = conn.execute(
+                    "SELECT MAX(scanned_at_utc) FROM paper_predictor_signals "
+                    "WHERE city = ? AND event_date = ?",
+                    (city, date),
+                ).fetchone()
+                latest_ts = latest_ts_row[0] if latest_ts_row else None
+                if latest_ts:
+                    row = conn.execute(
+                        """SELECT contract_id FROM paper_predictor_signals
+                           WHERE city = ? AND event_date = ?
+                             AND scanned_at_utc = ?
+                             AND bin_range_low  = ?
+                             AND bin_range_high = ?
+                             LIMIT 1""",
+                        (city, date, latest_ts, win_lo, win_hi),
+                    ).fetchone()
+                    if row:
+                        winning_cid = row[0]
+            except sqlite3.OperationalError:
+                pass
+
+        details[f"{city}||{date}"] = _load_city_detail(
+            conn,
+            city                = city,
+            event_date          = date,
+            bought_contract_id  = bought_cid,
+            winning_contract_id = winning_cid,
+        )
+    return details
+
+
+# ---------------------------------------------------------------------------
 # Analysis tab — purchases & outcomes (the readable headline)
 # ---------------------------------------------------------------------------
 # The headline product is one denormalized row per purchased bin showing:
@@ -223,6 +427,10 @@ def load_analysis_data(db: str, lookback_days: int = 30) -> dict:
         "purchases":           [],
         "calibration_buckets": [],
         "stuck_positions":     [],
+        # City detail blob — keyed by "<city>||<event_date>", populated
+        # AFTER the purchases query so we only emit detail for events
+        # we actually have purchases on.  Loaded by load_city_details.
+        "city_details":        {},
     }
     if not os.path.exists(db):
         return out
@@ -423,6 +631,16 @@ def load_analysis_data(db: str, lookback_days: int = 30) -> dict:
             out["purchases"] = [dict(r) for r in rows]
         except sqlite3.OperationalError as _e:
             log.warning(f"purchases query failed: {_e}")
+
+        # -------- City details (drilldown blob for click-through) -----
+        # Only build details for (city, event_date) pairs that appear
+        # in the purchases set — caps the JSON payload.
+        try:
+            out["city_details"] = _load_city_details_for_purchases(
+                conn, out["purchases"]
+            )
+        except Exception as _e:
+            log.warning(f"city_details build failed: {_e}")
 
         # Headline KPIs are computed in JS so they react to the
         # Paper / Live / Both mode toggle.  See computePurchaseKpis().
@@ -780,7 +998,10 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
 
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>Predictor Dashboard</title>
-<style>{DASHBOARD_CSS}</style></head><body>
+<style>{DASHBOARD_CSS}</style>
+<!-- Chart.js for the city-detail drilldown line charts -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head><body>
 
 <header>
   <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap">
@@ -945,6 +1166,70 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
     </tr></thead>
     <tbody id="an-stuck-tbody"></tbody>
   </table>
+
+</div>
+
+<!-- ===================== CITY-DETAIL DRILLDOWN ===================== -->
+<!-- Shown when the user clicks a city link in the Analysis table.
+     Driven by location.hash = "#detail/<city>/<event_date>". -->
+<div id="detail-section" style="display:none;padding:0 24px 24px">
+
+  <div style="margin:18px 0">
+    <button id="detail-back"
+            style="background:#334155;color:#e2e8f0;border:1px solid #475569;
+                   padding:6px 14px;border-radius:6px;cursor:pointer;
+                   font-size:12px;font-weight:600">
+      &larr; Back to Analysis
+    </button>
+    <span id="detail-title"
+          style="margin-left:14px;font-size:16px;font-weight:600">
+    </span>
+  </div>
+
+  <!-- Summary card: what we bought, result, P&L -->
+  <div class="kpis" id="detail-summary"></div>
+
+  <!-- Chart 1: bought bin -->
+  <div class="section-title" style="margin-top:24px">
+    Bought bin — <span id="detail-bought-label">--</span>
+  </div>
+  <div style="color:#94a3b8;font-size:12px;margin-bottom:8px">
+    Temperature (left axis) and probabilities (right axis) over the day.
+    Shaded band marks the bought bin's range; dashed line is our model's
+    probability; solid line is the market's implied probability.
+  </div>
+  <div style="background:#1e293b;border-radius:8px;padding:12px;
+              margin-bottom:24px">
+    <canvas id="detail-chart-bought" style="max-height:420px"></canvas>
+  </div>
+
+  <!-- Chart 2: winning bin -->
+  <div class="section-title" style="margin-top:24px">
+    Winning bin — <span id="detail-winning-label">--</span>
+  </div>
+  <div style="color:#94a3b8;font-size:12px;margin-bottom:8px">
+    Same view as above, anchored on the bin that Polymarket settled YES.
+    Useful for comparing "what we bought" vs "what won."
+  </div>
+  <div style="background:#1e293b;border-radius:8px;padding:12px;
+              margin-bottom:24px">
+    <canvas id="detail-chart-winning" style="max-height:420px"></canvas>
+  </div>
+
+  <!-- Chart 3: final-scan distribution across ALL bins -->
+  <div class="section-title" style="margin-top:24px">
+    Final-scan distribution (all bins)
+  </div>
+  <div style="color:#94a3b8;font-size:12px;margin-bottom:8px">
+    Our model's probability (blue) vs the market's (red) across every
+    bin at the last scan.  Highlighted bars: BOUGHT (yellow ring) /
+    WINNING (green ring).  Shows where the model and market diverged
+    on the full bin range.
+  </div>
+  <div style="background:#1e293b;border-radius:8px;padding:12px;
+              margin-bottom:24px">
+    <canvas id="detail-chart-distribution" style="max-height:340px"></canvas>
+  </div>
 
 </div>
 
@@ -1773,6 +2058,18 @@ function setView(v) {{
   $("trades-table").style.display    = (v === "trades"   ? "" : "none");
   const an = $("analysis-section");
   if (an) an.style.display           = (v === "analysis" ? "" : "none");
+  // Exit the detail drilldown when switching primary views — otherwise
+  // detail stays open over the new tab.  The hash gets cleared so
+  // hashchange doesn't loop us back in.
+  const ds = $("detail-section");
+  if (ds && ds.style.display !== "none") {{
+    ds.style.display = "none";
+    _destroyDetailCharts();
+    if (location.hash.startsWith("#detail/")) {{
+      history.pushState("", document.title,
+                          location.pathname + location.search);
+    }}
+  }}
   // Analysis tab hides the per-city panel + filters (they don't apply
   // to the historical-analysis view).
   const panelsTitle  = $("panels-title");
@@ -2083,9 +2380,15 @@ function renderAnalysis() {{
 
     const localTime = fmtCityLocalTime(r.entry_time, r.city);
 
+    // City cell links to the detail drilldown for (city, event_date)
+    const cityCell = r.city
+      ? `<a href="#detail/${{encodeURIComponent(r.city)}}/${{encodeURIComponent(r.event_date)}}"
+            style="color:#60a5fa;text-decoration:none;border-bottom:1px dotted #60a5fa">${{r.city}}</a>`
+      : "";
+
     psHtml += `<tr>
       <td>${{fmtDateShort(r.event_date)}}</td>
-      <td>${{r.city||""}}</td>
+      <td>${{cityCell}}</td>
       <td style="font-family:monospace;font-size:11px;color:#cbd5e1">${{localTime}}</td>
       <td>${{modeCell}}</td>
       <td><b>${{boughtBin}}</b></td>
@@ -2176,6 +2479,352 @@ function renderAnalysis() {{
   }}
 }}
 
+// ===========================================================================
+// CITY-DETAIL DRILLDOWN
+// ===========================================================================
+// State: chart instances kept around so we can destroy/recreate on
+// revisit (Chart.js leaks if you stack new charts onto the same canvas).
+let DETAIL_CHARTS = {{bought: null, winning: null, distribution: null}};
+let DETAIL_KEY = null;   // "<city>||<event_date>" of the currently-rendered detail
+
+function _destroyDetailCharts() {{
+  for (const k of Object.keys(DETAIL_CHARTS)) {{
+    if (DETAIL_CHARTS[k]) {{ DETAIL_CHARTS[k].destroy(); DETAIL_CHARTS[k] = null; }}
+  }}
+}}
+
+function _detailIsoToLocal(iso, city) {{
+  // Same idea as fmtCityLocalTime but returns a compact HH:MM string
+  // for chart axis labels — too noisy to render full date in every tick.
+  if (!iso) return "";
+  const tz = CITY_TZ[city];
+  try {{
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return iso;
+    return new Intl.DateTimeFormat("en-US", {{
+      hour: "2-digit", minute: "2-digit",
+      hour12: false, timeZone: tz || undefined,
+    }}).format(d);
+  }} catch (e) {{ return iso.slice(11, 16); }}
+}}
+
+function _purchaseForKey(city, date) {{
+  // Find the first purchase row matching (city, event_date) — used to
+  // build the summary card and choose bin labels.
+  for (const r of (ANALYSIS.purchases || [])) {{
+    if (r.city === city && String(r.event_date) === String(date)) return r;
+  }}
+  return null;
+}}
+
+function _findContractAtFinalScan(detail, lo, hi) {{
+  for (const b of (detail.bin_distribution || [])) {{
+    if (Number(b.range_low) === Number(lo)
+        && Number(b.range_high) === Number(hi)) {{
+      return b.contract_id;
+    }}
+  }}
+  return null;
+}}
+
+function renderDetail(city, eventDate) {{
+  const key = `${{city}}||${{eventDate}}`;
+  const detail = (ANALYSIS.city_details || {{}})[key];
+  const purchase = _purchaseForKey(city, eventDate);
+
+  // Title + back button always work even when detail data is missing
+  $("detail-title").textContent =
+    `${{city}} — ${{fmtDateShort(eventDate)}}`;
+
+  if (!detail) {{
+    $("detail-summary").innerHTML =
+      `<div class="kpi"><div class="label">Status</div>
+       <div class="val" style="color:#ef4444">No detail data available</div></div>`;
+    _destroyDetailCharts();
+    return;
+  }}
+  DETAIL_KEY = key;
+
+  // -- Summary card --
+  const boughtBinLbl = purchase
+    ? fmtBinLabel(purchase.bought_lo, purchase.bought_hi, purchase.bought_unit)
+    : "--";
+  const winBinLbl    = (purchase && purchase.win_lo != null)
+    ? fmtBinLabel(purchase.win_lo, purchase.win_hi,
+                    purchase.win_unit || purchase.bought_unit)
+    : "--";
+
+  // Determine result
+  let resultLbl = "--", resultColor = "#94a3b8";
+  if (purchase) {{
+    if (purchase.exit_px != null) {{
+      const won = Number(purchase.exit_px) >= 0.99;
+      resultLbl   = won ? "WON" : "LOST";
+      resultColor = won ? "#22c55e" : "#ef4444";
+    }} else if (purchase.win_lo != null && purchase.win_hi != null) {{
+      const won = Number(purchase.bought_lo) === Number(purchase.win_lo)
+               && Number(purchase.bought_hi) === Number(purchase.win_hi);
+      resultLbl   = won ? "WON" : "LOST";
+      resultColor = won ? "#22c55e" : "#ef4444";
+    }} else {{
+      resultLbl = "PENDING";
+    }}
+  }}
+
+  const pnlStr = purchase && purchase.pnl != null
+    ? fmtMoney(purchase.pnl, true) : "--";
+  const pnlStyle = (purchase && purchase.pnl != null) ? pnlColor(purchase.pnl) : "";
+  const stakeStr = purchase ? fmtMoney(purchase.stake_usd) : "--";
+  const entryStr = purchase ? fmtNum(purchase.entry_px, 3) : "--";
+  const exitStr  = (purchase && purchase.exit_px != null)
+                     ? fmtNum(purchase.exit_px, 3) : "--";
+  const isPaperLbl = (purchase && Number(purchase.is_paper) === 1)
+                       ? '<span style="color:#3b82f6">PAPER</span>'
+                       : '<span style="color:#ef4444">LIVE</span>';
+
+  $("detail-summary").innerHTML = `
+    <div class="kpi"><div class="label">Mode</div>
+      <div class="val">${{isPaperLbl}}</div></div>
+    <div class="kpi"><div class="label">Bought bin</div>
+      <div class="val">${{boughtBinLbl}}</div></div>
+    <div class="kpi"><div class="label">Winning bin</div>
+      <div class="val">${{winBinLbl}}</div></div>
+    <div class="kpi"><div class="label">Result</div>
+      <div class="val" style="color:${{resultColor}}">${{resultLbl}}</div></div>
+    <div class="kpi"><div class="label">Stake</div>
+      <div class="val">${{stakeStr}}</div></div>
+    <div class="kpi"><div class="label">Entry $</div>
+      <div class="val">${{entryStr}}</div></div>
+    <div class="kpi"><div class="label">Exit $</div>
+      <div class="val">${{exitStr}}</div></div>
+    <div class="kpi"><div class="label">P&amp;L</div>
+      <div class="val" style="${{pnlStyle}}">${{pnlStr}}</div></div>
+  `;
+
+  // Bin labels for the chart headers
+  $("detail-bought-label").textContent = boughtBinLbl;
+  $("detail-winning-label").textContent = winBinLbl;
+
+  // -- Build chart data --
+  _destroyDetailCharts();
+  const ts = detail.timeseries || [];
+  if (ts.length === 0) {{
+    // No scan data for this event — show empty placeholders
+    return;
+  }}
+
+  const unit = purchase ? purchase.bought_unit : null;
+  const isF  = String(unit||"").toLowerCase() === "fahrenheit";
+  const tempUnit = isF ? "°F" : "°C";
+  const conv = isF ? cToF : (v) => v;
+
+  const timeLabels = ts.map(p => _detailIsoToLocal(p.t, city));
+  const tempArr    = ts.map(p => conv(p.observed_max_c));
+  const muArr      = ts.map(p => conv(p.mu_c));
+  const forecastC  = ts.length ? ts[ts.length-1].forecast_high_c : null;
+
+  function _makeBinChart(canvasId, series, binLo, binHi, binLabel) {{
+    const ctx = $(canvasId);
+    if (!ctx) return null;
+    // Align bin series to the shared timeseries by index — both are
+    // ordered ASC by scanned_at_utc, but bin series can have fewer
+    // points (skipped scans).  Build a map for O(1) lookup.
+    const byT = {{}};
+    for (const p of (series || [])) byT[p.t] = p;
+    const ourArr = ts.map(p => byT[p.t] ? (Number(byT[p.t].our_prob) * 100) : null);
+    const mktArr = ts.map(p => byT[p.t] ? (Number(byT[p.t].market_prob) * 100) : null);
+    const binLoF = (binLo != null) ? conv(isF ? Number(binLo) : Number(binLo)) : null;
+    const binHiF = (binHi != null) ? conv(isF ? Number(binHi) : Number(binHi)) : null;
+    // The bin range is ALREADY in the display unit (F for US bins),
+    // so don't double-convert.  conv is identity for matching units;
+    // for °F bins viewed against C source, we'd want different logic
+    // but the dashboard uses the native bin unit anyway.
+    const datasets = [
+      {{
+        label: `Temperature (observed max)`, data: tempArr,
+        yAxisID: 'y-temp', borderColor: '#22c55e',
+        backgroundColor: 'rgba(34, 197, 94, 0.1)', pointRadius: 2,
+        borderWidth: 2, tension: 0.2,
+      }},
+      {{
+        label: `Model μ`, data: muArr,
+        yAxisID: 'y-temp', borderColor: '#a78bfa',
+        borderDash: [3, 3], pointRadius: 1, borderWidth: 1.5,
+        tension: 0.2,
+      }},
+      {{
+        label: `Our P (${{binLabel}})`, data: ourArr,
+        yAxisID: 'y-prob', borderColor: '#3b82f6',
+        borderDash: [6, 4], pointRadius: 2, borderWidth: 2,
+        tension: 0.2, spanGaps: true,
+      }},
+      {{
+        label: `Market P (${{binLabel}})`, data: mktArr,
+        yAxisID: 'y-prob', borderColor: '#ef4444', pointRadius: 2,
+        borderWidth: 2, tension: 0.2, spanGaps: true,
+      }},
+    ];
+    return new Chart(ctx, {{
+      type: 'line',
+      data: {{labels: timeLabels, datasets: datasets}},
+      options: {{
+        responsive: true, maintainAspectRatio: false,
+        interaction: {{mode: 'index', intersect: false}},
+        plugins: {{
+          legend: {{labels: {{color: '#e2e8f0'}}}},
+          tooltip: {{mode: 'index', intersect: false}},
+          title: {{
+            display: !!(forecastC || (binLoF != null)),
+            text: `Forecast high: ${{forecastC != null ? conv(forecastC).toFixed(1) + tempUnit : '--'}}`
+                  + (binLoF != null
+                       ? `  ·  Bin: ${{binLoF}}-${{binHiF}}${{tempUnit}}`
+                       : ''),
+            color: '#94a3b8',
+          }},
+        }},
+        scales: {{
+          x: {{ticks: {{color: '#94a3b8'}}, grid: {{color: '#1f2937'}}}},
+          'y-temp': {{
+            type: 'linear', position: 'left',
+            title: {{display: true, text: `Temperature (${{tempUnit}})`, color: '#94a3b8'}},
+            ticks: {{color: '#94a3b8'}}, grid: {{color: '#1f2937'}},
+          }},
+          'y-prob': {{
+            type: 'linear', position: 'right', min: 0, max: 100,
+            title: {{display: true, text: 'Probability (%)', color: '#94a3b8'}},
+            ticks: {{color: '#94a3b8'}}, grid: {{display: false}},
+          }},
+        }},
+      }},
+    }});
+  }}
+
+  // -- Chart 1: bought bin --
+  if (purchase) {{
+    DETAIL_CHARTS.bought = _makeBinChart(
+      "detail-chart-bought", detail.bought_series,
+      purchase.bought_lo, purchase.bought_hi, boughtBinLbl
+    );
+  }}
+
+  // -- Chart 2: winning bin --
+  if (purchase && purchase.win_lo != null) {{
+    DETAIL_CHARTS.winning = _makeBinChart(
+      "detail-chart-winning", detail.winning_series,
+      purchase.win_lo, purchase.win_hi, winBinLbl
+    );
+  }} else {{
+    // No winner known yet — render empty placeholder so the title still
+    // shows but the canvas stays blank.
+  }}
+
+  // -- Chart 3: final-scan distribution --
+  const dist = detail.bin_distribution || [];
+  if (dist.length > 0) {{
+    const dctx = $("detail-chart-distribution");
+    if (dctx) {{
+      const lbls = dist.map(b => b.bin_label || "?");
+      const ours = dist.map(b => Number(b.our_prob) * 100);
+      const mkts = dist.map(b => Number(b.market_prob) * 100);
+      // Per-bar border colors to highlight bought (yellow) / winning (green)
+      const borders = dist.map(b =>
+        b.is_winning ? '#22c55e'
+        : b.is_bought ? '#f59e0b'
+        : 'rgba(0,0,0,0)'
+      );
+      const borderWidths = dist.map(b => (b.is_bought || b.is_winning) ? 3 : 0);
+      DETAIL_CHARTS.distribution = new Chart(dctx, {{
+        type: 'bar',
+        data: {{
+          labels: lbls,
+          datasets: [
+            {{label: 'Our P (%)',    data: ours, backgroundColor: '#3b82f6',
+              borderColor: borders, borderWidth: borderWidths}},
+            {{label: 'Market P (%)', data: mkts, backgroundColor: '#ef4444',
+              borderColor: borders, borderWidth: borderWidths}},
+          ],
+        }},
+        options: {{
+          responsive: true, maintainAspectRatio: false,
+          plugins: {{
+            legend: {{labels: {{color: '#e2e8f0'}}}},
+            tooltip: {{mode: 'index', intersect: false}},
+          }},
+          scales: {{
+            x: {{ticks: {{color: '#94a3b8'}}, grid: {{color: '#1f2937'}}}},
+            y: {{
+              ticks: {{color: '#94a3b8'}}, grid: {{color: '#1f2937'}},
+              title: {{display: true, text: 'Probability (%)', color: '#94a3b8'}},
+              beginAtZero: true,
+            }},
+          }},
+        }},
+      }});
+    }}
+  }}
+}}
+
+// ===========================================================================
+// Hash-based routing for the detail view
+// ===========================================================================
+// URL pattern: #detail/<city>/<event_date>
+// Browser back button works for free — hashchange listener handles it.
+
+function _parseDetailHash() {{
+  const h = location.hash || "";
+  const m = h.match(/^#detail\\/([^/]+)\\/([^/]+)$/);
+  if (!m) return null;
+  try {{
+    return {{city: decodeURIComponent(m[1]), date: decodeURIComponent(m[2])}};
+  }} catch (e) {{ return null; }}
+}}
+
+function showDetail(city, eventDate) {{
+  // Hide every other section + show detail
+  const sections = ["sig-table","trades-table","analysis-section"];
+  for (const id of sections) {{
+    const el = $(id);
+    if (el) el.style.display = "none";
+  }}
+  for (const id of ["panels-title","filters","city-grid","signals-title"]) {{
+    const el = (id === "filters")
+      ? document.querySelector(".filters") : $(id);
+    if (el) el.style.display = "none";
+  }}
+  // Hide the top-of-page KPI strip too — it doesn't apply to the
+  // single-event drilldown.
+  const kpis = $("kpis"); if (kpis) kpis.style.display = "none";
+  const ds = $("detail-section");
+  if (ds) ds.style.display = "block";
+  renderDetail(city, eventDate);
+}}
+
+function hideDetail() {{
+  const ds = $("detail-section");
+  if (ds) ds.style.display = "none";
+  _destroyDetailCharts();
+  // Restore the top-of-page KPI strip
+  const kpis = $("kpis"); if (kpis) kpis.style.display = "";
+  // Re-apply the current view so the right section comes back
+  setView(VIEW_MODE);
+}}
+
+function _maybeRouteDetail() {{
+  const d = _parseDetailHash();
+  if (d) showDetail(d.city, d.date);
+  else   hideDetail();
+}}
+
+// Back-button & in-link navigation
+window.addEventListener("hashchange", _maybeRouteDetail);
+const _backBtn = $("detail-back");
+if (_backBtn) _backBtn.addEventListener("click", () => {{
+  // Clearing the hash fires hashchange → _maybeRouteDetail → hideDetail
+  history.pushState("", document.title,
+                      location.pathname + location.search);
+  hideDetail();
+}});
+
 // Date dropdown drives the whole dashboard
 $("f-date").addEventListener("change", () => {{
   SELECTED_DATE = $("f-date").value;
@@ -2262,6 +2911,10 @@ function renderAll() {{
 renderAll();
 restorePersistedUI();
 renderAll();
+
+// If the URL already has a #detail/... hash (deep link / refresh
+// from a detail page), route to it now that the initial render is done.
+_maybeRouteDetail();
 
 // ===== Silent refresh (no blank page on update) =====
 // Re-fetch the same URL every REFRESH_SEC, extract the SIGNALS/LIVE_ORDERS
