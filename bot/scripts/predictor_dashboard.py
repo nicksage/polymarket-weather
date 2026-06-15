@@ -791,6 +791,20 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
     Purchases &amp; outcomes
     (last <span id="an-lookback-1">30</span> days)
   </div>
+
+  <!-- In-tab filter row.  Mode comes from the top-level toggle
+       (Paper / Live / Both); date here is independent so the operator
+       can drill into a single event_date without leaving the tab. -->
+  <div class="filters" style="margin-bottom:8px">
+    <div>
+      <label>Date</label>
+      <select id="an-f-date">
+        <option value="">All dates (window)</option>
+      </select>
+    </div>
+    <div class="count" id="an-count">--</div>
+  </div>
+
   <div class="kpis" id="an-headline-kpis"></div>
 
   <!-- THE headline table: one row per purchased bin.  Shows what we
@@ -1700,6 +1714,40 @@ $("view-signals").addEventListener("click",  () => setView("signals"));
 $("view-trades").addEventListener("click",   () => setView("trades"));
 $("view-analysis").addEventListener("click", () => setView("analysis"));
 
+// Belt-and-suspenders dispatch for the Analysis tab.  setView/setMode
+// route through renderAll() which calls a chain of upstream functions
+// (refreshDateDropdown, recomputeDerived, refreshCityDropdown,
+// updateSectionTitles, renderKPIs, renderCityPanels) BEFORE reaching
+// renderAnalysis.  If any of those throws, renderAnalysis is silently
+// skipped.  We listen on the mode/view buttons directly and call
+// renderAnalysis ourselves to make the Analysis tab independent of
+// the rest of the dashboard's render path.
+function _maybeRenderAnalysis() {{
+  if (VIEW_MODE === "analysis") {{
+    try {{ renderAnalysis(); }}
+    catch (e) {{ console.error("renderAnalysis raised:", e); }}
+  }}
+}}
+["mode-paper","mode-live","mode-both",
+   "view-signals","view-trades","view-analysis"].forEach(id => {{
+  const btn = $(id);
+  if (btn) btn.addEventListener("click", () => {{
+    // Defer so setMode/setView finish first (they fire on the same
+    // click event before this handler).  setTimeout 0 puts us at the
+    // end of the microtask queue.
+    setTimeout(_maybeRenderAnalysis, 0);
+  }});
+}});
+
+// In-tab date filter change handler.
+const _anDateSel = $("an-f-date");
+if (_anDateSel) {{
+  _anDateSel.addEventListener("change", () => {{
+    AN_DATE_FILTER = _anDateSel.value || "";
+    _maybeRenderAnalysis();
+  }});
+}}
+
 // ===== Analysis render =====
 function fmtNum(v, places=2, sign=false) {{
   if (v == null || v === "" || isNaN(v)) return "--";
@@ -1838,20 +1886,63 @@ function matchesPurchaseMode(r) {{
   return true;
 }}
 
+// In-tab date filter for the Analysis view.  Empty string = "All dates
+// in the loaded window"; otherwise filter to the matching event_date.
+let AN_DATE_FILTER = "";
+function matchesPurchaseDate(r) {{
+  if (!AN_DATE_FILTER) return true;
+  return String(r.event_date || "") === AN_DATE_FILTER;
+}}
+
+// Populate the in-tab date dropdown with the distinct event_dates that
+// appear in the purchases set, plus an "All dates" option at the top.
+// Preserves the operator's selection across silent refreshes.
+function refreshAnalysisDateDropdown() {{
+  const sel = $("an-f-date");
+  if (!sel) return;
+  const dates = Array.from(new Set(
+    (ANALYSIS.purchases || []).map(r => String(r.event_date || ""))
+  )).filter(Boolean).sort().reverse();
+  const prev = sel.value;
+  let html = '<option value="">All dates (window)</option>';
+  for (const d of dates) {{
+    html += `<option value="${{d}}">${{fmtDateShort(d)}}</option>`;
+  }}
+  sel.innerHTML = html;
+  // Restore previous selection if it's still present
+  if (prev && dates.indexOf(prev) >= 0) {{
+    sel.value = prev;
+    AN_DATE_FILTER = prev;
+  }} else {{
+    AN_DATE_FILTER = "";
+  }}
+}}
+
 function renderAnalysis() {{
   if (!ANALYSIS || typeof ANALYSIS !== "object") return;
   const lookback = ANALYSIS.lookback_days || 30;
   const lb1 = $("an-lookback-1"); if (lb1) lb1.textContent = lookback;
 
-  // -- Filter purchases by current Paper / Live / Both toggle --
+  // Refresh the in-tab date dropdown from whatever dates are present
+  refreshAnalysisDateDropdown();
+
+  // -- Filter purchases: mode AND date --
   const allPurchases = ANALYSIS.purchases || [];
-  const ps = allPurchases.filter(matchesPurchaseMode);
+  const ps = allPurchases
+    .filter(matchesPurchaseMode)
+    .filter(matchesPurchaseDate);
 
   // -- Headline KPI strip (computed from FILTERED set) --
   const k = computePurchaseKpis(ps);
   const modeLabel = MODE_FILTER === "both" ? "all"
                     : MODE_FILTER === "paper" ? "paper"
                     : "live";
+
+  // Row count caption (above the table)
+  const dateLabel = AN_DATE_FILTER ? ` on ${{fmtDateShort(AN_DATE_FILTER)}}` : "";
+  const anCount = $("an-count");
+  if (anCount) anCount.textContent =
+    `${{ps.length}} purchase${{ps.length === 1 ? "" : "s"}} (${{modeLabel}})${{dateLabel}}`;
   $("an-headline-kpis").innerHTML = `
     <div class="kpi"><div class="label">Purchases (${{modeLabel}})</div>
       <div class="val">${{k.n_total||0}}</div></div>
