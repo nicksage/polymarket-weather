@@ -271,7 +271,33 @@ def load_analysis_data(db: str, lookback_days: int = 30) -> dict:
         try:
             rows = conn.execute(
                 f"""
-                WITH purchases AS (
+                WITH
+                -- One signal row per (contract, event_date, action).
+                -- Without this dedupe, the LEFT JOIN below multiplies
+                -- each positions row by the number of LIVE_BUY/PAPER_BUY
+                -- scans for that contract (the bot writes one signal row
+                -- per scan, so an actively-traded bin can have 30+
+                -- LIVE_BUY rows — same positions row would appear 30 times).
+                -- We pick the EARLIEST buy signal as the "model state at
+                -- the moment the buy decision first triggered."
+                first_buy_signal AS (
+                    SELECT * FROM (
+                        SELECT
+                            s.contract_id, s.event_date, s.action,
+                            s.our_prob, s.market_prob,
+                            s.forecast_high_c, s.mu_c, s.sigma_c,
+                            s.observed_max_c, s.data_quality_flag,
+                            s.scanned_at_utc,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY s.contract_id, s.event_date, s.action
+                                ORDER BY s.scanned_at_utc ASC
+                            ) AS rn
+                        FROM paper_predictor_signals s
+                        WHERE s.action IN ('LIVE_BUY', 'PAPER_BUY')
+                          AND s.event_date >= date('now', '-{days} days')
+                    ) WHERE rn = 1
+                ),
+                purchases AS (
                     -- Include BOTH live and paper positions; the
                     -- dashboard's mode toggle (Paper / Live / Both)
                     -- filters in JS via is_paper.  For paper, also
@@ -303,14 +329,11 @@ def load_analysis_data(db: str, lookback_days: int = 30) -> dict:
                         p.entry_time              AS entry_time,
                         p.exit_time               AS exit_time
                     FROM positions p
-                    LEFT JOIN paper_predictor_signals s
+                    LEFT JOIN first_buy_signal s
                       ON s.contract_id = p.contract_id
-                     AND (
-                       (COALESCE(p.is_paper, 0) = 0 AND s.action = 'LIVE_BUY')
-                       OR
-                       (COALESCE(p.is_paper, 0) = 1 AND s.action = 'PAPER_BUY')
-                     )
-                     AND s.event_date = p.date
+                     AND s.event_date  = p.date
+                     AND ((COALESCE(p.is_paper, 0) = 0 AND s.action = 'LIVE_BUY')
+                       OR (COALESCE(p.is_paper, 0) = 1 AND s.action = 'PAPER_BUY'))
                     WHERE p.date >= date('now', '-{days} days')
                 ),
                 latest_scan AS (
