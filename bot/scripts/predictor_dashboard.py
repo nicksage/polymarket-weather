@@ -214,14 +214,12 @@ def load_analysis_data(db: str, lookback_days: int = 30) -> dict:
     Every query is wrapped in try/except so missing tables (fresh DB)
     don't break the whole tab.
     """
+    # Headline KPIs are computed in JS from the filtered `purchases` set
+    # so they react to the Paper / Live / Both mode toggle.  Python no
+    # longer pre-aggregates them.
     out: dict = {
         "lookback_days":       int(lookback_days),
         "pipeline_today":      {"signals": 0, "orders": 0, "positions": 0},
-        "headline_kpis":       {
-            "n_total":   0, "n_won":   0, "n_lost":  0, "n_pending": 0,
-            "win_pct":   0.0, "pnl_total": 0.0, "roi_pct": 0.0,
-            "staked_total": 0.0,
-        },
         "purchases":           [],
         "calibration_buckets": [],
         "stuck_positions":     [],
@@ -274,6 +272,11 @@ def load_analysis_data(db: str, lookback_days: int = 30) -> dict:
             rows = conn.execute(
                 f"""
                 WITH purchases AS (
+                    -- Include BOTH live and paper positions; the
+                    -- dashboard's mode toggle (Paper / Live / Both)
+                    -- filters in JS via is_paper.  For paper, also
+                    -- accept PAPER_BUY rows in the signal join so the
+                    -- model context comes through for paper trades too.
                     SELECT
                         p.id              AS pos_id,
                         p.city            AS city,
@@ -282,6 +285,7 @@ def load_analysis_data(db: str, lookback_days: int = 30) -> dict:
                         p.side            AS side,
                         p.status          AS status,
                         p.fill_status     AS fill_status,
+                        COALESCE(p.is_paper, 0) AS is_paper,
                         ROUND(p.size_usdc,   2)  AS stake_usd,
                         ROUND(p.entry_price, 3)  AS entry_px,
                         ROUND(p.exit_price,  3)  AS exit_px,
@@ -301,10 +305,13 @@ def load_analysis_data(db: str, lookback_days: int = 30) -> dict:
                     FROM positions p
                     LEFT JOIN paper_predictor_signals s
                       ON s.contract_id = p.contract_id
-                     AND s.action = 'LIVE_BUY'
+                     AND (
+                       (COALESCE(p.is_paper, 0) = 0 AND s.action = 'LIVE_BUY')
+                       OR
+                       (COALESCE(p.is_paper, 0) = 1 AND s.action = 'PAPER_BUY')
+                     )
                      AND s.event_date = p.date
-                    WHERE COALESCE(p.is_paper, 0) = 0
-                      AND p.date >= date('now', '-{days} days')
+                    WHERE p.date >= date('now', '-{days} days')
                 ),
                 latest_scan AS (
                     SELECT city, event_date,
@@ -341,50 +348,8 @@ def load_analysis_data(db: str, lookback_days: int = 30) -> dict:
         except sqlite3.OperationalError as _e:
             log.warning(f"purchases query failed: {_e}")
 
-        # -------- Headline KPIs (computed from the purchases set) -----
-        purchases = out["purchases"]
-        n_total   = len(purchases)
-        # "Won" / "Lost" requires we both know the winner AND have a
-        # closed position to compare against.  Pending = either still
-        # open OR winner not yet known.
-        n_won = n_lost = n_pending = 0
-        staked = 0.0
-        pnl_sum = 0.0
-        for r in purchases:
-            staked += float(r.get("stake_usd") or 0)
-            pnl    = r.get("pnl")
-            if pnl is not None:
-                pnl_sum += float(pnl)
-            # Outcome: prefer the closed exit_price (1.0/0.0) when present,
-            # else compare bought bin to winner bin if we have one
-            exit_px = r.get("exit_px")
-            win_lo, win_hi = r.get("win_lo"), r.get("win_hi")
-            if exit_px is not None:
-                if float(exit_px) >= 0.99: n_won += 1
-                else:                      n_lost += 1
-            elif win_lo is not None and win_hi is not None:
-                # We know the winner but the position row isn't closed
-                bought_lo = r.get("bought_lo")
-                bought_hi = r.get("bought_hi")
-                if (bought_lo is not None and bought_hi is not None
-                    and float(bought_lo) == float(win_lo)
-                    and float(bought_hi) == float(win_hi)):
-                    n_won += 1
-                else:
-                    n_lost += 1
-            else:
-                n_pending += 1
-        decided = n_won + n_lost
-        out["headline_kpis"] = {
-            "n_total":   n_total,
-            "n_won":     n_won,
-            "n_lost":    n_lost,
-            "n_pending": n_pending,
-            "win_pct":   round(100.0 * n_won / decided, 1) if decided else 0.0,
-            "pnl_total": round(pnl_sum, 2),
-            "roi_pct":   round(100.0 * pnl_sum / staked, 2) if staked > 0 else 0.0,
-            "staked_total": round(staked, 2),
-        }
+        # Headline KPIs are computed in JS so they react to the
+        # Paper / Live / Both mode toggle.  See computePurchaseKpis().
 
         # -------- Calibration buckets (kept for model-tuning) ---------
         try:
@@ -524,7 +489,10 @@ def _us_cities() -> list[dict]:
             continue
         icao, _net, tz, _lat, _lon = s
         tz_label = _TZ_SHORT.get(tz, tz.split("/")[-1].replace("_", " "))
-        out.append({"city": city, "station": icao, "tz_label": tz_label})
+        # tz_str: full IANA name for client-side time conversion
+        # (Analysis tab uses it to render entry_time in city-local time).
+        out.append({"city": city, "station": icao,
+                       "tz_label": tz_label, "tz_str": tz})
     return out
 
 
@@ -832,6 +800,8 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
       <thead><tr>
         <th>Date</th>
         <th>City</th>
+        <th>Purchased (local)</th>
+        <th>Mode</th>
         <th>Bought bin</th>
         <th>Side</th>
         <th>Stake</th>
@@ -1793,34 +1763,115 @@ function fmtSigmaC(sig_c) {{
   return `±${{Number(sig_c).toFixed(2)}}°C`;
 }}
 
+// Map city -> IANA tz string, built once from the CITIES meta blob.
+// Used by fmtCityLocalTime to render entry_time in the city's local
+// time zone (Atlanta CT, NYC ET, etc.) so the operator can reason
+// about "what was the bot doing at 2pm city local."
+const CITY_TZ = (() => {{
+  const m = {{}};
+  for (const c of (CITIES || [])) {{
+    if (c.city && c.tz_str) m[c.city] = c.tz_str;
+  }}
+  return m;
+}})();
+
+function fmtCityLocalTime(iso, city) {{
+  if (!iso) return "--";
+  const tz = CITY_TZ[city];
+  try {{
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return iso;
+    const opts = {{
+      year: "2-digit", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit",
+      hour12: false, timeZone: tz || undefined,
+      timeZoneName: "short",
+    }};
+    // Returns like "06/13/26, 14:38 EDT"
+    return new Intl.DateTimeFormat("en-US", opts).format(d);
+  }} catch (e) {{
+    return String(iso).slice(0, 19).replace("T", " ");
+  }}
+}}
+
+// Compute headline KPIs from a filtered purchases set.  Mirrors the
+// pre-deletion Python aggregation but runs client-side so it reacts
+// to the Paper / Live / Both mode toggle.
+function computePurchaseKpis(ps) {{
+  let n_won = 0, n_lost = 0, n_pending = 0;
+  let staked = 0, pnl_sum = 0;
+  for (const r of ps) {{
+    staked += Number(r.stake_usd) || 0;
+    if (r.pnl != null) pnl_sum += Number(r.pnl) || 0;
+    if (r.exit_px != null) {{
+      if (Number(r.exit_px) >= 0.99) n_won++;
+      else                            n_lost++;
+    }} else if (r.win_lo != null && r.win_hi != null) {{
+      const won = Number(r.bought_lo) === Number(r.win_lo)
+                && Number(r.bought_hi) === Number(r.win_hi);
+      won ? n_won++ : n_lost++;
+    }} else {{
+      n_pending++;
+    }}
+  }}
+  const decided = n_won + n_lost;
+  return {{
+    n_total:      ps.length,
+    n_won:        n_won,
+    n_lost:       n_lost,
+    n_pending:    n_pending,
+    win_pct:      decided > 0 ? (100 * n_won / decided) : 0,
+    staked_total: staked,
+    pnl_total:    pnl_sum,
+    roi_pct:      staked > 0 ? (100 * pnl_sum / staked) : 0,
+  }};
+}}
+
+// Match the dashboard's mode-toggle semantics for a purchase row.
+//   "paper" — only paper trades (is_paper=1)
+//   "live"  — only live trades  (is_paper=0)
+//   "both"  — everything
+function matchesPurchaseMode(r) {{
+  const isPaper = Number(r.is_paper) === 1;
+  if (MODE_FILTER === "paper") return isPaper;
+  if (MODE_FILTER === "live")  return !isPaper;
+  return true;
+}}
+
 function renderAnalysis() {{
   if (!ANALYSIS || typeof ANALYSIS !== "object") return;
   const lookback = ANALYSIS.lookback_days || 30;
   const lb1 = $("an-lookback-1"); if (lb1) lb1.textContent = lookback;
 
-  // -- Headline KPI strip --
-  const k = ANALYSIS.headline_kpis || {{}};
+  // -- Filter purchases by current Paper / Live / Both toggle --
+  const allPurchases = ANALYSIS.purchases || [];
+  const ps = allPurchases.filter(matchesPurchaseMode);
+
+  // -- Headline KPI strip (computed from FILTERED set) --
+  const k = computePurchaseKpis(ps);
+  const modeLabel = MODE_FILTER === "both" ? "all"
+                    : MODE_FILTER === "paper" ? "paper"
+                    : "live";
   $("an-headline-kpis").innerHTML = `
-    <div class="kpi"><div class="lbl">Purchases</div>
+    <div class="kpi"><div class="label">Purchases (${{modeLabel}})</div>
       <div class="val">${{k.n_total||0}}</div></div>
-    <div class="kpi"><div class="lbl">Won</div>
+    <div class="kpi"><div class="label">Won</div>
       <div class="val" style="color:#22c55e">${{k.n_won||0}}</div></div>
-    <div class="kpi"><div class="lbl">Lost</div>
+    <div class="kpi"><div class="label">Lost</div>
       <div class="val" style="color:#ef4444">${{k.n_lost||0}}</div></div>
-    <div class="kpi"><div class="lbl">Pending</div>
+    <div class="kpi"><div class="label">Pending</div>
       <div class="val" style="color:#94a3b8">${{k.n_pending||0}}</div></div>
-    <div class="kpi"><div class="lbl">Win rate</div>
+    <div class="kpi"><div class="label">Win rate</div>
       <div class="val">${{fmtPct(k.win_pct, 1)}}</div></div>
-    <div class="kpi"><div class="lbl">Staked</div>
+    <div class="kpi"><div class="label">Staked</div>
       <div class="val">${{fmtMoney(k.staked_total)}}</div></div>
-    <div class="kpi"><div class="lbl">P&amp;L</div>
+    <div class="kpi"><div class="label">P&amp;L</div>
       <div class="val" style="${{pnlColor(k.pnl_total)}}">${{fmtMoney(k.pnl_total, true)}}</div></div>
-    <div class="kpi"><div class="lbl">ROI</div>
+    <div class="kpi"><div class="label">ROI</div>
       <div class="val" style="${{pnlColor(k.roi_pct)}}">${{fmtPct(k.roi_pct, 2, true)}}</div></div>
   `;
 
   // -- Purchases & outcomes table (the headline) --
-  const ps = ANALYSIS.purchases || [];
   let psHtml = "";
   for (const r of ps) {{
     const boughtBin = fmtBinLabel(r.bought_lo, r.bought_hi, r.bought_unit);
@@ -1858,9 +1909,18 @@ function renderAnalysis() {{
       ? `<span style="${{pnlColor(r.pnl)}}">${{fmtMoney(r.pnl, true)}}</span>`
       : '<span style="color:#94a3b8">--</span>';
 
+    const isPaper = Number(r.is_paper) === 1;
+    const modeCell = isPaper
+      ? '<span style="color:#3b82f6;font-weight:600">PAPER</span>'
+      : '<span style="color:#ef4444;font-weight:600">LIVE</span>';
+
+    const localTime = fmtCityLocalTime(r.entry_time, r.city);
+
     psHtml += `<tr>
       <td>${{fmtDateShort(r.event_date)}}</td>
       <td>${{r.city||""}}</td>
+      <td style="font-family:monospace;font-size:11px;color:#cbd5e1">${{localTime}}</td>
+      <td>${{modeCell}}</td>
       <td><b>${{boughtBin}}</b></td>
       <td>${{r.side||""}}</td>
       <td>${{fmtMoney(r.stake_usd)}}</td>
@@ -1876,7 +1936,7 @@ function renderAnalysis() {{
     </tr>`;
   }}
   $("an-purchases-tbody").innerHTML = psHtml ||
-    '<tr><td colspan="14" class="empty">No live purchases in window</td></tr>';
+    `<tr><td colspan="16" class="empty">No ${{modeLabel}} purchases in window</td></tr>`;
 
   // -- Pipeline coverage KPIs --
   const pipe = ANALYSIS.pipeline_today
@@ -2169,13 +2229,14 @@ def main() -> int:
         live_orders = load_live_orders(args.db, since)
         live_positions = fetch_live_positions()    # Polymarket data API
         analysis = load_analysis_data(args.db, lookback_days=_analysis_days)
+        _pu = analysis.get("purchases", [])
+        _live = sum(1 for r in _pu if int(r.get("is_paper", 0)) == 0)
+        _paper = len(_pu) - _live
         log.info(f"regenerate: {len(signals)} signals + "
                   f"{len(live_orders)} live orders + "
                   f"{len(live_positions)} live positions + "
-                  f"analysis(purchases={len(analysis.get('purchases', []))},"
-                  f" won={analysis.get('headline_kpis', {}).get('n_won', 0)},"
-                  f" lost={analysis.get('headline_kpis', {}).get('n_lost', 0)},"
-                  f" pending={analysis.get('headline_kpis', {}).get('n_pending', 0)})")
+                  f"analysis(purchases={len(_pu)} = "
+                  f"{_live} live + {_paper} paper)")
         generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         html = build_dashboard(signals, live_orders, generated_at,
                                 auto_refresh_sec=args.watch or None,
