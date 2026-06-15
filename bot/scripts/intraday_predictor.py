@@ -118,6 +118,32 @@ PREDICTOR_USE_CLIMATOLOGICAL_SIGMA = bool(int(
 PREDICTOR_CLIMATOLOGICAL_SIGMA_C = float(
     os.getenv("PREDICTOR_CLIMATOLOGICAL_SIGMA_C", "1.75"))
 
+# === σ floor (2026-06-15, after Q2 realism check) ===
+#
+# Q2 diagnostic confirmed σ is materially under-calibrated:
+#   avg σ_c     = 0.96
+#   avg |error| = 1.25  (ratio 1.30)
+#   pct within 1σ = 60.0% (expected ~68%)
+#   pct within 2σ = 75.6% (expected ~95%)
+#
+# The 2σ shortfall is the louder flag — fat tails the Gaussian can't
+# represent.  W2 Phase C empirical-residual CDF is the durable fix;
+# this floor is the safe-by-construction patch in the meantime.
+#
+# Was 0.3°C (essentially "almost never bind").  Raised to 1.3°C — the
+# value Q2's ratio argues for as a sigma "should be" lower bound.  This
+# stops σ from collapsing to ~0.30°C after observations land, which is
+# the "100% on one bin → off-by-one-bin guaranteed loss" failure mode.
+#
+# Cannot make the bot more aggressive — strictly widens.  After 24h of
+# live data, re-run Q2.  If pct_within_1σ is still well below 68% even
+# with the floor binding, that's evidence the BASE σ (not just the
+# collapsed values) needs widening — argument for the empirical CDF.
+#
+# Override with `PREDICTOR_SIGMA_FLOOR_C` if you want it tighter/wider.
+PREDICTOR_SIGMA_FLOOR_C = float(
+    os.getenv("PREDICTOR_SIGMA_FLOOR_C", "1.3"))
+
 # === Immediate post-peak narrowing — Quick Fix B (default ON 2026-06-12) ===
 #
 # When True (default), the time-since-observed-peak narrowing in
@@ -1658,7 +1684,18 @@ def estimate_day_high_dist(forecast_high: float, forecast_peak_hour: int,
         extra_narrow = 1.0 - cooling_confidence * 0.5
         sigma *= extra_narrow
 
-    sigma = max(0.3, sigma)
+    # σ floor — see PREDICTOR_SIGMA_FLOOR_C constant docs.  Stops the
+    # cascade of narrowing branches from collapsing σ below what Q2's
+    # realism check shows is the calibrated lower bound.
+    #
+    # Carve-out: post-sunset the day is locked at observed_max, so σ
+    # SHOULD stay collapsed (we know the day's high already).  Apply
+    # the wider floor pre-sunset only; post-sunset retains the legacy
+    # 0.3°C floor representing pure station-level measurement noise.
+    if current_hour < sunset_hour:
+        sigma = max(PREDICTOR_SIGMA_FLOOR_C, sigma)
+    else:
+        sigma = max(0.3, sigma)
     return mu, sigma
 
 

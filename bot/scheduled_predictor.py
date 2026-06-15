@@ -1342,11 +1342,24 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
             # Polymarket data was already pulled fresh at scan start (above);
             # weather lags on a 5-min model cycle so caching it saves API
             # calls without hurting decision quality.
+            #
+            # FIX (2026-06-15): include today_str_local in the freshness
+            # check so the cache invalidates the moment local-day rolls
+            # over.  Without this, the first scans of a new local day
+            # (00:00 - 00:05 local) get served yesterday's nws_obs from
+            # cache, and `observed_max_c = max(yesterday's cycles)` writes
+            # yesterday's peak temperature under today's event_date.  The
+            # MAX-asymmetry then permanently inflates today's actuals
+            # proxy in any analysis built on MAX(observed_max_c).  See
+            # the Denver 06-13 case where 2 scans wrote 33.2°C / 91.8°F
+            # while the real KBKF peak that day was 26.3°C / 79.3°F.
             import time as _time
             now_epoch = _time.time()
             cached = _WEATHER_CACHE.get(city)
             cache_age = (now_epoch - cached[0]) if cached else None
-            if cached and cache_age < WEATHER_CACHE_SEC:
+            cached_day = cached[1].get("today_str_local") if cached else None
+            cache_day_matches = (cached_day == today_str_local)
+            if cached and cache_age < WEATHER_CACHE_SEC and cache_day_matches:
                 w = cached[1]
                 nws_obs        = w["nws_obs"]
                 forecast       = w["forecast"]
@@ -1424,6 +1437,9 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
                     "wind_octant":    wind_octant,
                     "nbr_signal":     nbr_signal,
                     "ensemble_stats": ensemble_stats,
+                    # Stamped so the freshness check on the next cache
+                    # hit can detect a local-day rollover and invalidate.
+                    "today_str_local": today_str_local,
                 })
                 log.debug(f"weather cache REFRESH for {city}")
 

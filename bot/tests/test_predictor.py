@@ -195,7 +195,15 @@ def test_post_forecast_peak_narrowing():
 
 
 def test_late_afternoon_well_past_peak():
-    """3h past peak, obs is the day high.  Aggressive narrowing."""
+    """3h past peak, obs is the day high.  Aggressive narrowing.
+
+    Updated 2026-06-15 for PREDICTOR_SIGMA_FLOOR_C = 1.3°C: the σ floor
+    binds here because all narrowing branches stack downward.  Pre-fix
+    σ would collapse to ~0.3°C and bet 100% on one bin → off-by-one
+    bin = guaranteed loss.  The floor at 1.3°C preserves ~30% mass on
+    each adjacent bin so single-bin misses are bounded losses, not
+    total ones.
+    """
     mu, sigma = estimate_day_high_dist(
         forecast_high      = 30.0,
         forecast_peak_hour = 16,
@@ -208,8 +216,8 @@ def test_late_afternoon_well_past_peak():
     )
     # mu locked near observed
     assert_close(mu, 30.5, tol=0.5, msg="mu locks at observed late post-peak")
-    # sigma very narrow (multiple branches multiplied)
-    assert_range(sigma, 0.3, 1.2, msg="sigma very narrow late post-peak")
+    # sigma bound by the floor — pre-sunset, pre-fix would land near 0.3
+    assert_range(sigma, 1.3, 1.5, msg="sigma floored at PREDICTOR_SIGMA_FLOOR_C pre-sunset")
 
 
 def test_after_sunset_locks_to_observed():
@@ -253,20 +261,29 @@ def test_observed_exceeds_forecast_pulls_mu_up():
 # ---------------------------------------------------------------------------
 
 def test_strong_cooling_neighbor_narrows_sigma():
-    """Upwind cooling signal narrows sigma."""
+    """Upwind cooling signal narrows sigma.
+
+    Updated 2026-06-15 for PREDICTOR_SIGMA_FLOOR_C: use a wider
+    base_sigma_c so the floor doesn't bind in either case — that lets
+    us observe the marginal effect of the neighbor signal without the
+    floor swallowing it.  The floor is intentional and tested
+    elsewhere; this test is about the neighbor signal mechanism.
+    """
     base_no_neighbor = estimate_day_high_dist(
         forecast_high=30.0, forecast_peak_hour=16, observed_max=30.0,
         observed_peak_hour=16, current_hour=17, sunset_hour=20,
-        neighbor_signal={}, base_sigma_c=2.0,
+        neighbor_signal={}, base_sigma_c=5.0,   # wide enough to avoid the floor
     )
     with_neighbor = estimate_day_high_dist(
         forecast_high=30.0, forecast_peak_hour=16, observed_max=30.0,
         observed_peak_hour=16, current_hour=17, sunset_hour=20,
         neighbor_signal={"strong_cooling_signal": True, "signal_strength": 0.8},
-        base_sigma_c=2.0,
+        base_sigma_c=5.0,
     )
     assert with_neighbor[1] < base_no_neighbor[1], (
-        "Cooling neighbor signal should narrow sigma further"
+        f"Cooling neighbor signal should narrow sigma further "
+        f"(no_neighbor={base_no_neighbor[1]:.3f}, "
+        f"with_neighbor={with_neighbor[1]:.3f})"
     )
 
 
