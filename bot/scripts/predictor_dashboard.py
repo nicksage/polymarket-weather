@@ -195,33 +195,35 @@ def load_live_orders(db: str, since_utc: datetime) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Analysis tab — bot persistence + performance + calibration audit
+# Analysis tab — purchases & outcomes (the readable headline)
 # ---------------------------------------------------------------------------
-# Loads the data needed to populate the dashboard's Analysis tab:
-#   1. pipeline_today        — signal/order/position counts for today
-#   2. weekly_performance    — closed-position P&L grouped by week
-#   3. closed_positions      — recent realized P&L per position
-#   4. calibration_buckets   — our_prob bucketed vs realized win rate
-#   5. filled_with_context   — filled positions joined to LIVE_BUY signal
-#   6. event_resolutions     — markets the resolution monitor has seen settle
-#   7. stuck_positions       — open positions past their event_date
+# The headline product is one denormalized row per purchased bin showing:
+#   - What we bought (city, date, bin, side, stake)
+#   - What the model said at purchase time (forecast_high, mu, sigma, our_p)
+#   - What actually won (the bin whose market_prob settled at >= 0.99)
+#   - Realized P&L
+#
+# Winning bin is derived from paper_predictor_signals: the bin in the
+# latest scan of (city, event_date) with market_prob >= 0.99 is the bin
+# Polymarket resolved YES.  Falls back to event_resolutions if available.
 
 def load_analysis_data(db: str, lookback_days: int = 30) -> dict:
     """Compose every analysis dataset in one pass.  Returns a dict the
     JS can iterate over; empty lists for tables that have no rows.
 
-    Cheap: each query is bounded by `lookback_days` (default 30).
-    Each query is wrapped in try/except so missing tables (fresh DB,
-    no migrations) don't break the whole tab.
+    Every query is wrapped in try/except so missing tables (fresh DB)
+    don't break the whole tab.
     """
     out: dict = {
         "lookback_days":       int(lookback_days),
         "pipeline_today":      {"signals": 0, "orders": 0, "positions": 0},
-        "weekly_performance":  [],
-        "closed_positions":    [],
+        "headline_kpis":       {
+            "n_total":   0, "n_won":   0, "n_lost":  0, "n_pending": 0,
+            "win_pct":   0.0, "pnl_total": 0.0, "roi_pct": 0.0,
+            "staked_total": 0.0,
+        },
+        "purchases":           [],
         "calibration_buckets": [],
-        "filled_with_context": [],
-        "event_resolutions":   [],
         "stuck_positions":     [],
     }
     if not os.path.exists(db):
@@ -232,7 +234,7 @@ def load_analysis_data(db: str, lookback_days: int = 30) -> dict:
     with sqlite3.connect(db) as conn:
         conn.row_factory = sqlite3.Row
 
-        # -------- 1. Pipeline coverage today --------------------------
+        # -------- Pipeline coverage today (compact health KPI) --------
         try:
             sig = conn.execute(
                 "SELECT COUNT(*) FROM paper_predictor_signals "
@@ -259,60 +261,132 @@ def load_analysis_data(db: str, lookback_days: int = 30) -> dict:
             "signals": int(sig), "orders": int(ord_n), "positions": int(pos)
         }
 
-        # -------- 2. Weekly performance scorecard ---------------------
-        try:
-            rows = conn.execute(
-                """
-                SELECT
-                    strftime('%Y-W%W', date) AS week,
-                    COUNT(*)                  AS n_closed,
-                    SUM(CASE WHEN exit_price = 1.0 THEN 1 ELSE 0 END) AS wins,
-                    ROUND(100.0 * SUM(CASE WHEN exit_price = 1.0 THEN 1 ELSE 0 END)
-                                / NULLIF(COUNT(*), 0), 1) AS win_pct,
-                    ROUND(SUM(size_usdc), 2) AS total_staked,
-                    ROUND(SUM(COALESCE(pnl_net, pnl)), 2) AS pnl_total,
-                    ROUND(100.0 * SUM(COALESCE(pnl_net, pnl))
-                                / NULLIF(SUM(size_usdc), 0), 2) AS roi_pct
-                FROM positions
-                WHERE COALESCE(is_paper, 0) = 0
-                  AND status = 'closed'
-                  AND exit_price IS NOT NULL
-                GROUP BY week
-                ORDER BY week DESC
-                LIMIT 12
-                """
-            ).fetchall()
-            out["weekly_performance"] = [dict(r) for r in rows]
-        except sqlite3.OperationalError:
-            pass
-
-        # -------- 3. Recent closed positions --------------------------
+        # -------- Purchases + outcomes (the headline) -----------------
+        # Three CTEs:
+        #   purchases    — every live position with the LIVE_BUY signal
+        #                   row that produced it, model context joined
+        #   latest_scan  — most-recent scan_at_utc per (city, event_date)
+        #   winners      — the bin in that latest scan with market_prob
+        #                   >= 0.99 (Polymarket's resolution signal)
+        # Final select joins purchases LEFT JOIN winners — pending events
+        # come through with NULL winner fields.
         try:
             rows = conn.execute(
                 f"""
-                SELECT
-                    date, city, side,
-                    ROUND(size_usdc, 2)         AS stake_usd,
-                    ROUND(entry_price, 3)       AS entry_px,
-                    ROUND(exit_price, 3)        AS exit_px,
-                    ROUND(COALESCE(pnl_net, pnl), 2) AS pnl,
-                    ROUND(100.0 * COALESCE(pnl_net, pnl)
-                                / NULLIF(size_usdc, 0), 1) AS pct_return,
-                    exit_reason, exit_time
-                FROM positions
-                WHERE COALESCE(is_paper, 0) = 0
-                  AND status = 'closed'
-                  AND exit_price IS NOT NULL
-                  AND date >= date('now', '-{days} days')
-                ORDER BY exit_time DESC
-                LIMIT 100
+                WITH purchases AS (
+                    SELECT
+                        p.id              AS pos_id,
+                        p.city            AS city,
+                        p.date            AS event_date,
+                        p.contract_id     AS contract_id,
+                        p.side            AS side,
+                        p.status          AS status,
+                        p.fill_status     AS fill_status,
+                        ROUND(p.size_usdc,   2)  AS stake_usd,
+                        ROUND(p.entry_price, 3)  AS entry_px,
+                        ROUND(p.exit_price,  3)  AS exit_px,
+                        ROUND(COALESCE(p.pnl_net, p.pnl), 2) AS pnl,
+                        p.range_low       AS bought_lo,
+                        p.range_high      AS bought_hi,
+                        p.unit            AS bought_unit,
+                        s.our_prob        AS at_buy_our_p,
+                        s.market_prob     AS at_buy_mkt_p,
+                        ROUND(s.forecast_high_c, 2) AS at_buy_fc_high_c,
+                        ROUND(s.mu_c,            2) AS at_buy_mu_c,
+                        ROUND(s.sigma_c,         2) AS at_buy_sigma_c,
+                        ROUND(s.observed_max_c,  2) AS at_buy_obs_max_c,
+                        s.data_quality_flag       AS dq_flag,
+                        p.entry_time              AS entry_time,
+                        p.exit_time               AS exit_time
+                    FROM positions p
+                    LEFT JOIN paper_predictor_signals s
+                      ON s.contract_id = p.contract_id
+                     AND s.action = 'LIVE_BUY'
+                     AND s.event_date = p.date
+                    WHERE COALESCE(p.is_paper, 0) = 0
+                      AND p.date >= date('now', '-{days} days')
+                ),
+                latest_scan AS (
+                    SELECT city, event_date,
+                           MAX(scanned_at_utc) AS max_ts
+                    FROM paper_predictor_signals
+                    WHERE event_date >= date('now', '-{days} days')
+                    GROUP BY city, event_date
+                ),
+                winners AS (
+                    SELECT
+                        s.city,
+                        s.event_date,
+                        s.bin_range_low  AS win_lo,
+                        s.bin_range_high AS win_hi,
+                        s.unit           AS win_unit,
+                        s.market_prob    AS win_mkt_p
+                    FROM paper_predictor_signals s
+                    JOIN latest_scan ls
+                      ON ls.city = s.city
+                     AND ls.event_date = s.event_date
+                     AND ls.max_ts = s.scanned_at_utc
+                    WHERE s.market_prob >= 0.99
+                )
+                SELECT pu.*,
+                       w.win_lo, w.win_hi, w.win_unit, w.win_mkt_p
+                FROM purchases pu
+                LEFT JOIN winners w
+                       ON w.city = pu.city AND w.event_date = pu.event_date
+                ORDER BY pu.event_date DESC, pu.city ASC, pu.pos_id ASC
+                LIMIT 500
                 """
             ).fetchall()
-            out["closed_positions"] = [dict(r) for r in rows]
-        except sqlite3.OperationalError:
-            pass
+            out["purchases"] = [dict(r) for r in rows]
+        except sqlite3.OperationalError as _e:
+            log.warning(f"purchases query failed: {_e}")
 
-        # -------- 4. Calibration buckets ------------------------------
+        # -------- Headline KPIs (computed from the purchases set) -----
+        purchases = out["purchases"]
+        n_total   = len(purchases)
+        # "Won" / "Lost" requires we both know the winner AND have a
+        # closed position to compare against.  Pending = either still
+        # open OR winner not yet known.
+        n_won = n_lost = n_pending = 0
+        staked = 0.0
+        pnl_sum = 0.0
+        for r in purchases:
+            staked += float(r.get("stake_usd") or 0)
+            pnl    = r.get("pnl")
+            if pnl is not None:
+                pnl_sum += float(pnl)
+            # Outcome: prefer the closed exit_price (1.0/0.0) when present,
+            # else compare bought bin to winner bin if we have one
+            exit_px = r.get("exit_px")
+            win_lo, win_hi = r.get("win_lo"), r.get("win_hi")
+            if exit_px is not None:
+                if float(exit_px) >= 0.99: n_won += 1
+                else:                      n_lost += 1
+            elif win_lo is not None and win_hi is not None:
+                # We know the winner but the position row isn't closed
+                bought_lo = r.get("bought_lo")
+                bought_hi = r.get("bought_hi")
+                if (bought_lo is not None and bought_hi is not None
+                    and float(bought_lo) == float(win_lo)
+                    and float(bought_hi) == float(win_hi)):
+                    n_won += 1
+                else:
+                    n_lost += 1
+            else:
+                n_pending += 1
+        decided = n_won + n_lost
+        out["headline_kpis"] = {
+            "n_total":   n_total,
+            "n_won":     n_won,
+            "n_lost":    n_lost,
+            "n_pending": n_pending,
+            "win_pct":   round(100.0 * n_won / decided, 1) if decided else 0.0,
+            "pnl_total": round(pnl_sum, 2),
+            "roi_pct":   round(100.0 * pnl_sum / staked, 2) if staked > 0 else 0.0,
+            "staked_total": round(staked, 2),
+        }
+
+        # -------- Calibration buckets (kept for model-tuning) ---------
         try:
             rows = conn.execute(
                 f"""
@@ -350,59 +424,7 @@ def load_analysis_data(db: str, lookback_days: int = 30) -> dict:
         except sqlite3.OperationalError:
             pass
 
-        # -------- 5. Filled positions w/ preserved model context ------
-        try:
-            rows = conn.execute(
-                f"""
-                SELECT
-                    p.id, p.city, p.date,
-                    ROUND(p.size_usdc, 2)        AS filled_usd,
-                    ROUND(p.entry_price, 3)      AS entry_px,
-                    ROUND(s.our_prob, 3)         AS model_p,
-                    ROUND(s.market_prob, 3)      AS mkt_p,
-                    ROUND(s.edge, 3)             AS edge,
-                    ROUND(s.mu_c, 1)             AS mu_c,
-                    ROUND(s.sigma_c, 2)          AS sigma_c,
-                    ROUND(s.forecast_high_c, 1)  AS fc_high_c,
-                    s.data_quality_flag          AS dq_flag,
-                    p.entry_time
-                FROM positions p
-                LEFT JOIN paper_predictor_signals s
-                  ON s.contract_id = p.contract_id
-                 AND s.action = 'LIVE_BUY'
-                 AND s.event_date = p.date
-                WHERE COALESCE(p.is_paper, 0) = 0
-                  AND p.fill_status = 'filled'
-                  AND p.date >= date('now', '-{days} days')
-                ORDER BY p.entry_time DESC
-                LIMIT 50
-                """
-            ).fetchall()
-            out["filled_with_context"] = [dict(r) for r in rows]
-        except sqlite3.OperationalError:
-            pass
-
-        # -------- 6. Event resolutions --------------------------------
-        try:
-            rows = conn.execute(
-                f"""
-                SELECT
-                    date, city,
-                    ROUND(winning_range_low, 0)  AS win_lo,
-                    ROUND(winning_range_high, 0) AS win_hi,
-                    ROUND(winning_yes_price, 3)  AS yes_settle_px,
-                    resolved_at
-                FROM event_resolutions
-                WHERE date >= date('now', '-{days} days')
-                ORDER BY resolved_at DESC
-                LIMIT 100
-                """
-            ).fetchall()
-            out["event_resolutions"] = [dict(r) for r in rows]
-        except sqlite3.OperationalError:
-            pass
-
-        # -------- 7. Stuck positions (past event date, still open) ----
+        # -------- Stuck positions (compact warning if any) ------------
         try:
             rows = conn.execute(
                 """
@@ -796,112 +818,65 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
 <!-- ===================== ANALYSIS TAB ===================== -->
 <div id="analysis-section" style="display:none">
 
-  <!-- Section 1 - Pipeline coverage -->
-  <div class="section-title">1 - Pipeline coverage (today)</div>
+  <!-- Headline KPI strip -->
+  <div class="section-title">
+    Purchases &amp; outcomes
+    (last <span id="an-lookback-1">30</span> days)
+  </div>
+  <div class="kpis" id="an-headline-kpis"></div>
+
+  <!-- THE headline table: one row per purchased bin.  Shows what we
+       bought, what the model said at purchase time, and what won. -->
+  <div style="overflow-x:auto;margin-bottom:24px">
+    <table class="signals" id="an-purchases-table">
+      <thead><tr>
+        <th>Date</th>
+        <th>City</th>
+        <th>Bought bin</th>
+        <th>Side</th>
+        <th>Stake</th>
+        <th>Entry $</th>
+        <th>At-buy forecast high</th>
+        <th>At-buy &mu;</th>
+        <th>At-buy &sigma;</th>
+        <th>Model P</th>
+        <th>Mkt P</th>
+        <th>Winning bin</th>
+        <th>Result</th>
+        <th>P&amp;L</th>
+      </tr></thead>
+      <tbody id="an-purchases-tbody"></tbody>
+    </table>
+  </div>
+
+  <!-- Compact pipeline health KPI strip (one-glance check) -->
+  <div class="section-title">Pipeline (today)</div>
   <div style="color:#94a3b8;font-size:12px;margin-bottom:8px">
-    Signals &rarr; orders &rarr; positions chain.  Large gaps mean writes
-    are dropping somewhere.
+    Signals &rarr; orders &rarr; positions chain for today.  Large
+    gaps mean writes are dropping somewhere in the pipeline.
   </div>
   <div class="kpis" id="an-pipeline-kpis"></div>
   <div id="an-pipeline-alert"></div>
 
-  <!-- Section 2 - Weekly performance -->
+  <!-- Calibration (kept — useful for tuning the model) -->
   <div class="section-title" style="margin-top:24px">
-    2 - Weekly performance scorecard
-  </div>
-  <div style="color:#94a3b8;font-size:12px;margin-bottom:8px">
-    Real-money P&amp;L on closed LIVE positions, grouped by ISO week.
-    win_pct is bin-by-bin (not bankroll-weighted); pnl uses pnl_net
-    (fees deducted) when available.
-  </div>
-  <div class="kpis" id="an-perf-kpis"></div>
-  <table class="signals" id="an-weekly-table">
-    <thead><tr>
-      <th>Week</th><th>Closed</th><th>Wins</th><th>Win %</th>
-      <th>Staked</th><th>P&amp;L</th><th>ROI %</th>
-    </tr></thead>
-    <tbody id="an-weekly-tbody"></tbody>
-  </table>
-
-  <!-- Section 3 - Recent closed positions -->
-  <div class="section-title" style="margin-top:24px">
-    3 - Recent closed positions (realized P&amp;L)
-  </div>
-  <div style="color:#94a3b8;font-size:12px;margin-bottom:8px">
-    All closed LIVE positions in the lookback window.  exit_px=1.0 won,
-    0.0 lost.  Lookback: <span id="an-lookback-1">30</span> days.
-  </div>
-  <table class="signals" id="an-closed-table">
-    <thead><tr>
-      <th>Date</th><th>City</th><th>Side</th><th>Stake</th>
-      <th>Entry</th><th>Exit</th><th>P&amp;L</th><th>Return %</th>
-      <th>Exit Reason</th><th>Exit Time</th>
-    </tr></thead>
-    <tbody id="an-closed-tbody"></tbody>
-  </table>
-
-  <!-- Section 4 - Calibration -->
-  <div class="section-title" style="margin-top:24px">
-    4 - Model calibration (our_prob vs realized win rate)
+    Model calibration
   </div>
   <div style="color:#94a3b8;font-size:12px;margin-bottom:8px">
     Bucket closed positions by the model's confidence at buy time.  If
-    well-calibrated, avg_model_p &asymp; actual_win_rate within each bucket.
-    Gap colored: green &lt; 5pp, yellow 5-10pp, red &gt;= 10pp.
-    Lookback: <span id="an-lookback-2">30</span> days.
+    well-calibrated, avg_model_p &asymp; actual_win_rate within each
+    bucket.  Gap colored: green &lt; 5pp, yellow 5-10pp, red &gt;= 10pp.
   </div>
   <table class="signals" id="an-cal-table" style="max-width:780px">
     <thead><tr>
       <th>Bucket</th><th>N</th><th>Avg model_p</th>
-      <th>Actual win rate</th><th>Gap (actual - model)</th>
+      <th>Actual win rate</th><th>Gap</th>
     </tr></thead>
     <tbody id="an-cal-tbody"></tbody>
   </table>
 
-  <!-- Section 5 - Filled with model context -->
-  <div class="section-title" style="margin-top:24px">
-    5 - Filled positions with preserved model context
-  </div>
-  <div style="color:#94a3b8;font-size:12px;margin-bottom:8px">
-    Recent filled live positions joined to the LIVE_BUY signal that
-    produced them.  Always-empty model columns = data-loss bug.
-  </div>
-  <div id="an-context-alert"></div>
-  <table class="signals" id="an-context-table">
-    <thead><tr>
-      <th>Pos</th><th>City</th><th>Date</th><th>Filled $</th>
-      <th>Entry</th><th>model_p</th><th>mkt_p</th><th>Edge</th>
-      <th>&mu; (C)</th><th>&sigma; (C)</th><th>FC High (C)</th>
-      <th>DQ Flag</th>
-    </tr></thead>
-    <tbody id="an-context-tbody"></tbody>
-  </table>
-
-  <!-- Section 6 - Event resolutions -->
-  <div class="section-title" style="margin-top:24px">
-    6 - Event resolutions seen by the bot
-  </div>
-  <div style="color:#94a3b8;font-size:12px;margin-bottom:8px">
-    Markets the resolution monitor has seen settle on Gamma.  Empty for
-    recent dates often just means resolutions haven't happened yet.
-  </div>
-  <table class="signals" id="an-res-table">
-    <thead><tr>
-      <th>Event Date</th><th>City</th><th>Winning Bin</th>
-      <th>YES Settle Px</th><th>Resolved At</th>
-    </tr></thead>
-    <tbody id="an-res-tbody"></tbody>
-  </table>
-
-  <!-- Section 7 - Stuck-position alert -->
-  <div class="section-title" style="margin-top:24px">
-    7 - Stuck-position alert
-  </div>
-  <div style="color:#94a3b8;font-size:12px;margin-bottom:8px">
-    Live positions past event_date still 'open'.  Empty is healthy
-    (resolution monitor is working).
-  </div>
-  <div id="an-stuck-summary"></div>
+  <!-- Stuck-position alert (only visible when non-empty) -->
+  <div id="an-stuck-summary" style="margin-top:24px"></div>
   <table class="signals" id="an-stuck-table" style="display:none">
     <thead><tr>
       <th>Pos</th><th>City</th><th>Event Date</th><th>Side</th>
@@ -1794,14 +1769,118 @@ function gapColor(v) {{
   return "color:#22c55e";
 }}
 
+// Temperature helpers — convert Celsius -> Fahrenheit and format with
+// the right symbol so model context (always in C) lines up with bin
+// labels (F for US, C for EU).
+function cToF(c) {{
+  if (c == null || isNaN(c)) return null;
+  return Number(c) * 9 / 5 + 32;
+}}
+function fmtTempInUnit(temp_c, unit, places=1) {{
+  if (temp_c == null || isNaN(temp_c)) return "--";
+  const isF = (String(unit||"").toLowerCase() === "fahrenheit");
+  const v = isF ? cToF(temp_c) : Number(temp_c);
+  return v.toFixed(places) + "°" + (isF ? "F" : "C");
+}}
+function fmtBinLabel(lo, hi, unit) {{
+  if (lo == null || hi == null) return "--";
+  const isF = (String(unit||"").toLowerCase() === "fahrenheit");
+  const sym = isF ? "°F" : "°C";
+  return `${{Math.round(Number(lo))}}-${{Math.round(Number(hi))}}${{sym}}`;
+}}
+function fmtSigmaC(sig_c) {{
+  if (sig_c == null || isNaN(sig_c)) return "--";
+  return `±${{Number(sig_c).toFixed(2)}}°C`;
+}}
+
 function renderAnalysis() {{
   if (!ANALYSIS || typeof ANALYSIS !== "object") return;
   const lookback = ANALYSIS.lookback_days || 30;
   const lb1 = $("an-lookback-1"); if (lb1) lb1.textContent = lookback;
-  const lb2 = $("an-lookback-2"); if (lb2) lb2.textContent = lookback;
 
-  // -- 1. Pipeline KPIs --
-  const pipe = ANALYSIS.pipeline_today || {{signals:0, orders:0, positions:0}};
+  // -- Headline KPI strip --
+  const k = ANALYSIS.headline_kpis || {{}};
+  $("an-headline-kpis").innerHTML = `
+    <div class="kpi"><div class="lbl">Purchases</div>
+      <div class="val">${{k.n_total||0}}</div></div>
+    <div class="kpi"><div class="lbl">Won</div>
+      <div class="val" style="color:#22c55e">${{k.n_won||0}}</div></div>
+    <div class="kpi"><div class="lbl">Lost</div>
+      <div class="val" style="color:#ef4444">${{k.n_lost||0}}</div></div>
+    <div class="kpi"><div class="lbl">Pending</div>
+      <div class="val" style="color:#94a3b8">${{k.n_pending||0}}</div></div>
+    <div class="kpi"><div class="lbl">Win rate</div>
+      <div class="val">${{fmtPct(k.win_pct, 1)}}</div></div>
+    <div class="kpi"><div class="lbl">Staked</div>
+      <div class="val">${{fmtMoney(k.staked_total)}}</div></div>
+    <div class="kpi"><div class="lbl">P&amp;L</div>
+      <div class="val" style="${{pnlColor(k.pnl_total)}}">${{fmtMoney(k.pnl_total, true)}}</div></div>
+    <div class="kpi"><div class="lbl">ROI</div>
+      <div class="val" style="${{pnlColor(k.roi_pct)}}">${{fmtPct(k.roi_pct, 2, true)}}</div></div>
+  `;
+
+  // -- Purchases & outcomes table (the headline) --
+  const ps = ANALYSIS.purchases || [];
+  let psHtml = "";
+  for (const r of ps) {{
+    const boughtBin = fmtBinLabel(r.bought_lo, r.bought_hi, r.bought_unit);
+    const winBin    = (r.win_lo != null && r.win_hi != null)
+                        ? fmtBinLabel(r.win_lo, r.win_hi,
+                                        r.win_unit || r.bought_unit)
+                        : '<span style="color:#94a3b8">--</span>';
+
+    // Forecast high / mu shown in the same unit as the purchased bin
+    const fcHigh = fmtTempInUnit(r.at_buy_fc_high_c, r.bought_unit, 1);
+    const mu     = fmtTempInUnit(r.at_buy_mu_c, r.bought_unit, 1);
+    const sigma  = fmtSigmaC(r.at_buy_sigma_c);
+
+    // Result: prefer the position's exit_price (closed positions);
+    // fall back to comparing bought vs winning bin.
+    let result_html;
+    if (r.exit_px != null) {{
+      const won = Number(r.exit_px) >= 0.99;
+      result_html = won
+        ? '<span style="color:#22c55e;font-weight:600">WON</span>'
+        : '<span style="color:#ef4444;font-weight:600">LOST</span>';
+    }} else if (r.win_lo != null && r.win_hi != null) {{
+      const won = (Number(r.bought_lo) === Number(r.win_lo)
+                   && Number(r.bought_hi) === Number(r.win_hi));
+      result_html = won
+        ? '<span style="color:#22c55e;font-weight:600">WON</span>'
+        : '<span style="color:#ef4444;font-weight:600">LOST</span>';
+    }} else {{
+      // Either still open OR no winner yet known
+      const lbl = (r.status === 'open') ? 'OPEN' : 'PENDING';
+      result_html = `<span style="color:#94a3b8">${{lbl}}</span>`;
+    }}
+
+    const pnlCell = (r.pnl != null)
+      ? `<span style="${{pnlColor(r.pnl)}}">${{fmtMoney(r.pnl, true)}}</span>`
+      : '<span style="color:#94a3b8">--</span>';
+
+    psHtml += `<tr>
+      <td>${{fmtDateShort(r.event_date)}}</td>
+      <td>${{r.city||""}}</td>
+      <td><b>${{boughtBin}}</b></td>
+      <td>${{r.side||""}}</td>
+      <td>${{fmtMoney(r.stake_usd)}}</td>
+      <td>${{fmtNum(r.entry_px, 3)}}</td>
+      <td>${{fcHigh}}</td>
+      <td>${{mu}}</td>
+      <td style="color:#94a3b8">${{sigma}}</td>
+      <td>${{fmtPct(Number(r.at_buy_our_p)*100, 1)}}</td>
+      <td>${{fmtPct(Number(r.at_buy_mkt_p)*100, 1)}}</td>
+      <td>${{winBin}}</td>
+      <td>${{result_html}}</td>
+      <td>${{pnlCell}}</td>
+    </tr>`;
+  }}
+  $("an-purchases-tbody").innerHTML = psHtml ||
+    '<tr><td colspan="14" class="empty">No live purchases in window</td></tr>';
+
+  // -- Pipeline coverage KPIs --
+  const pipe = ANALYSIS.pipeline_today
+                 || {{signals:0, orders:0, positions:0}};
   $("an-pipeline-kpis").innerHTML = `
     <div class="kpi"><div class="lbl">LIVE_BUY signals today</div>
       <div class="val">${{pipe.signals}}</div></div>
@@ -1819,67 +1898,11 @@ function renderAnalysis() {{
   }} else if (pipe.orders > 0 && pipe.positions === 0) {{
     alertHtml = '<div style="background:#78350f;color:#fef3c7;padding:10px;'
       + 'border-radius:6px;margin-top:8px">'
-      + 'WARN: Orders placed but no positions opened. Either all orders '
-      + 'errored, or position row inserts are failing.</div>';
+      + 'WARN: Orders placed but no positions opened.</div>';
   }}
   $("an-pipeline-alert").innerHTML = alertHtml;
 
-  // -- 2. Weekly performance --
-  const weekly = ANALYSIS.weekly_performance || [];
-  const totClosed = weekly.reduce((a,r) => a + (r.n_closed||0), 0);
-  const totWins   = weekly.reduce((a,r) => a + (r.wins||0), 0);
-  const totStake  = weekly.reduce((a,r) => a + (Number(r.total_staked)||0), 0);
-  const totPnl    = weekly.reduce((a,r) => a + (Number(r.pnl_total)||0), 0);
-  const lifeWr    = totClosed > 0 ? (100*totWins/totClosed) : 0;
-  const lifeRoi   = totStake > 0 ? (100*totPnl/totStake) : 0;
-  $("an-perf-kpis").innerHTML = `
-    <div class="kpi"><div class="lbl">Total closed</div>
-      <div class="val">${{totClosed}}</div></div>
-    <div class="kpi"><div class="lbl">Lifetime win %</div>
-      <div class="val">${{lifeWr.toFixed(1)}}%</div></div>
-    <div class="kpi"><div class="lbl">Total staked</div>
-      <div class="val">$${{totStake.toFixed(2)}}</div></div>
-    <div class="kpi"><div class="lbl">Lifetime P&amp;L</div>
-      <div class="val" style="${{pnlColor(totPnl)}}">${{fmtMoney(totPnl, true)}}</div></div>
-    <div class="kpi"><div class="lbl">Lifetime ROI</div>
-      <div class="val" style="${{pnlColor(lifeRoi)}}">${{fmtPct(lifeRoi, 2, true)}}</div></div>
-  `;
-  let weeklyHtml = "";
-  for (const r of weekly) {{
-    weeklyHtml += `<tr>
-      <td>${{r.week||"--"}}</td>
-      <td>${{r.n_closed||0}}</td>
-      <td>${{r.wins||0}}</td>
-      <td>${{fmtPct(r.win_pct, 1)}}</td>
-      <td>${{fmtMoney(r.total_staked)}}</td>
-      <td style="${{pnlColor(r.pnl_total)}}">${{fmtMoney(r.pnl_total, true)}}</td>
-      <td style="${{pnlColor(r.roi_pct)}}">${{fmtPct(r.roi_pct, 2, true)}}</td>
-    </tr>`;
-  }}
-  $("an-weekly-tbody").innerHTML = weeklyHtml ||
-    '<tr><td colspan="7" class="empty">No closed LIVE positions yet</td></tr>';
-
-  // -- 3. Recent closed positions --
-  const closed = ANALYSIS.closed_positions || [];
-  let closedHtml = "";
-  for (const r of closed) {{
-    closedHtml += `<tr>
-      <td>${{fmtDateShort(r.date)}}</td>
-      <td>${{r.city||""}}</td>
-      <td>${{r.side||""}}</td>
-      <td>${{fmtMoney(r.stake_usd)}}</td>
-      <td>${{fmtNum(r.entry_px, 3)}}</td>
-      <td>${{fmtNum(r.exit_px, 3)}}</td>
-      <td style="${{pnlColor(r.pnl)}}">${{fmtMoney(r.pnl, true)}}</td>
-      <td style="${{pnlColor(r.pct_return)}}">${{fmtPct(r.pct_return, 1, true)}}</td>
-      <td>${{r.exit_reason||""}}</td>
-      <td>${{(r.exit_time||"").slice(0,19).replace("T"," ")}}</td>
-    </tr>`;
-  }}
-  $("an-closed-tbody").innerHTML = closedHtml ||
-    '<tr><td colspan="10" class="empty">No closed LIVE positions in window</td></tr>';
-
-  // -- 4. Calibration --
+  // -- Calibration --
   const cal = ANALYSIS.calibration_buckets || [];
   let calHtml = "";
   for (const r of cal) {{
@@ -1892,70 +1915,18 @@ function renderAnalysis() {{
     </tr>`;
   }}
   $("an-cal-tbody").innerHTML = calHtml ||
-    '<tr><td colspan="5" class="empty">Need at least one closed position with a matching LIVE_BUY signal</td></tr>';
+    '<tr><td colspan="5" class="empty">Need closed positions with a matching LIVE_BUY signal</td></tr>';
 
-  // -- 5. Filled with model context --
-  const ctx = ANALYSIS.filled_with_context || [];
-  let ctxHtml = "";
-  let missingAny = false;
-  for (const r of ctx) {{
-    if (r.model_p == null || r.mu_c == null) missingAny = true;
-    ctxHtml += `<tr>
-      <td>${{r.id||""}}</td>
-      <td>${{r.city||""}}</td>
-      <td>${{fmtDateShort(r.date)}}</td>
-      <td>${{fmtMoney(r.filled_usd)}}</td>
-      <td>${{fmtNum(r.entry_px, 3)}}</td>
-      <td>${{fmtNum(r.model_p, 3)}}</td>
-      <td>${{fmtNum(r.mkt_p, 3)}}</td>
-      <td>${{fmtNum(r.edge, 3, true)}}</td>
-      <td>${{fmtNum(r.mu_c, 1)}}</td>
-      <td>${{fmtNum(r.sigma_c, 2)}}</td>
-      <td>${{fmtNum(r.fc_high_c, 1)}}</td>
-      <td style="color:#94a3b8;font-size:11px">${{r.dq_flag||""}}</td>
-    </tr>`;
-  }}
-  $("an-context-tbody").innerHTML = ctxHtml ||
-    '<tr><td colspan="12" class="empty">No filled LIVE positions in window</td></tr>';
-  $("an-context-alert").innerHTML = (ctx.length > 0 && missingAny)
-    ? '<div style="background:#78350f;color:#fef3c7;padding:10px;'
-      + 'border-radius:6px;margin-bottom:8px">'
-      + 'Some positions have no matching LIVE_BUY signal row (manual trades '
-      + 'or signal deletion).</div>'
-    : "";
-
-  // -- 6. Event resolutions --
-  const res = ANALYSIS.event_resolutions || [];
-  let resHtml = "";
-  for (const r of res) {{
-    const bin = (r.win_lo != null && r.win_hi != null)
-      ? `${{Math.round(r.win_lo)}}-${{Math.round(r.win_hi)}}`
-      : "?";
-    resHtml += `<tr>
-      <td>${{fmtDateShort(r.date)}}</td>
-      <td>${{r.city||""}}</td>
-      <td>${{bin}}</td>
-      <td>${{fmtNum(r.yes_settle_px, 3)}}</td>
-      <td>${{(r.resolved_at||"").slice(0,19).replace("T"," ")}}</td>
-    </tr>`;
-  }}
-  $("an-res-tbody").innerHTML = resHtml ||
-    '<tr><td colspan="5" class="empty">No resolutions recorded in window</td></tr>';
-
-  // -- 7. Stuck positions --
+  // -- Stuck positions (compact warning only when present) --
   const stuck = ANALYSIS.stuck_positions || [];
   if (stuck.length === 0) {{
-    $("an-stuck-summary").innerHTML =
-      '<div style="background:#064e3b;color:#d1fae5;padding:10px;'
-      + 'border-radius:6px">'
-      + 'Healthy: no stuck positions. Every past-date live position '
-      + 'has been closed.</div>';
+    $("an-stuck-summary").innerHTML = "";
     $("an-stuck-table").style.display = "none";
   }} else {{
     $("an-stuck-summary").innerHTML =
       `<div style="background:#78350f;color:#fef3c7;padding:10px;`
       + `border-radius:6px;margin-bottom:8px">`
-      + `${{stuck.length}} live position(s) past event date, still open. `
+      + `<b>${{stuck.length}} stuck position(s)</b> past event date, still open. `
       + `Investigate whether _settle_resolved_positions is firing OR `
       + `Gamma shows the market still open (delayed resolution).</div>`;
     let stuckHtml = "";
@@ -2201,9 +2172,10 @@ def main() -> int:
         log.info(f"regenerate: {len(signals)} signals + "
                   f"{len(live_orders)} live orders + "
                   f"{len(live_positions)} live positions + "
-                  f"analysis(closed={len(analysis.get('closed_positions', []))},"
-                  f" weeks={len(analysis.get('weekly_performance', []))},"
-                  f" cal_buckets={len(analysis.get('calibration_buckets', []))})")
+                  f"analysis(purchases={len(analysis.get('purchases', []))},"
+                  f" won={analysis.get('headline_kpis', {}).get('n_won', 0)},"
+                  f" lost={analysis.get('headline_kpis', {}).get('n_lost', 0)},"
+                  f" pending={analysis.get('headline_kpis', {}).get('n_pending', 0)})")
         generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         html = build_dashboard(signals, live_orders, generated_at,
                                 auto_refresh_sec=args.watch or None,
