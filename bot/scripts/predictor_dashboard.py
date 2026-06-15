@@ -1195,12 +1195,14 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
   </div>
   <div style="color:#94a3b8;font-size:12px;margin-bottom:8px">
     Temperature (left axis) and probabilities (right axis) over the day.
-    Shaded band marks the bought bin's range; dashed line is our model's
-    probability; solid line is the market's implied probability.
+    Dashed line is our model's probability; solid line is the market's
+    implied probability.
   </div>
   <div style="background:#1e293b;border-radius:8px;padding:12px;
               margin-bottom:24px">
-    <canvas id="detail-chart-bought" style="max-height:420px"></canvas>
+    <div style="position:relative;height:560px">
+      <canvas id="detail-chart-bought"></canvas>
+    </div>
   </div>
 
   <!-- Chart 2: winning bin -->
@@ -1213,7 +1215,9 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
   </div>
   <div style="background:#1e293b;border-radius:8px;padding:12px;
               margin-bottom:24px">
-    <canvas id="detail-chart-winning" style="max-height:420px"></canvas>
+    <div style="position:relative;height:560px">
+      <canvas id="detail-chart-winning"></canvas>
+    </div>
   </div>
 
   <!-- Chart 3: final-scan distribution across ALL bins -->
@@ -1228,7 +1232,9 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
   </div>
   <div style="background:#1e293b;border-radius:8px;padding:12px;
               margin-bottom:24px">
-    <canvas id="detail-chart-distribution" style="max-height:340px"></canvas>
+    <div style="position:relative;height:420px">
+      <canvas id="detail-chart-distribution"></canvas>
+    </div>
   </div>
 
 </div>
@@ -2633,12 +2639,11 @@ function renderDetail(city, eventDate) {{
     for (const p of (series || [])) byT[p.t] = p;
     const ourArr = ts.map(p => byT[p.t] ? (Number(byT[p.t].our_prob) * 100) : null);
     const mktArr = ts.map(p => byT[p.t] ? (Number(byT[p.t].market_prob) * 100) : null);
-    const binLoF = (binLo != null) ? conv(isF ? Number(binLo) : Number(binLo)) : null;
-    const binHiF = (binHi != null) ? conv(isF ? Number(binHi) : Number(binHi)) : null;
-    // The bin range is ALREADY in the display unit (F for US bins),
-    // so don't double-convert.  conv is identity for matching units;
-    // for °F bins viewed against C source, we'd want different logic
-    // but the dashboard uses the native bin unit anyway.
+    // Bin range is ALREADY stored in the bin's native unit (the same
+    // unit we render the temperature in via conv).  Do NOT convert it
+    // — that would F-to-F again, producing 168°F for a 76°F bin.
+    const binLoDisp = (binLo != null) ? Number(binLo) : null;
+    const binHiDisp = (binHi != null) ? Number(binHi) : null;
     const datasets = [
       {{
         label: `Temperature (observed max)`, data: tempArr,
@@ -2674,16 +2679,28 @@ function renderDetail(city, eventDate) {{
           legend: {{labels: {{color: '#e2e8f0'}}}},
           tooltip: {{mode: 'index', intersect: false}},
           title: {{
-            display: !!(forecastC || (binLoF != null)),
+            display: !!(forecastC || (binLoDisp != null)),
             text: `Forecast high: ${{forecastC != null ? conv(forecastC).toFixed(1) + tempUnit : '--'}}`
-                  + (binLoF != null
-                       ? `  ·  Bin: ${{binLoF}}-${{binHiF}}${{tempUnit}}`
+                  + (binLoDisp != null
+                       ? `  ·  Bin: ${{binLoDisp}}-${{binHiDisp}}${{tempUnit}}`
                        : ''),
             color: '#94a3b8',
           }},
         }},
         scales: {{
-          x: {{ticks: {{color: '#94a3b8'}}, grid: {{color: '#1f2937'}}}},
+          x: {{
+            // Thin tick labels: 200+ scans/day would otherwise jam the
+            // axis and eat all the chart height.  autoSkip + 12 limit
+            // shows roughly one label per hour for a 12-hour window.
+            ticks: {{
+              color: '#94a3b8',
+              autoSkip: true,
+              maxTicksLimit: 12,
+              maxRotation: 0,
+              minRotation: 0,
+            }},
+            grid: {{color: '#1f2937'}},
+          }},
           'y-temp': {{
             type: 'linear', position: 'left',
             title: {{display: true, text: `Temperature (${{tempUnit}})`, color: '#94a3b8'}},
@@ -2751,7 +2768,14 @@ function renderDetail(city, eventDate) {{
             tooltip: {{mode: 'index', intersect: false}},
           }},
           scales: {{
-            x: {{ticks: {{color: '#94a3b8'}}, grid: {{color: '#1f2937'}}}},
+            x: {{
+              ticks: {{
+                color: '#94a3b8',
+                autoSkip: false,    // every bin label matters here
+                maxRotation: 45, minRotation: 30,
+              }},
+              grid: {{color: '#1f2937'}},
+            }},
             y: {{
               ticks: {{color: '#94a3b8'}}, grid: {{color: '#1f2937'}},
               title: {{display: true, text: 'Probability (%)', color: '#94a3b8'}},
