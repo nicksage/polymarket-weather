@@ -195,6 +195,239 @@ def load_live_orders(db: str, since_utc: datetime) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Analysis tab — bot persistence + performance + calibration audit
+# ---------------------------------------------------------------------------
+# Loads the data needed to populate the dashboard's Analysis tab:
+#   1. pipeline_today        — signal/order/position counts for today
+#   2. weekly_performance    — closed-position P&L grouped by week
+#   3. closed_positions      — recent realized P&L per position
+#   4. calibration_buckets   — our_prob bucketed vs realized win rate
+#   5. filled_with_context   — filled positions joined to LIVE_BUY signal
+#   6. event_resolutions     — markets the resolution monitor has seen settle
+#   7. stuck_positions       — open positions past their event_date
+
+def load_analysis_data(db: str, lookback_days: int = 30) -> dict:
+    """Compose every analysis dataset in one pass.  Returns a dict the
+    JS can iterate over; empty lists for tables that have no rows.
+
+    Cheap: each query is bounded by `lookback_days` (default 30).
+    Each query is wrapped in try/except so missing tables (fresh DB,
+    no migrations) don't break the whole tab.
+    """
+    out: dict = {
+        "lookback_days":       int(lookback_days),
+        "pipeline_today":      {"signals": 0, "orders": 0, "positions": 0},
+        "weekly_performance":  [],
+        "closed_positions":    [],
+        "calibration_buckets": [],
+        "filled_with_context": [],
+        "event_resolutions":   [],
+        "stuck_positions":     [],
+    }
+    if not os.path.exists(db):
+        return out
+
+    days = max(1, int(lookback_days))
+
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+
+        # -------- 1. Pipeline coverage today --------------------------
+        try:
+            sig = conn.execute(
+                "SELECT COUNT(*) FROM paper_predictor_signals "
+                "WHERE event_date = date('now') AND action = 'LIVE_BUY'"
+            ).fetchone()[0]
+        except sqlite3.OperationalError:
+            sig = 0
+        try:
+            ord_n = conn.execute(
+                "SELECT COUNT(*) FROM live_predictor_orders "
+                "WHERE substr(placed_at_utc, 1, 10) = date('now')"
+            ).fetchone()[0]
+        except sqlite3.OperationalError:
+            ord_n = 0
+        try:
+            pos = conn.execute(
+                "SELECT COUNT(*) FROM positions "
+                "WHERE date = date('now') AND COALESCE(is_paper, 0) = 0 "
+                "  AND status IN ('open', 'closed')"
+            ).fetchone()[0]
+        except sqlite3.OperationalError:
+            pos = 0
+        out["pipeline_today"] = {
+            "signals": int(sig), "orders": int(ord_n), "positions": int(pos)
+        }
+
+        # -------- 2. Weekly performance scorecard ---------------------
+        try:
+            rows = conn.execute(
+                """
+                SELECT
+                    strftime('%Y-W%W', date) AS week,
+                    COUNT(*)                  AS n_closed,
+                    SUM(CASE WHEN exit_price = 1.0 THEN 1 ELSE 0 END) AS wins,
+                    ROUND(100.0 * SUM(CASE WHEN exit_price = 1.0 THEN 1 ELSE 0 END)
+                                / NULLIF(COUNT(*), 0), 1) AS win_pct,
+                    ROUND(SUM(size_usdc), 2) AS total_staked,
+                    ROUND(SUM(COALESCE(pnl_net, pnl)), 2) AS pnl_total,
+                    ROUND(100.0 * SUM(COALESCE(pnl_net, pnl))
+                                / NULLIF(SUM(size_usdc), 0), 2) AS roi_pct
+                FROM positions
+                WHERE COALESCE(is_paper, 0) = 0
+                  AND status = 'closed'
+                  AND exit_price IS NOT NULL
+                GROUP BY week
+                ORDER BY week DESC
+                LIMIT 12
+                """
+            ).fetchall()
+            out["weekly_performance"] = [dict(r) for r in rows]
+        except sqlite3.OperationalError:
+            pass
+
+        # -------- 3. Recent closed positions --------------------------
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    date, city, side,
+                    ROUND(size_usdc, 2)         AS stake_usd,
+                    ROUND(entry_price, 3)       AS entry_px,
+                    ROUND(exit_price, 3)        AS exit_px,
+                    ROUND(COALESCE(pnl_net, pnl), 2) AS pnl,
+                    ROUND(100.0 * COALESCE(pnl_net, pnl)
+                                / NULLIF(size_usdc, 0), 1) AS pct_return,
+                    exit_reason, exit_time
+                FROM positions
+                WHERE COALESCE(is_paper, 0) = 0
+                  AND status = 'closed'
+                  AND exit_price IS NOT NULL
+                  AND date >= date('now', '-{days} days')
+                ORDER BY exit_time DESC
+                LIMIT 100
+                """
+            ).fetchall()
+            out["closed_positions"] = [dict(r) for r in rows]
+        except sqlite3.OperationalError:
+            pass
+
+        # -------- 4. Calibration buckets ------------------------------
+        try:
+            rows = conn.execute(
+                f"""
+                WITH joined AS (
+                    SELECT
+                        p.id, p.exit_price, s.our_prob
+                    FROM positions p
+                    JOIN paper_predictor_signals s
+                      ON s.contract_id = p.contract_id
+                     AND s.action = 'LIVE_BUY'
+                     AND s.event_date = p.date
+                    WHERE COALESCE(p.is_paper, 0) = 0
+                      AND p.status = 'closed'
+                      AND p.exit_price IS NOT NULL
+                      AND p.date >= date('now', '-{days} days')
+                )
+                SELECT
+                    CASE
+                        WHEN our_prob < 0.3 THEN '0.0-0.3'
+                        WHEN our_prob < 0.5 THEN '0.3-0.5'
+                        WHEN our_prob < 0.7 THEN '0.5-0.7'
+                        WHEN our_prob < 0.9 THEN '0.7-0.9'
+                        ELSE                       '0.9-1.0'
+                    END                       AS conf_bucket,
+                    COUNT(*)                  AS n,
+                    ROUND(AVG(our_prob), 3)   AS avg_model_p,
+                    ROUND(AVG(exit_price), 3) AS actual_win_rate,
+                    ROUND(AVG(exit_price) - AVG(our_prob), 3) AS calibration_gap
+                FROM joined
+                GROUP BY conf_bucket
+                ORDER BY conf_bucket
+                """
+            ).fetchall()
+            out["calibration_buckets"] = [dict(r) for r in rows]
+        except sqlite3.OperationalError:
+            pass
+
+        # -------- 5. Filled positions w/ preserved model context ------
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    p.id, p.city, p.date,
+                    ROUND(p.size_usdc, 2)        AS filled_usd,
+                    ROUND(p.entry_price, 3)      AS entry_px,
+                    ROUND(s.our_prob, 3)         AS model_p,
+                    ROUND(s.market_prob, 3)      AS mkt_p,
+                    ROUND(s.edge, 3)             AS edge,
+                    ROUND(s.mu_c, 1)             AS mu_c,
+                    ROUND(s.sigma_c, 2)          AS sigma_c,
+                    ROUND(s.forecast_high_c, 1)  AS fc_high_c,
+                    s.data_quality_flag          AS dq_flag,
+                    p.entry_time
+                FROM positions p
+                LEFT JOIN paper_predictor_signals s
+                  ON s.contract_id = p.contract_id
+                 AND s.action = 'LIVE_BUY'
+                 AND s.event_date = p.date
+                WHERE COALESCE(p.is_paper, 0) = 0
+                  AND p.fill_status = 'filled'
+                  AND p.date >= date('now', '-{days} days')
+                ORDER BY p.entry_time DESC
+                LIMIT 50
+                """
+            ).fetchall()
+            out["filled_with_context"] = [dict(r) for r in rows]
+        except sqlite3.OperationalError:
+            pass
+
+        # -------- 6. Event resolutions --------------------------------
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    date, city,
+                    ROUND(winning_range_low, 0)  AS win_lo,
+                    ROUND(winning_range_high, 0) AS win_hi,
+                    ROUND(winning_yes_price, 3)  AS yes_settle_px,
+                    resolved_at
+                FROM event_resolutions
+                WHERE date >= date('now', '-{days} days')
+                ORDER BY resolved_at DESC
+                LIMIT 100
+                """
+            ).fetchall()
+            out["event_resolutions"] = [dict(r) for r in rows]
+        except sqlite3.OperationalError:
+            pass
+
+        # -------- 7. Stuck positions (past event date, still open) ----
+        try:
+            rows = conn.execute(
+                """
+                SELECT
+                    id, city, date, side,
+                    ROUND(size_usdc, 2)   AS stake_usd,
+                    ROUND(entry_price, 3) AS entry_px,
+                    status, fill_status, entry_time,
+                    ROUND(julianday('now') - julianday(date), 1) AS days_past_event
+                FROM positions
+                WHERE COALESCE(is_paper, 0) = 0
+                  AND status = 'open'
+                  AND date < date('now')
+                ORDER BY date ASC
+                LIMIT 50
+                """
+            ).fetchall()
+            out["stuck_positions"] = [dict(r) for r in rows]
+        except sqlite3.OperationalError:
+            pass
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Polymarket data API — authoritative LIVE positions / P&L
 # ---------------------------------------------------------------------------
 
@@ -452,7 +685,8 @@ table.live-orders th { background: #0f172a; color: #94a3b8; font-weight: 600;
 def build_dashboard(signals: list[dict], live_orders: list[dict],
                      generated_at_utc: str,
                      auto_refresh_sec: int | None = None,
-                     live_positions: list[dict] | None = None) -> str:
+                     live_positions: list[dict] | None = None,
+                     analysis: dict | None = None) -> str:
     """Build the full HTML page.  All data filtering / aggregation happens
     in JS so the mode toggle is instant and reuses one data blob."""
     cities_meta = _us_cities()
@@ -460,6 +694,8 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
     live_json   = json.dumps(live_orders, default=str, separators=(",", ":"))
     cities_json = json.dumps(cities_meta, default=str, separators=(",", ":"))
     positions_json = json.dumps(live_positions or [], default=str,
+                                  separators=(",", ":"))
+    analysis_json  = json.dumps(analysis or {}, default=str,
                                   separators=(",", ":"))
     # Dashboard's default mode mirrors the bot's PREDICTOR_MODE so a fresh
     # browser (no localStorage) shows what the bot is actually doing.
@@ -491,6 +727,7 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
     <div class="mode-toggle view-toggle">
       <button id="view-signals" class="active view">Signals</button>
       <button id="view-trades" class="view">Trades</button>
+      <button id="view-analysis" class="view">Analysis</button>
     </div>
   </div>
   <div class="meta">generated {generated_at_utc} {refresh_badge}<br>
@@ -556,11 +793,132 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
   <tbody id="trades-tbody"></tbody>
 </table>
 
+<!-- ===================== ANALYSIS TAB ===================== -->
+<div id="analysis-section" style="display:none">
+
+  <!-- Section 1 - Pipeline coverage -->
+  <div class="section-title">1 - Pipeline coverage (today)</div>
+  <div style="color:#94a3b8;font-size:12px;margin-bottom:8px">
+    Signals &rarr; orders &rarr; positions chain.  Large gaps mean writes
+    are dropping somewhere.
+  </div>
+  <div class="kpis" id="an-pipeline-kpis"></div>
+  <div id="an-pipeline-alert"></div>
+
+  <!-- Section 2 - Weekly performance -->
+  <div class="section-title" style="margin-top:24px">
+    2 - Weekly performance scorecard
+  </div>
+  <div style="color:#94a3b8;font-size:12px;margin-bottom:8px">
+    Real-money P&amp;L on closed LIVE positions, grouped by ISO week.
+    win_pct is bin-by-bin (not bankroll-weighted); pnl uses pnl_net
+    (fees deducted) when available.
+  </div>
+  <div class="kpis" id="an-perf-kpis"></div>
+  <table class="signals" id="an-weekly-table">
+    <thead><tr>
+      <th>Week</th><th>Closed</th><th>Wins</th><th>Win %</th>
+      <th>Staked</th><th>P&amp;L</th><th>ROI %</th>
+    </tr></thead>
+    <tbody id="an-weekly-tbody"></tbody>
+  </table>
+
+  <!-- Section 3 - Recent closed positions -->
+  <div class="section-title" style="margin-top:24px">
+    3 - Recent closed positions (realized P&amp;L)
+  </div>
+  <div style="color:#94a3b8;font-size:12px;margin-bottom:8px">
+    All closed LIVE positions in the lookback window.  exit_px=1.0 won,
+    0.0 lost.  Lookback: <span id="an-lookback-1">30</span> days.
+  </div>
+  <table class="signals" id="an-closed-table">
+    <thead><tr>
+      <th>Date</th><th>City</th><th>Side</th><th>Stake</th>
+      <th>Entry</th><th>Exit</th><th>P&amp;L</th><th>Return %</th>
+      <th>Exit Reason</th><th>Exit Time</th>
+    </tr></thead>
+    <tbody id="an-closed-tbody"></tbody>
+  </table>
+
+  <!-- Section 4 - Calibration -->
+  <div class="section-title" style="margin-top:24px">
+    4 - Model calibration (our_prob vs realized win rate)
+  </div>
+  <div style="color:#94a3b8;font-size:12px;margin-bottom:8px">
+    Bucket closed positions by the model's confidence at buy time.  If
+    well-calibrated, avg_model_p &asymp; actual_win_rate within each bucket.
+    Gap colored: green &lt; 5pp, yellow 5-10pp, red &gt;= 10pp.
+    Lookback: <span id="an-lookback-2">30</span> days.
+  </div>
+  <table class="signals" id="an-cal-table" style="max-width:780px">
+    <thead><tr>
+      <th>Bucket</th><th>N</th><th>Avg model_p</th>
+      <th>Actual win rate</th><th>Gap (actual - model)</th>
+    </tr></thead>
+    <tbody id="an-cal-tbody"></tbody>
+  </table>
+
+  <!-- Section 5 - Filled with model context -->
+  <div class="section-title" style="margin-top:24px">
+    5 - Filled positions with preserved model context
+  </div>
+  <div style="color:#94a3b8;font-size:12px;margin-bottom:8px">
+    Recent filled live positions joined to the LIVE_BUY signal that
+    produced them.  Always-empty model columns = data-loss bug.
+  </div>
+  <div id="an-context-alert"></div>
+  <table class="signals" id="an-context-table">
+    <thead><tr>
+      <th>Pos</th><th>City</th><th>Date</th><th>Filled $</th>
+      <th>Entry</th><th>model_p</th><th>mkt_p</th><th>Edge</th>
+      <th>&mu; (C)</th><th>&sigma; (C)</th><th>FC High (C)</th>
+      <th>DQ Flag</th>
+    </tr></thead>
+    <tbody id="an-context-tbody"></tbody>
+  </table>
+
+  <!-- Section 6 - Event resolutions -->
+  <div class="section-title" style="margin-top:24px">
+    6 - Event resolutions seen by the bot
+  </div>
+  <div style="color:#94a3b8;font-size:12px;margin-bottom:8px">
+    Markets the resolution monitor has seen settle on Gamma.  Empty for
+    recent dates often just means resolutions haven't happened yet.
+  </div>
+  <table class="signals" id="an-res-table">
+    <thead><tr>
+      <th>Event Date</th><th>City</th><th>Winning Bin</th>
+      <th>YES Settle Px</th><th>Resolved At</th>
+    </tr></thead>
+    <tbody id="an-res-tbody"></tbody>
+  </table>
+
+  <!-- Section 7 - Stuck-position alert -->
+  <div class="section-title" style="margin-top:24px">
+    7 - Stuck-position alert
+  </div>
+  <div style="color:#94a3b8;font-size:12px;margin-bottom:8px">
+    Live positions past event_date still 'open'.  Empty is healthy
+    (resolution monitor is working).
+  </div>
+  <div id="an-stuck-summary"></div>
+  <table class="signals" id="an-stuck-table" style="display:none">
+    <thead><tr>
+      <th>Pos</th><th>City</th><th>Event Date</th><th>Side</th>
+      <th>Stake</th><th>Entry</th><th>Status</th><th>Fill</th>
+      <th>Entry Time</th><th>Days Past</th>
+    </tr></thead>
+    <tbody id="an-stuck-tbody"></tbody>
+  </table>
+
+</div>
+
 <script>
 // Mutable so the silent-refresh fetch can swap them in place
 let SIGNALS = {sig_json};
 let LIVE_ORDERS = {live_json};
 let LIVE_POSITIONS = {positions_json};   // from Polymarket data API
+let ANALYSIS = {analysis_json};          // Analysis tab data
 const CITIES = {cities_json};
 
 // Index live positions by asset (token_id) for O(1) lookup when computing
@@ -1367,21 +1725,258 @@ document.querySelectorAll("#trades-table th").forEach(th => {{
   }});
 }});
 
-// ===== View toggle (Signals vs Trades) =====
+// ===== View toggle (Signals / Trades / Analysis) =====
 function setView(v) {{
   VIEW_MODE = v;
   saveState({{view: v}});
-  ["signals", "trades"].forEach(x => {{
+  ["signals", "trades", "analysis"].forEach(x => {{
     const btn = $("view-" + x);
-    btn.classList.toggle("active", x === v);
+    if (btn) btn.classList.toggle("active", x === v);
   }});
-  // Show the right table, hide the other
-  $("sig-table").style.display    = (v === "signals" ? "" : "none");
-  $("trades-table").style.display = (v === "trades"  ? "" : "none");
+  // Show the right view, hide the others
+  $("sig-table").style.display       = (v === "signals"  ? "" : "none");
+  $("trades-table").style.display    = (v === "trades"   ? "" : "none");
+  const an = $("analysis-section");
+  if (an) an.style.display           = (v === "analysis" ? "" : "none");
+  // Analysis tab hides the per-city panel + filters (they don't apply
+  // to the historical-analysis view).
+  const panelsTitle  = $("panels-title");
+  const filters      = document.querySelector(".filters");
+  const cityGrid     = $("city-grid");
+  const signalsTitle = $("signals-title");
+  const hideForAnalysis = (v === "analysis");
+  if (panelsTitle)  panelsTitle.style.display  = hideForAnalysis ? "none" : "";
+  if (filters)      filters.style.display      = hideForAnalysis ? "none" : "";
+  if (cityGrid)     cityGrid.style.display     = hideForAnalysis ? "none" : "";
+  if (signalsTitle) signalsTitle.style.display = hideForAnalysis ? "none" : "";
   renderAll();
 }}
-$("view-signals").addEventListener("click", () => setView("signals"));
-$("view-trades").addEventListener("click",  () => setView("trades"));
+$("view-signals").addEventListener("click",  () => setView("signals"));
+$("view-trades").addEventListener("click",   () => setView("trades"));
+$("view-analysis").addEventListener("click", () => setView("analysis"));
+
+// ===== Analysis render =====
+function fmtNum(v, places=2, sign=false) {{
+  if (v == null || v === "" || isNaN(v)) return "--";
+  const n = Number(v);
+  const s = sign && n > 0 ? "+" : "";
+  return s + n.toFixed(places);
+}}
+function fmtPct(v, places=1, sign=false) {{
+  if (v == null || v === "" || isNaN(v)) return "--";
+  const n = Number(v);
+  const s = sign && n > 0 ? "+" : "";
+  return s + n.toFixed(places) + "%";
+}}
+function fmtMoney(v, sign=false) {{
+  if (v == null || v === "" || isNaN(v)) return "--";
+  const n = Number(v);
+  const sgn = sign && n > 0 ? "+" : (n < 0 ? "-" : "");
+  return sgn + "$" + Math.abs(n).toFixed(2);
+}}
+function fmtDateShort(d) {{
+  if (!d) return "--";
+  const s = String(d);
+  if (s.length >= 10 && s[4] === "-") {{
+    return s.slice(5, 10) + " (" + s.slice(0, 4) + ")";
+  }}
+  return s;
+}}
+function pnlColor(v) {{
+  if (v == null || isNaN(v)) return "";
+  return Number(v) >= 0 ? "color:#22c55e" : "color:#ef4444";
+}}
+function gapColor(v) {{
+  if (v == null || isNaN(v)) return "";
+  const m = Math.abs(Number(v));
+  if (m >= 0.10) return "color:#ef4444;font-weight:600";
+  if (m >= 0.05) return "color:#f59e0b";
+  return "color:#22c55e";
+}}
+
+function renderAnalysis() {{
+  if (!ANALYSIS || typeof ANALYSIS !== "object") return;
+  const lookback = ANALYSIS.lookback_days || 30;
+  const lb1 = $("an-lookback-1"); if (lb1) lb1.textContent = lookback;
+  const lb2 = $("an-lookback-2"); if (lb2) lb2.textContent = lookback;
+
+  // -- 1. Pipeline KPIs --
+  const pipe = ANALYSIS.pipeline_today || {{signals:0, orders:0, positions:0}};
+  $("an-pipeline-kpis").innerHTML = `
+    <div class="kpi"><div class="lbl">LIVE_BUY signals today</div>
+      <div class="val">${{pipe.signals}}</div></div>
+    <div class="kpi"><div class="lbl">Orders placed today</div>
+      <div class="val">${{pipe.orders}}</div></div>
+    <div class="kpi"><div class="lbl">Live positions opened</div>
+      <div class="val">${{pipe.positions}}</div></div>
+  `;
+  let alertHtml = "";
+  if (pipe.signals > 0 && pipe.orders === 0) {{
+    alertHtml = '<div style="background:#7f1d1d;color:#fee2e2;padding:10px;'
+      + 'border-radius:6px;margin-top:8px">'
+      + 'WARNING: LIVE_BUY signals exist but ZERO orders placed today. '
+      + 'Check execute_signal logs for failures.</div>';
+  }} else if (pipe.orders > 0 && pipe.positions === 0) {{
+    alertHtml = '<div style="background:#78350f;color:#fef3c7;padding:10px;'
+      + 'border-radius:6px;margin-top:8px">'
+      + 'WARN: Orders placed but no positions opened. Either all orders '
+      + 'errored, or position row inserts are failing.</div>';
+  }}
+  $("an-pipeline-alert").innerHTML = alertHtml;
+
+  // -- 2. Weekly performance --
+  const weekly = ANALYSIS.weekly_performance || [];
+  const totClosed = weekly.reduce((a,r) => a + (r.n_closed||0), 0);
+  const totWins   = weekly.reduce((a,r) => a + (r.wins||0), 0);
+  const totStake  = weekly.reduce((a,r) => a + (Number(r.total_staked)||0), 0);
+  const totPnl    = weekly.reduce((a,r) => a + (Number(r.pnl_total)||0), 0);
+  const lifeWr    = totClosed > 0 ? (100*totWins/totClosed) : 0;
+  const lifeRoi   = totStake > 0 ? (100*totPnl/totStake) : 0;
+  $("an-perf-kpis").innerHTML = `
+    <div class="kpi"><div class="lbl">Total closed</div>
+      <div class="val">${{totClosed}}</div></div>
+    <div class="kpi"><div class="lbl">Lifetime win %</div>
+      <div class="val">${{lifeWr.toFixed(1)}}%</div></div>
+    <div class="kpi"><div class="lbl">Total staked</div>
+      <div class="val">$${{totStake.toFixed(2)}}</div></div>
+    <div class="kpi"><div class="lbl">Lifetime P&amp;L</div>
+      <div class="val" style="${{pnlColor(totPnl)}}">${{fmtMoney(totPnl, true)}}</div></div>
+    <div class="kpi"><div class="lbl">Lifetime ROI</div>
+      <div class="val" style="${{pnlColor(lifeRoi)}}">${{fmtPct(lifeRoi, 2, true)}}</div></div>
+  `;
+  let weeklyHtml = "";
+  for (const r of weekly) {{
+    weeklyHtml += `<tr>
+      <td>${{r.week||"--"}}</td>
+      <td>${{r.n_closed||0}}</td>
+      <td>${{r.wins||0}}</td>
+      <td>${{fmtPct(r.win_pct, 1)}}</td>
+      <td>${{fmtMoney(r.total_staked)}}</td>
+      <td style="${{pnlColor(r.pnl_total)}}">${{fmtMoney(r.pnl_total, true)}}</td>
+      <td style="${{pnlColor(r.roi_pct)}}">${{fmtPct(r.roi_pct, 2, true)}}</td>
+    </tr>`;
+  }}
+  $("an-weekly-tbody").innerHTML = weeklyHtml ||
+    '<tr><td colspan="7" class="empty">No closed LIVE positions yet</td></tr>';
+
+  // -- 3. Recent closed positions --
+  const closed = ANALYSIS.closed_positions || [];
+  let closedHtml = "";
+  for (const r of closed) {{
+    closedHtml += `<tr>
+      <td>${{fmtDateShort(r.date)}}</td>
+      <td>${{r.city||""}}</td>
+      <td>${{r.side||""}}</td>
+      <td>${{fmtMoney(r.stake_usd)}}</td>
+      <td>${{fmtNum(r.entry_px, 3)}}</td>
+      <td>${{fmtNum(r.exit_px, 3)}}</td>
+      <td style="${{pnlColor(r.pnl)}}">${{fmtMoney(r.pnl, true)}}</td>
+      <td style="${{pnlColor(r.pct_return)}}">${{fmtPct(r.pct_return, 1, true)}}</td>
+      <td>${{r.exit_reason||""}}</td>
+      <td>${{(r.exit_time||"").slice(0,19).replace("T"," ")}}</td>
+    </tr>`;
+  }}
+  $("an-closed-tbody").innerHTML = closedHtml ||
+    '<tr><td colspan="10" class="empty">No closed LIVE positions in window</td></tr>';
+
+  // -- 4. Calibration --
+  const cal = ANALYSIS.calibration_buckets || [];
+  let calHtml = "";
+  for (const r of cal) {{
+    calHtml += `<tr>
+      <td>${{r.conf_bucket||""}}</td>
+      <td>${{r.n||0}}</td>
+      <td>${{fmtNum(r.avg_model_p, 3)}}</td>
+      <td>${{fmtNum(r.actual_win_rate, 3)}}</td>
+      <td style="${{gapColor(r.calibration_gap)}}">${{fmtNum(r.calibration_gap, 3, true)}}</td>
+    </tr>`;
+  }}
+  $("an-cal-tbody").innerHTML = calHtml ||
+    '<tr><td colspan="5" class="empty">Need at least one closed position with a matching LIVE_BUY signal</td></tr>';
+
+  // -- 5. Filled with model context --
+  const ctx = ANALYSIS.filled_with_context || [];
+  let ctxHtml = "";
+  let missingAny = false;
+  for (const r of ctx) {{
+    if (r.model_p == null || r.mu_c == null) missingAny = true;
+    ctxHtml += `<tr>
+      <td>${{r.id||""}}</td>
+      <td>${{r.city||""}}</td>
+      <td>${{fmtDateShort(r.date)}}</td>
+      <td>${{fmtMoney(r.filled_usd)}}</td>
+      <td>${{fmtNum(r.entry_px, 3)}}</td>
+      <td>${{fmtNum(r.model_p, 3)}}</td>
+      <td>${{fmtNum(r.mkt_p, 3)}}</td>
+      <td>${{fmtNum(r.edge, 3, true)}}</td>
+      <td>${{fmtNum(r.mu_c, 1)}}</td>
+      <td>${{fmtNum(r.sigma_c, 2)}}</td>
+      <td>${{fmtNum(r.fc_high_c, 1)}}</td>
+      <td style="color:#94a3b8;font-size:11px">${{r.dq_flag||""}}</td>
+    </tr>`;
+  }}
+  $("an-context-tbody").innerHTML = ctxHtml ||
+    '<tr><td colspan="12" class="empty">No filled LIVE positions in window</td></tr>';
+  $("an-context-alert").innerHTML = (ctx.length > 0 && missingAny)
+    ? '<div style="background:#78350f;color:#fef3c7;padding:10px;'
+      + 'border-radius:6px;margin-bottom:8px">'
+      + 'Some positions have no matching LIVE_BUY signal row (manual trades '
+      + 'or signal deletion).</div>'
+    : "";
+
+  // -- 6. Event resolutions --
+  const res = ANALYSIS.event_resolutions || [];
+  let resHtml = "";
+  for (const r of res) {{
+    const bin = (r.win_lo != null && r.win_hi != null)
+      ? `${{Math.round(r.win_lo)}}-${{Math.round(r.win_hi)}}`
+      : "?";
+    resHtml += `<tr>
+      <td>${{fmtDateShort(r.date)}}</td>
+      <td>${{r.city||""}}</td>
+      <td>${{bin}}</td>
+      <td>${{fmtNum(r.yes_settle_px, 3)}}</td>
+      <td>${{(r.resolved_at||"").slice(0,19).replace("T"," ")}}</td>
+    </tr>`;
+  }}
+  $("an-res-tbody").innerHTML = resHtml ||
+    '<tr><td colspan="5" class="empty">No resolutions recorded in window</td></tr>';
+
+  // -- 7. Stuck positions --
+  const stuck = ANALYSIS.stuck_positions || [];
+  if (stuck.length === 0) {{
+    $("an-stuck-summary").innerHTML =
+      '<div style="background:#064e3b;color:#d1fae5;padding:10px;'
+      + 'border-radius:6px">'
+      + 'Healthy: no stuck positions. Every past-date live position '
+      + 'has been closed.</div>';
+    $("an-stuck-table").style.display = "none";
+  }} else {{
+    $("an-stuck-summary").innerHTML =
+      `<div style="background:#78350f;color:#fef3c7;padding:10px;`
+      + `border-radius:6px;margin-bottom:8px">`
+      + `${{stuck.length}} live position(s) past event date, still open. `
+      + `Investigate whether _settle_resolved_positions is firing OR `
+      + `Gamma shows the market still open (delayed resolution).</div>`;
+    let stuckHtml = "";
+    for (const r of stuck) {{
+      stuckHtml += `<tr>
+        <td>${{r.id||""}}</td>
+        <td>${{r.city||""}}</td>
+        <td>${{fmtDateShort(r.date)}}</td>
+        <td>${{r.side||""}}</td>
+        <td>${{fmtMoney(r.stake_usd)}}</td>
+        <td>${{fmtNum(r.entry_px, 3)}}</td>
+        <td>${{r.status||""}}</td>
+        <td>${{r.fill_status||""}}</td>
+        <td>${{(r.entry_time||"").slice(0,19).replace("T"," ")}}</td>
+        <td>${{fmtNum(r.days_past_event, 1)}}</td>
+      </tr>`;
+    }}
+    $("an-stuck-tbody").innerHTML = stuckHtml;
+    $("an-stuck-table").style.display = "";
+  }}
+}}
 
 // Date dropdown drives the whole dashboard
 $("f-date").addEventListener("change", () => {{
@@ -1458,8 +2053,9 @@ function renderAll() {{
   updateSectionTitles();
   renderKPIs();
   renderCityPanels();
-  if (VIEW_MODE === 'trades') renderTradesTable();
-  else                          renderSigTable();
+  if (VIEW_MODE === 'analysis') renderAnalysis();
+  else if (VIEW_MODE === 'trades') renderTradesTable();
+  else                              renderSigTable();
 }}
 
 // Initial render — must populate dropdowns BEFORE restoring filter
@@ -1479,10 +2075,14 @@ renderAll();
 //   * dropdown open/closed state
 function extractJsonBlob(text, varName) {{
   // Match: let VAR = [...]; or let VAR = {{...}};
-  // Use a tolerant pattern: capture everything between the assignment and
-  // the next ";\\n" at top-level.
-  const re = new RegExp('let\\\\s+' + varName + '\\\\s*=\\\\s*(\\\\[[\\\\s\\\\S]*?\\\\]);', 'm');
-  const m = text.match(re);
+  // Tolerant: accepts either array or object form.  We try array first
+  // (most blobs), then object (used by ANALYSIS).
+  const reArr = new RegExp('let\\\\s+' + varName + '\\\\s*=\\\\s*(\\\\[[\\\\s\\\\S]*?\\\\]);', 'm');
+  let m = text.match(reArr);
+  if (!m) {{
+    const reObj = new RegExp('let\\\\s+' + varName + '\\\\s*=\\\\s*(\\\\{{[\\\\s\\\\S]*?\\\\}});', 'm');
+    m = text.match(reObj);
+  }}
   if (!m) return null;
   try {{ return JSON.parse(m[1]); }} catch (e) {{ return null; }}
 }}
@@ -1495,10 +2095,13 @@ async function silentRefresh() {{
     const newSignals    = extractJsonBlob(text, "SIGNALS");
     const newLiveOrders = extractJsonBlob(text, "LIVE_ORDERS");
     const newLivePos    = extractJsonBlob(text, "LIVE_POSITIONS");
-    if (newSignals === null && newLiveOrders === null && newLivePos === null) return;
+    const newAnalysis   = extractJsonBlob(text, "ANALYSIS");
+    if (newSignals === null && newLiveOrders === null
+        && newLivePos === null && newAnalysis === null) return;
     if (newSignals !== null)    SIGNALS = newSignals;
     if (newLiveOrders !== null) LIVE_ORDERS = newLiveOrders;
     if (newLivePos !== null)    LIVE_POSITIONS = newLivePos;
+    if (newAnalysis !== null)   ANALYSIS = newAnalysis;
     recomputeDerived();
     renderAll();
     // Re-assert button states after render — defensive against any
@@ -1584,18 +2187,28 @@ def main() -> int:
     if args.no_serve:
         args.serve = None
 
+    # Analysis tab lookback (env-tunable; default 30 days).  Bounded
+    # at the SQL layer for cost — the joins on closed positions can
+    # otherwise scan the full history every regen.
+    _analysis_days = int(os.getenv("DASHBOARD_ANALYSIS_LOOKBACK_DAYS", "30"))
+
     def regenerate() -> str:
         since = datetime.now(timezone.utc) - timedelta(days=args.days)
         signals = load_signals(args.db, since)
         live_orders = load_live_orders(args.db, since)
         live_positions = fetch_live_positions()    # Polymarket data API
+        analysis = load_analysis_data(args.db, lookback_days=_analysis_days)
         log.info(f"regenerate: {len(signals)} signals + "
                   f"{len(live_orders)} live orders + "
-                  f"{len(live_positions)} live positions since {since.isoformat()}")
+                  f"{len(live_positions)} live positions + "
+                  f"analysis(closed={len(analysis.get('closed_positions', []))},"
+                  f" weeks={len(analysis.get('weekly_performance', []))},"
+                  f" cal_buckets={len(analysis.get('calibration_buckets', []))})")
         generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         html = build_dashboard(signals, live_orders, generated_at,
                                 auto_refresh_sec=args.watch or None,
-                                live_positions=live_positions)
+                                live_positions=live_positions,
+                                analysis=analysis)
         os.makedirs(os.path.dirname(args.html) or ".", exist_ok=True)
         with open(args.html, "w", encoding="utf-8") as fh:
             fh.write(html)
