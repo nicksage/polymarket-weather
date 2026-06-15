@@ -1104,13 +1104,30 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
   </div>
 
   <!-- In-tab filter row.  Mode comes from the top-level toggle
-       (Paper / Live / Both); date here is independent so the operator
-       can drill into a single event_date without leaving the tab. -->
+       (Paper / Live / Both); date / city / result are independent
+       so the operator can drill in without leaving the tab.  All
+       filters update the headline KPIs (won / lost / win rate / P&L)
+       in real time as they change. -->
   <div class="filters" style="margin-bottom:8px">
     <div>
       <label>Date</label>
       <select id="an-f-date">
         <option value="">All dates (window)</option>
+      </select>
+    </div>
+    <div>
+      <label>City</label>
+      <select id="an-f-city">
+        <option value="">All cities</option>
+      </select>
+    </div>
+    <div>
+      <label>Result</label>
+      <select id="an-f-result">
+        <option value="">All results</option>
+        <option value="won">Won</option>
+        <option value="lost">Lost</option>
+        <option value="open">Open / Pending</option>
       </select>
     </div>
     <div class="count" id="an-count">--</div>
@@ -2132,11 +2149,26 @@ function _maybeRenderAnalysis() {{
   }});
 }});
 
-// In-tab date filter change handler.
+// In-tab filter change handlers.  Each one updates its state var and
+// triggers a re-render of the Analysis tab (headline KPIs + table).
 const _anDateSel = $("an-f-date");
 if (_anDateSel) {{
   _anDateSel.addEventListener("change", () => {{
     AN_DATE_FILTER = _anDateSel.value || "";
+    _maybeRenderAnalysis();
+  }});
+}}
+const _anCitySel = $("an-f-city");
+if (_anCitySel) {{
+  _anCitySel.addEventListener("change", () => {{
+    AN_CITY_FILTER = _anCitySel.value || "";
+    _maybeRenderAnalysis();
+  }});
+}}
+const _anResultSel = $("an-f-result");
+if (_anResultSel) {{
+  _anResultSel.addEventListener("change", () => {{
+    AN_RESULT_FILTER = _anResultSel.value || "";
     _maybeRenderAnalysis();
   }});
 }}
@@ -2243,15 +2275,9 @@ function computePurchaseKpis(ps) {{
   let staked = 0, pnl_sum = 0;
   for (const r of ps) {{
     staked += Number(r.stake_usd) || 0;
-    // Win/Lost classification — same logic the row uses
-    let result = null;
-    if (r.exit_px != null) {{
-      result = Number(r.exit_px) >= 0.99 ? "won" : "lost";
-    }} else if (r.win_lo != null && r.win_hi != null) {{
-      const won = Number(r.bought_lo) === Number(r.win_lo)
-                && Number(r.bought_hi) === Number(r.win_hi);
-      result = won ? "won" : "lost";
-    }}
+    // Single source of truth for win/lost — also used by the Result
+    // filter and the row's Result cell.  Returns "won" | "lost" | "open".
+    const result = purchaseResult(r);
     if (result === "won")  n_won++;
     else if (result === "lost") n_lost++;
     else n_pending++;
@@ -2259,8 +2285,8 @@ function computePurchaseKpis(ps) {{
     // P&L total: prefer recorded; else estimate from result + stake/entry
     if (r.pnl != null) {{
       pnl_sum += Number(r.pnl) || 0;
-    }} else if (result && r.stake_usd != null && r.entry_px != null
-                 && Number(r.entry_px) > 0) {{
+    }} else if (result !== "open" && r.stake_usd != null
+                 && r.entry_px != null && Number(r.entry_px) > 0) {{
       const stake = Number(r.stake_usd);
       const entry = Number(r.entry_px);
       pnl_sum += result === "won"
@@ -2292,12 +2318,43 @@ function matchesPurchaseMode(r) {{
   return true;
 }}
 
-// In-tab date filter for the Analysis view.  Empty string = "All dates
-// in the loaded window"; otherwise filter to the matching event_date.
-let AN_DATE_FILTER = "";
+// In-tab filters for the Analysis view.  All default to "show
+// everything" — selecting a value narrows the table AND recomputes
+// the headline KPIs (so won/lost/pnl reflect what you're looking at,
+// not the full set).
+let AN_DATE_FILTER   = "";
+let AN_CITY_FILTER   = "";
+let AN_RESULT_FILTER = "";
+
 function matchesPurchaseDate(r) {{
   if (!AN_DATE_FILTER) return true;
   return String(r.event_date || "") === AN_DATE_FILTER;
+}}
+
+function matchesPurchaseCity(r) {{
+  if (!AN_CITY_FILTER) return true;
+  return String(r.city || "") === AN_CITY_FILTER;
+}}
+
+// Classify a purchase row into one of {{won, lost, open}}.  Mirrors
+// the result-cell renderer (which prefers exit_price when present,
+// else compares bought_bin to winning_bin).  Used by the Result
+// filter AND by computePurchaseKpis so both stay consistent.
+function purchaseResult(r) {{
+  if (r.exit_px != null) {{
+    return Number(r.exit_px) >= 0.99 ? "won" : "lost";
+  }}
+  if (r.win_lo != null && r.win_hi != null) {{
+    const won = Number(r.bought_lo) === Number(r.win_lo)
+             && Number(r.bought_hi) === Number(r.win_hi);
+    return won ? "won" : "lost";
+  }}
+  return "open";
+}}
+
+function matchesPurchaseResult(r) {{
+  if (!AN_RESULT_FILTER) return true;
+  return purchaseResult(r) === AN_RESULT_FILTER;
 }}
 
 // Populate the in-tab date dropdown with the distinct event_dates that
@@ -2315,7 +2372,6 @@ function refreshAnalysisDateDropdown() {{
     html += `<option value="${{d}}">${{fmtDateShort(d)}}</option>`;
   }}
   sel.innerHTML = html;
-  // Restore previous selection if it's still present
   if (prev && dates.indexOf(prev) >= 0) {{
     sel.value = prev;
     AN_DATE_FILTER = prev;
@@ -2324,19 +2380,44 @@ function refreshAnalysisDateDropdown() {{
   }}
 }}
 
+// Populate the in-tab city dropdown, same pattern as date.  Distinct
+// city names from the purchases set, alphabetical.
+function refreshAnalysisCityDropdown() {{
+  const sel = $("an-f-city");
+  if (!sel) return;
+  const cities = Array.from(new Set(
+    (ANALYSIS.purchases || []).map(r => String(r.city || ""))
+  )).filter(Boolean).sort();
+  const prev = sel.value;
+  let html = '<option value="">All cities</option>';
+  for (const c of cities) {{
+    html += `<option value="${{c}}">${{c}}</option>`;
+  }}
+  sel.innerHTML = html;
+  if (prev && cities.indexOf(prev) >= 0) {{
+    sel.value = prev;
+    AN_CITY_FILTER = prev;
+  }} else {{
+    AN_CITY_FILTER = "";
+  }}
+}}
+
 function renderAnalysis() {{
   if (!ANALYSIS || typeof ANALYSIS !== "object") return;
   const lookback = ANALYSIS.lookback_days || 30;
   const lb1 = $("an-lookback-1"); if (lb1) lb1.textContent = lookback;
 
-  // Refresh the in-tab date dropdown from whatever dates are present
+  // Refresh in-tab dropdowns from whatever values are present
   refreshAnalysisDateDropdown();
+  refreshAnalysisCityDropdown();
 
-  // -- Filter purchases: mode AND date --
+  // -- Filter purchases: mode + date + city + result --
   const allPurchases = ANALYSIS.purchases || [];
   const ps = allPurchases
     .filter(matchesPurchaseMode)
-    .filter(matchesPurchaseDate);
+    .filter(matchesPurchaseDate)
+    .filter(matchesPurchaseCity)
+    .filter(matchesPurchaseResult);
 
   // -- Headline KPI strip (computed from FILTERED set) --
   const k = computePurchaseKpis(ps);
@@ -2344,11 +2425,15 @@ function renderAnalysis() {{
                     : MODE_FILTER === "paper" ? "paper"
                     : "live";
 
-  // Row count caption (above the table)
-  const dateLabel = AN_DATE_FILTER ? ` on ${{fmtDateShort(AN_DATE_FILTER)}}` : "";
+  // Row count caption — reflects every active filter
+  const captionParts = [`${{modeLabel}}`];
+  if (AN_DATE_FILTER)   captionParts.push(`date ${{fmtDateShort(AN_DATE_FILTER)}}`);
+  if (AN_CITY_FILTER)   captionParts.push(`city ${{AN_CITY_FILTER}}`);
+  if (AN_RESULT_FILTER) captionParts.push(`result ${{AN_RESULT_FILTER}}`);
   const anCount = $("an-count");
   if (anCount) anCount.textContent =
-    `${{ps.length}} purchase${{ps.length === 1 ? "" : "s"}} (${{modeLabel}})${{dateLabel}}`;
+    `${{ps.length}} purchase${{ps.length === 1 ? "" : "s"}} `
+    + `(${{captionParts.join(" · ")}})`;
   $("an-headline-kpis").innerHTML = `
     <div class="kpi"><div class="label">Purchases (${{modeLabel}})</div>
       <div class="val">${{k.n_total||0}}</div></div>
