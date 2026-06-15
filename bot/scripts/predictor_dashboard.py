@@ -297,44 +297,97 @@ def load_analysis_data(db: str, lookback_days: int = 30) -> dict:
                           AND s.event_date >= date('now', '-{days} days')
                     ) WHERE rn = 1
                 ),
-                purchases AS (
-                    -- Include BOTH live and paper positions; the
-                    -- dashboard's mode toggle (Paper / Live / Both)
-                    -- filters in JS via is_paper.  For paper, also
-                    -- accept PAPER_BUY rows in the signal join so the
-                    -- model context comes through for paper trades too.
+                -- Aggregate every positions row that shares the same
+                -- (city, event_date, contract_id, side, is_paper) into
+                -- ONE logical purchase.  An "initial buy + topup +
+                -- re-entry-after-cancel" sequence collapses to one row.
+                -- size sums; entry_price weight-averages; pnl sums; the
+                -- earliest entry_time wins for display.  status uses a
+                -- precedence (any closed > any open > any pending).
+                positions_agg AS (
                     SELECT
-                        p.id              AS pos_id,
                         p.city            AS city,
                         p.date            AS event_date,
                         p.contract_id     AS contract_id,
                         p.side            AS side,
-                        p.status          AS status,
-                        p.fill_status     AS fill_status,
                         COALESCE(p.is_paper, 0) AS is_paper,
-                        ROUND(p.size_usdc,   2)  AS stake_usd,
-                        ROUND(p.entry_price, 3)  AS entry_px,
-                        ROUND(p.exit_price,  3)  AS exit_px,
-                        ROUND(COALESCE(p.pnl_net, p.pnl), 2) AS pnl,
-                        p.range_low       AS bought_lo,
-                        p.range_high      AS bought_hi,
-                        p.unit            AS bought_unit,
+                        -- Bin: per-contract these are constant; MAX is
+                        -- a no-op pickup so the grouping still works.
+                        MAX(p.range_low)  AS bought_lo,
+                        MAX(p.range_high) AS bought_hi,
+                        MAX(p.unit)       AS bought_unit,
+                        -- Stake: total deployed across all rows
+                        ROUND(SUM(COALESCE(p.size_usdc, 0)), 2) AS stake_usd,
+                        -- Entry price: weighted average by stake
+                        ROUND(
+                          SUM(COALESCE(p.size_usdc, 0) * COALESCE(p.entry_price, 0))
+                          / NULLIF(SUM(COALESCE(p.size_usdc, 0)), 0),
+                          3
+                        ) AS entry_px,
+                        -- Exit: same for every row of a resolved market,
+                        -- so MAX is identity (NULL when not resolved).
+                        ROUND(MAX(p.exit_price), 3) AS exit_px,
+                        -- PNL: sum across all rows (initial + topup
+                        -- share the same outcome but persist as
+                        -- separate position_orders rows with their own
+                        -- pnl values for that slice of the position).
+                        ROUND(SUM(COALESCE(p.pnl_net, p.pnl, 0)), 2) AS pnl,
+                        -- Status precedence: closed beats open beats
+                        -- pending.  CASE expression assigns sort order
+                        -- and we pick the max.
+                        CASE MAX(
+                          CASE p.status
+                            WHEN 'closed' THEN 3
+                            WHEN 'open'   THEN 2
+                            ELSE 1
+                          END
+                        )
+                          WHEN 3 THEN 'closed'
+                          WHEN 2 THEN 'open'
+                          ELSE        'pending'
+                        END AS status,
+                        -- Fill status precedence: filled > pending > cancelled
+                        CASE MAX(
+                          CASE p.fill_status
+                            WHEN 'filled'    THEN 3
+                            WHEN 'pending'   THEN 2
+                            ELSE 1
+                          END
+                        )
+                          WHEN 3 THEN 'filled'
+                          WHEN 2 THEN 'pending'
+                          ELSE        'cancelled'
+                        END AS fill_status,
+                        MIN(p.entry_time) AS entry_time,
+                        MAX(p.exit_time)  AS exit_time,
+                        COUNT(*)          AS n_rows
+                    FROM positions p
+                    WHERE p.date >= date('now', '-{days} days')
+                    GROUP BY p.city, p.date, p.contract_id, p.side,
+                             COALESCE(p.is_paper, 0)
+                ),
+                purchases AS (
+                    -- Final shape: aggregated purchases LEFT JOINed to
+                    -- the first-buy signal for model context.
+                    SELECT
+                        pa.city, pa.event_date, pa.contract_id,
+                        pa.side, pa.is_paper, pa.status, pa.fill_status,
+                        pa.stake_usd, pa.entry_px, pa.exit_px, pa.pnl,
+                        pa.bought_lo, pa.bought_hi, pa.bought_unit,
+                        pa.entry_time, pa.exit_time, pa.n_rows,
                         s.our_prob        AS at_buy_our_p,
                         s.market_prob     AS at_buy_mkt_p,
                         ROUND(s.forecast_high_c, 2) AS at_buy_fc_high_c,
                         ROUND(s.mu_c,            2) AS at_buy_mu_c,
                         ROUND(s.sigma_c,         2) AS at_buy_sigma_c,
                         ROUND(s.observed_max_c,  2) AS at_buy_obs_max_c,
-                        s.data_quality_flag       AS dq_flag,
-                        p.entry_time              AS entry_time,
-                        p.exit_time               AS exit_time
-                    FROM positions p
+                        s.data_quality_flag       AS dq_flag
+                    FROM positions_agg pa
                     LEFT JOIN first_buy_signal s
-                      ON s.contract_id = p.contract_id
-                     AND s.event_date  = p.date
-                     AND ((COALESCE(p.is_paper, 0) = 0 AND s.action = 'LIVE_BUY')
-                       OR (COALESCE(p.is_paper, 0) = 1 AND s.action = 'PAPER_BUY'))
-                    WHERE p.date >= date('now', '-{days} days')
+                      ON s.contract_id = pa.contract_id
+                     AND s.event_date  = pa.event_date
+                     AND ((pa.is_paper = 0 AND s.action = 'LIVE_BUY')
+                       OR (pa.is_paper = 1 AND s.action = 'PAPER_BUY'))
                 ),
                 latest_scan AS (
                     SELECT city, event_date,
@@ -363,7 +416,7 @@ def load_analysis_data(db: str, lookback_days: int = 30) -> dict:
                 FROM purchases pu
                 LEFT JOIN winners w
                        ON w.city = pu.city AND w.event_date = pu.event_date
-                ORDER BY pu.event_date DESC, pu.city ASC, pu.pos_id ASC
+                ORDER BY pu.event_date DESC, pu.entry_time DESC, pu.city ASC
                 LIMIT 500
                 """
             ).fetchall()
