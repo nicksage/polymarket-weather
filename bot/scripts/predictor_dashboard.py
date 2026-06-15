@@ -437,6 +437,12 @@ def load_analysis_data(db: str, lookback_days: int = 30) -> dict:
 
     days = max(1, int(lookback_days))
 
+    # Hard cutoff for the Analysis tab.  Defaults to 2026-06-10 — drops
+    # legacy/test trades from June 9 and earlier the operator no longer
+    # wants surfaced.  Override with DASHBOARD_ANALYSIS_MIN_DATE if you
+    # want to widen or narrow the window later.  Format: YYYY-MM-DD.
+    min_date = os.getenv("DASHBOARD_ANALYSIS_MIN_DATE", "2026-06-10")
+
     with sqlite3.connect(db) as conn:
         conn.row_factory = sqlite3.Row
 
@@ -535,11 +541,16 @@ def load_analysis_data(db: str, lookback_days: int = 30) -> dict:
                         -- Exit: same for every row of a resolved market,
                         -- so MAX is identity (NULL when not resolved).
                         ROUND(MAX(p.exit_price), 3) AS exit_px,
-                        -- PNL: sum across all rows (initial + topup
-                        -- share the same outcome but persist as
-                        -- separate position_orders rows with their own
-                        -- pnl values for that slice of the position).
-                        ROUND(SUM(COALESCE(p.pnl_net, p.pnl, 0)), 2) AS pnl,
+                        -- PNL: sum the recorded pnl_net (or gross pnl)
+                        -- across all rows.  NO `, 0` default — that
+                        -- would surface as "$0.00" when no pnl was
+                        -- ever recorded (open + unresolved positions),
+                        -- which is indistinguishable from "we broke
+                        -- even."  Returning NULL lets the JS render
+                        -- "--" for "no actual pnl yet" and optionally
+                        -- compute an estimated pnl from win/lost when
+                        -- the winner is known.
+                        ROUND(SUM(COALESCE(p.pnl_net, p.pnl)), 2) AS pnl,
                         -- Status precedence: closed beats open beats
                         -- pending.  CASE expression assigns sort order
                         -- and we pick the max.
@@ -571,6 +582,7 @@ def load_analysis_data(db: str, lookback_days: int = 30) -> dict:
                         COUNT(*)          AS n_rows
                     FROM positions p
                     WHERE p.date >= date('now', '-{days} days')
+                      AND p.date >= '{min_date}'
                     GROUP BY p.city, p.date, p.contract_id, p.side,
                              COALESCE(p.is_paper, 0)
                 ),
@@ -661,6 +673,7 @@ def load_analysis_data(db: str, lookback_days: int = 30) -> dict:
                       AND p.status = 'closed'
                       AND p.exit_price IS NOT NULL
                       AND p.date >= date('now', '-{days} days')
+                      AND p.date >= '{min_date}'
                 )
                 SELECT
                     CASE
@@ -697,6 +710,7 @@ def load_analysis_data(db: str, lookback_days: int = 30) -> dict:
                 WHERE COALESCE(is_paper, 0) = 0
                   AND status = 'open'
                   AND date < date('now')
+                  AND date >= '{min_date}'
                 ORDER BY date ASC
                 LIMIT 50
                 """
@@ -1117,9 +1131,9 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
         <th>Side</th>
         <th>Stake</th>
         <th>Entry $</th>
-        <th>At-buy forecast high</th>
-        <th>At-buy &mu;</th>
-        <th>At-buy &sigma;</th>
+        <th>Forecast high</th>
+        <th title="Model's predicted mean day-high temperature at buy time">Model mean</th>
+        <th title="Model's uncertainty (1 standard deviation) at buy time">Model uncertainty</th>
         <th>Model P</th>
         <th>Mkt P</th>
         <th>Winning bin</th>
@@ -2229,16 +2243,29 @@ function computePurchaseKpis(ps) {{
   let staked = 0, pnl_sum = 0;
   for (const r of ps) {{
     staked += Number(r.stake_usd) || 0;
-    if (r.pnl != null) pnl_sum += Number(r.pnl) || 0;
+    // Win/Lost classification — same logic the row uses
+    let result = null;
     if (r.exit_px != null) {{
-      if (Number(r.exit_px) >= 0.99) n_won++;
-      else                            n_lost++;
+      result = Number(r.exit_px) >= 0.99 ? "won" : "lost";
     }} else if (r.win_lo != null && r.win_hi != null) {{
       const won = Number(r.bought_lo) === Number(r.win_lo)
                 && Number(r.bought_hi) === Number(r.win_hi);
-      won ? n_won++ : n_lost++;
-    }} else {{
-      n_pending++;
+      result = won ? "won" : "lost";
+    }}
+    if (result === "won")  n_won++;
+    else if (result === "lost") n_lost++;
+    else n_pending++;
+
+    // P&L total: prefer recorded; else estimate from result + stake/entry
+    if (r.pnl != null) {{
+      pnl_sum += Number(r.pnl) || 0;
+    }} else if (result && r.stake_usd != null && r.entry_px != null
+                 && Number(r.entry_px) > 0) {{
+      const stake = Number(r.stake_usd);
+      const entry = Number(r.entry_px);
+      pnl_sum += result === "won"
+        ? (stake * (1 - entry) / entry)
+        : (-stake);
     }}
   }}
   const decided = n_won + n_lost;
@@ -2375,9 +2402,30 @@ function renderAnalysis() {{
       result_html = `<span style="color:#94a3b8">${{lbl}}</span>`;
     }}
 
-    const pnlCell = (r.pnl != null)
-      ? `<span style="${{pnlColor(r.pnl)}}">${{fmtMoney(r.pnl, true)}}</span>`
-      : '<span style="color:#94a3b8">--</span>';
+    // P&L cell: prefer recorded pnl_net/pnl from the DB; otherwise,
+    // when we know win/lost from the winning_bin comparison, estimate:
+    //   WIN  → +(1 - entry_price) * shares = stake/entry - stake = stake*(1-entry)/entry
+    //   LOSS → -stake (entire entry capital lost)
+    // The estimate is marked with a ~ prefix so the operator knows it's
+    // computed (not the formally-closed pnl from the bot's exit code).
+    let pnlCell;
+    if (r.pnl != null) {{
+      pnlCell = `<span style="${{pnlColor(r.pnl)}}">${{fmtMoney(r.pnl, true)}}</span>`;
+    }} else if (r.win_lo != null && r.win_hi != null
+                 && r.stake_usd != null && r.entry_px != null
+                 && Number(r.entry_px) > 0) {{
+      const won = Number(r.bought_lo) === Number(r.win_lo)
+               && Number(r.bought_hi) === Number(r.win_hi);
+      const stake = Number(r.stake_usd);
+      const entry = Number(r.entry_px);
+      const estPnl = won
+        ? (stake * (1 - entry) / entry)   // win: net gain
+        : (-stake);                        // loss: lose entire stake
+      pnlCell = `<span title="estimated from win/lost; position not yet formally closed"
+                       style="${{pnlColor(estPnl)}}">~${{fmtMoney(estPnl, true)}}</span>`;
+    }} else {{
+      pnlCell = '<span style="color:#94a3b8">--</span>';
+    }}
 
     const isPaper = Number(r.is_paper) === 1;
     const modeCell = isPaper
@@ -2978,11 +3026,24 @@ async function silentRefresh() {{
     if (newLivePos !== null)    LIVE_POSITIONS = newLivePos;
     if (newAnalysis !== null)   ANALYSIS = newAnalysis;
     recomputeDerived();
-    renderAll();
-    // Re-assert button states after render — defensive against any
-    // accidental DOM reset during the silent refresh cycle.
-    setMode(MODE_FILTER);
-    setView(VIEW_MODE);
+    const onDetail = location.hash.startsWith("#detail/");
+    if (onDetail) {{
+      // Re-render the detail charts in place with the fresh data and
+      // SKIP renderAll/setView — those would clobber the drilldown
+      // back to the analysis list (the bug the user reported:
+      // detail page resets to list after auto-refresh).
+      const d = _parseDetailHash();
+      if (d) {{
+        try {{ renderDetail(d.city, d.date); }}
+        catch (e) {{ console.error("renderDetail on silent refresh:", e); }}
+      }}
+    }} else {{
+      renderAll();
+      // Re-assert button states after render — defensive against any
+      // accidental DOM reset during the silent refresh cycle.
+      setMode(MODE_FILTER);
+      setView(VIEW_MODE);
+    }}
     // Update generated-at timestamp in header if present
     const tsMatch = text.match(/generated ([0-9-]+ [0-9:]+ UTC)/);
     if (tsMatch) {{
