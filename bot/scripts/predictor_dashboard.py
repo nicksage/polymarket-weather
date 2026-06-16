@@ -1380,7 +1380,6 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
         <th>City</th>
         <th>Purchased (local)</th>
         <th>Mode</th>
-        <th>Bought bin</th>
         <th>Side</th>
         <th>Stake</th>
         <th>Entry $</th>
@@ -1389,7 +1388,9 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
         <th title="Model's uncertainty (1 standard deviation) at buy time">Model uncertainty</th>
         <th>Model P</th>
         <th>Mkt P</th>
+        <th>Bought bin</th>
         <th>Winning bin</th>
+        <th title="Was the bought bin cooler (Under) or warmer (Over) than the winning bin?">Over / Under</th>
         <th>Result</th>
         <th>P&amp;L</th>
       </tr></thead>
@@ -2846,6 +2847,22 @@ function renderAnalysis() {{
       result_html = `<span style="color:#94a3b8">${{lbl}}</span>`;
     }}
 
+    // Over / Under: cool vs warm comparison of bought bin to winning bin.
+    // Only meaningful when both bins are known AND they differ.  A WIN
+    // shows '--' (no over/under by definition).  Adjacent US 2°F bins
+    // can't overlap so a strict <,>,== on the low edge is sufficient.
+    let overUnder_html = '<span style="color:#94a3b8">--</span>';
+    if (r.win_lo != null && r.win_hi != null
+        && r.bought_lo != null && r.bought_hi != null) {{
+      const bLo = Number(r.bought_lo), wLo = Number(r.win_lo);
+      if (bLo < wLo) {{
+        overUnder_html = '<span style="color:#60a5fa;font-weight:600" title="Bought bin was cooler than the winning bin">Under</span>';
+      }} else if (bLo > wLo) {{
+        overUnder_html = '<span style="color:#f59e0b;font-weight:600" title="Bought bin was warmer than the winning bin">Over</span>';
+      }}
+      // bLo == wLo → bins match → leave the '--' (Result column shows WON)
+    }}
+
     // P&L cell: prefer recorded pnl_net/pnl from the DB; otherwise,
     // when we know win/lost from the winning_bin comparison, estimate:
     //   WIN  → +(1 - entry_price) * shares = stake/entry - stake = stake*(1-entry)/entry
@@ -2889,7 +2906,6 @@ function renderAnalysis() {{
       <td>${{cityCell}}</td>
       <td style="font-family:monospace;font-size:11px;color:#cbd5e1">${{localTime}}</td>
       <td>${{modeCell}}</td>
-      <td><b>${{boughtBin}}</b></td>
       <td>${{r.side||""}}</td>
       <td>${{fmtMoney(r.stake_usd)}}</td>
       <td>${{fmtNum(r.entry_px, 3)}}</td>
@@ -2898,13 +2914,15 @@ function renderAnalysis() {{
       <td style="color:#94a3b8">${{sigma}}</td>
       <td>${{fmtPct(Number(r.at_buy_our_p)*100, 1)}}</td>
       <td>${{fmtPct(Number(r.at_buy_mkt_p)*100, 1)}}</td>
+      <td><b>${{boughtBin}}</b></td>
       <td>${{winBin}}</td>
+      <td>${{overUnder_html}}</td>
       <td>${{result_html}}</td>
       <td>${{pnlCell}}</td>
     </tr>`;
   }}
   $("an-purchases-tbody").innerHTML = psHtml ||
-    `<tr><td colspan="16" class="empty">No ${{modeLabel}} purchases in window</td></tr>`;
+    `<tr><td colspan="17" class="empty">No ${{modeLabel}} purchases in window</td></tr>`;
 
   // -- Pipeline coverage KPIs --
   const pipe = ANALYSIS.pipeline_today
