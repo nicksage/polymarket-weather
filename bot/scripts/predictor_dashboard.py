@@ -740,6 +740,165 @@ def load_analysis_data(db: str, lookback_days: int = 30) -> dict:
 # doesn't break the rest of the dashboard.
 # ---------------------------------------------------------------------------
 
+def _load_boundary_eligibility(conn: sqlite3.Connection) -> list:
+    """For every event the predictor scanned today, ask 'is this event
+    currently eligible to fire on a boundary crossing?'  This is the
+    'right now' view that complements the historical trigger log —
+    answers the operator's question 'what would the watcher do if a
+    METAR arrived this minute?'
+
+    Uses the live boundary_watcher helpers so the answer reflects the
+    REAL arming logic, not a re-implementation that could drift.
+
+    Returns one dict per (city, event_date) the predictor is tracking
+    today, with eligibility status + reason.  When the watcher itself
+    silently returns None (no candidate bin above forecast), we still
+    surface a row marked reason='no_candidate_bin' so the operator can
+    see WHY no log row was written.
+    """
+    out: list = []
+    try:
+        # Import lazily so the dashboard still works if boundary_watcher
+        # is not on the import path (fresh checkout, partial rollout).
+        import sys
+        if _BOT_DIR not in sys.path:
+            sys.path.insert(0, _BOT_DIR)
+        from boundary_watcher import (
+            find_candidate_bin, compute_arming_state,
+            reading_in_settlement_unit, c_to_f,
+        )
+    except Exception as e:
+        log.warning(f"boundary_watcher import for eligibility failed: {e}")
+        return out
+
+    # Today's events that the predictor is actively tracking.  Use the
+    # SAME query shape boundary_watcher.run_boundary_watcher_tick uses
+    # so the dashboard sees the exact same population.
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        events = conn.execute(
+            """SELECT DISTINCT s.city, s.event_date,
+                                s.forecast_high_c,
+                                s.forecast_peak_hour,
+                                s.observed_max_c,
+                                s.current_hour_local
+               FROM paper_predictor_signals s
+               WHERE s.event_date = ?
+                 AND s.scanned_at_utc = (
+                   SELECT MAX(scanned_at_utc) FROM paper_predictor_signals
+                   WHERE city = s.city AND event_date = ?
+                 )
+               ORDER BY s.city ASC""",
+            (today, today),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return out
+
+    for ev in events:
+        city            = ev["city"]
+        event_date      = ev["event_date"]
+        fc_high_c       = ev["forecast_high_c"]
+        fc_peak_hour    = ev["forecast_peak_hour"]
+        obs_max_c       = ev["observed_max_c"]
+        cur_hour        = ev["current_hour_local"]
+        if fc_high_c is None or fc_peak_hour is None:
+            out.append({
+                "city": city, "event_date": event_date,
+                "armed": False, "reason": "missing_forecast",
+                "candidate_bin_label": None,
+                "candidate_bin_lo": None, "candidate_bin_hi": None,
+                "settlement_unit": None,
+                "boundary_settlement": None,
+                "forecast_high_c": fc_high_c,
+                "forecast_high_settlement": None,
+                "margin_to_boundary": None,
+                "market_p": None,
+                "observed_max_c": obs_max_c,
+                "observed_max_settlement": None,
+                "current_local_hour": cur_hour,
+                "forecast_peak_hour": fc_peak_hour,
+            })
+            continue
+
+        # Find candidate bin (the "next bin above forecast")
+        try:
+            cand = find_candidate_bin(conn, city, event_date, float(fc_high_c))
+        except Exception as e:
+            log.warning(f"find_candidate_bin raised for {city} {event_date}: {e}")
+            cand = None
+
+        if cand is None:
+            out.append({
+                "city": city, "event_date": event_date,
+                "armed": False, "reason": "no_candidate_bin",
+                "candidate_bin_label": None,
+                "candidate_bin_lo": None, "candidate_bin_hi": None,
+                "settlement_unit": None,
+                "boundary_settlement": None,
+                "forecast_high_c": float(fc_high_c),
+                "forecast_high_settlement": None,
+                "margin_to_boundary": None,
+                "market_p": None,
+                "observed_max_c": float(obs_max_c) if obs_max_c is not None else None,
+                "observed_max_settlement": None,
+                "current_local_hour": cur_hour,
+                "forecast_peak_hour": fc_peak_hour,
+            })
+            continue
+
+        unit = cand["unit"]
+        try:
+            fc_settlement = reading_in_settlement_unit(float(fc_high_c), unit)
+        except Exception:
+            fc_settlement = None
+        obs_settlement = None
+        if obs_max_c is not None:
+            try:
+                obs_settlement = reading_in_settlement_unit(float(obs_max_c), unit)
+            except Exception:
+                pass
+
+        boundary = cand.get("boundary")
+        margin = (boundary - fc_settlement) if (boundary is not None
+                                                  and fc_settlement is not None) else None
+
+        # Apply the real arming gate
+        arm = compute_arming_state(
+            forecast_high_c     = float(fc_high_c),
+            forecast_peak_hour  = int(fc_peak_hour),
+            current_local_hour  = int(cur_hour) if cur_hour is not None else 0,
+            settlement_unit     = unit,
+            candidate_bin_lo    = cand["bin_range_low"],
+            candidate_bin_hi    = cand["bin_range_high"],
+            candidate_market_p  = cand.get("market_prob") or 0,
+            observed_max_c      = float(obs_max_c) if obs_max_c is not None else -100,
+        )
+
+        out.append({
+            "city": city,
+            "event_date": event_date,
+            "armed": bool(arm.armed),
+            "reason": arm.reason,
+            "candidate_bin_label":   cand.get("bin_label"),
+            "candidate_bin_lo":      cand.get("bin_range_low"),
+            "candidate_bin_hi":      cand.get("bin_range_high"),
+            "settlement_unit":       unit,
+            "boundary_settlement":   boundary,
+            "forecast_high_c":       float(fc_high_c),
+            "forecast_high_settlement": fc_settlement,
+            "margin_to_boundary":    margin,
+            "market_p":              cand.get("market_prob"),
+            "observed_max_c":        float(obs_max_c) if obs_max_c is not None else None,
+            "observed_max_settlement": obs_settlement,
+            "current_local_hour":    cur_hour,
+            "forecast_peak_hour":    fc_peak_hour,
+        })
+
+    # Sort: armed events first, then by city
+    out.sort(key=lambda r: (0 if r["armed"] else 1, str(r.get("city") or "")))
+    return out
+
+
 def load_boundary_data(db: str, lookback_days: int = 30) -> dict:
     """Pull boundary_trigger_log telemetry for the Boundary tab.
 
@@ -780,6 +939,7 @@ def load_boundary_data(db: str, lookback_days: int = 30) -> dict:
             "blockers":        [],
         },
         "recent_rows": [],
+        "eligibility": [],
         "lookback_days": int(lookback_days),
     }
     if not os.path.exists(db):
@@ -792,8 +952,16 @@ def load_boundary_data(db: str, lookback_days: int = 30) -> dict:
     with sqlite3.connect(db) as conn:
         conn.row_factory = sqlite3.Row
 
-        # Sanity: does the table exist?  If not, return zeros (operator
-        # may not have run the bot yet on this DB).
+        # ---- Current eligibility (computed FIRST so it surfaces even
+        # when boundary_trigger_log has zero rows — exactly the case
+        # where the operator most needs to see WHY).
+        try:
+            out["eligibility"] = _load_boundary_eligibility(conn)
+        except Exception as e:
+            log.warning(f"boundary eligibility build failed: {e}")
+
+        # Sanity: does the trigger-log table exist?  If not, return out
+        # with eligibility populated but zeros for all log-driven KPIs.
         try:
             conn.execute("SELECT 1 FROM boundary_trigger_log LIMIT 1")
         except sqlite3.OperationalError:
@@ -1456,8 +1624,41 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
     <span>Trades cap/day: <strong id="bd-trades-cap">--</strong></span>
   </div>
 
+  <!-- Currently eligible (today) — the "right now" view.  Surfaces
+       which events would actually fire if a boundary-crossing METAR
+       arrived this minute, and for events that won't, exactly why
+       not.  This is the panel that explains zero KPI counts. -->
+  <div class="section-title" style="margin-top:24px">
+    Currently eligible (today, <span id="bd-elig-count">--</span> events)
+  </div>
+  <div style="color:#94a3b8;font-size:12px;margin-bottom:8px">
+    For every event the predictor is tracking today, what would the
+    boundary watcher do right now?  Green <code>ARMED</code> rows fire
+    on a confirmed boundary crossing.  Other rows show the gate that's
+    blocking them.  If this table is empty, the bot isn't running
+    boundary jobs (or no predictor scans landed today).
+  </div>
+  <div style="overflow-x:auto;margin-bottom:8px">
+    <table class="signals" id="bd-elig-table">
+      <thead><tr>
+        <th>City</th>
+        <th>Event date</th>
+        <th>Status</th>
+        <th title="The 'next bin above forecast' the watcher would arm against">Candidate bin</th>
+        <th title="Lower edge of the candidate bin in settlement units (°F for US)">Boundary</th>
+        <th title="Forecast high in settlement units (°F for US)">Forecast</th>
+        <th title="How far below the boundary the current forecast sits — must be ≤ 0.5°C (~0.9°F) to arm">Margin to boundary</th>
+        <th title="Latest market price on YES for the candidate bin — must be ≤ 0.05 to arm">Mkt p</th>
+        <th title="Observed daily-high so far in settlement units">Observed max</th>
+        <th title="Local clock hour at last scan / forecast peak hour">Time</th>
+        <th title="Why this event is not armed (when 'armed', this just says so)">Reason</th>
+      </tr></thead>
+      <tbody id="bd-elig-tbody"></tbody>
+    </table>
+  </div>
+
   <!-- Headline KPIs -->
-  <div class="section-title">Boundary watcher (last <span id="bd-lookback">30</span> days)</div>
+  <div class="section-title" style="margin-top:24px">Boundary watcher (last <span id="bd-lookback">30</span> days)</div>
   <div class="kpis" id="bd-kpis"></div>
 
   <!-- Sign-off readiness -->
@@ -3470,6 +3671,75 @@ function renderBoundary() {{
   const tc = $("bd-trades-cap");
   if (tc) tc.textContent =
     (s.actually_fired_today || 0) + " / " + (s.max_trades_per_day || 0);
+
+  // -- Currently-eligible table --
+  const elig = BOUNDARY.eligibility || [];
+  const eligCnt = $("bd-elig-count");
+  if (eligCnt) eligCnt.textContent = elig.length;
+  const eligTb = $("bd-elig-tbody");
+  if (eligTb) {{
+    if (elig.length === 0) {{
+      eligTb.innerHTML = '<tr><td colspan="11" style="color:#64748b">' +
+        'No predictor scans for today yet, or boundary_watcher module ' +
+        'not importable on this host.</td></tr>';
+    }} else {{
+      eligTb.innerHTML = elig.map(r => {{
+        const armedPill = r.armed
+          ? '<span style="background:#22c55e;color:white;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700">ARMED</span>'
+          : '<span style="background:#475569;color:#cbd5e1;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600">--</span>';
+        const unit = r.settlement_unit === "fahrenheit" ? "°F" :
+                     (r.settlement_unit === "celsius" ? "°C" : "");
+        const bin = r.candidate_bin_label
+          ? `<b>${{r.candidate_bin_label}}</b>`
+          : '<span style="color:#94a3b8">--</span>';
+        const boundary = r.boundary_settlement != null
+          ? Number(r.boundary_settlement).toFixed(1) + unit
+          : '--';
+        const fc = r.forecast_high_settlement != null
+          ? Number(r.forecast_high_settlement).toFixed(1) + unit
+          : (r.forecast_high_c != null ? Number(r.forecast_high_c).toFixed(1) + "°C" : "--");
+        // Margin: positive = forecast below boundary; color by arming threshold
+        let marginCell = '<span style="color:#94a3b8">--</span>';
+        if (r.margin_to_boundary != null) {{
+          const m = Number(r.margin_to_boundary);
+          // 0.5°C ≈ 0.9°F is the arming margin for °F bins; show in unit
+          const threshold = (r.settlement_unit === "fahrenheit") ? 0.9 : 0.5;
+          const c = (m > 0 && m <= threshold) ? "#22c55e" :
+                    (m > 0 && m <= threshold * 2) ? "#fbbf24" : "#94a3b8";
+          const sign = m > 0 ? "+" : "";
+          marginCell = `<span style="color:${{c}};font-weight:600">${{sign}}${{m.toFixed(2)}}${{unit}}</span>`;
+        }}
+        const mp = r.market_p != null
+          ? Number(r.market_p).toFixed(3)
+          : '<span style="color:#94a3b8">--</span>';
+        const obs = r.observed_max_settlement != null
+          ? Number(r.observed_max_settlement).toFixed(1) + unit
+          : (r.observed_max_c != null ? Number(r.observed_max_c).toFixed(1) + "°C" : "--");
+        const timeCell = (r.current_local_hour != null && r.forecast_peak_hour != null)
+          ? `${{r.current_local_hour}}h / peak ${{r.forecast_peak_hour}}h`
+          : '--';
+        // Reason: friendlier display
+        const reason = (r.reason || "").replace(/_/g, " ");
+        const reasonColor = r.armed ? "#22c55e"
+          : (r.reason === "no_candidate_bin"     ? "#94a3b8"
+            : r.reason === "missing_forecast"    ? "#ef4444"
+            : "#fbbf24");
+        return `<tr>
+          <td><b>${{r.city || ""}}</b></td>
+          <td>${{r.event_date || ""}}</td>
+          <td>${{armedPill}}</td>
+          <td>${{bin}}</td>
+          <td class="num">${{boundary}}</td>
+          <td class="num">${{fc}}</td>
+          <td class="num">${{marginCell}}</td>
+          <td class="num">${{mp}}</td>
+          <td class="num">${{obs}}</td>
+          <td>${{timeCell}}</td>
+          <td style="color:${{reasonColor}};font-size:11px">${{reason}}</td>
+        </tr>`;
+      }}).join("");
+    }}
+  }}
 
   // -- Headline KPIs --
   const kpis = $("bd-kpis");
