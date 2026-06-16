@@ -984,6 +984,7 @@ def insert_position(
     pre_entry_volatility: float = None,
     pre_entry_trend: float = None,
     pre_entry_momentum: float = None,
+    signal_origin: str = None,
 ) -> int:
     sql = """
         INSERT INTO positions (
@@ -996,8 +997,9 @@ def insert_position(
             yes_token_id, no_token_id, lat, lon,
             forecast_sigma_c, entry_snapshot_id, target_size_usdc,
             stop_loss_price, peak_price, strategy,
-            pre_entry_volatility, pre_entry_trend, pre_entry_momentum
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            pre_entry_volatility, pre_entry_trend, pre_entry_momentum,
+            signal_origin
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     with _get_conn() as conn:
         cur = conn.execute(sql, (
@@ -1018,6 +1020,7 @@ def insert_position(
             pre_entry_volatility,
             pre_entry_trend,
             pre_entry_momentum,
+            signal_origin,
         ))
         return cur.lastrowid
 

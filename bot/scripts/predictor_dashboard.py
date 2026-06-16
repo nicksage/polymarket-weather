@@ -723,6 +723,238 @@ def load_analysis_data(db: str, lookback_days: int = 30) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Boundary watcher surface — dry-run sign-off telemetry
+#
+# The Boundary tab is purely observational.  It exists to give the
+# operator the four-gate sign-off data BEFORE flipping
+# BOUNDARY_DRY_RUN=0 to live execution:
+#   1. >=30 would_fire rows logged
+#   2. acceptable contradiction rate (T-group disagreement on
+#      provisional signals)
+#   3. favorable market_prob_60s_later distribution (post-trigger
+#      market repricing should agree with the trigger more often
+#      than not)
+#   4. manual eyeball of recent rows
+#
+# Every query is wrapped in try/except so a fresh DB (no table yet)
+# doesn't break the rest of the dashboard.
+# ---------------------------------------------------------------------------
+
+def load_boundary_data(db: str, lookback_days: int = 30) -> dict:
+    """Pull boundary_trigger_log telemetry for the Boundary tab.
+
+    Returns a dict with: summary KPIs, classification breakdown,
+    lookahead distribution, and recent-row table.  Empty / zeros when
+    the table doesn't exist yet (fresh deployment, dry-run hasn't
+    written anything).
+    """
+    out: dict = {
+        "summary": {
+            "rows_total":          0,
+            "rows_today":          0,
+            "would_fire_total":    0,
+            "would_fire_today":    0,
+            "actually_fired_total": 0,
+            "actually_fired_today": 0,
+            "dry_run_enabled":     bool(int(os.getenv("BOUNDARY_DRY_RUN", "1"))),
+            "strategy_enabled":    bool(int(os.getenv("BOUNDARY_STRATEGY_ENABLED", "0"))),
+            "max_entry_price":     float(os.getenv("BOUNDARY_MAX_ENTRY_PRICE", "0.20")),
+            "target_stake_usd":    float(os.getenv("BOUNDARY_TARGET_STAKE_USD", "20")),
+            "daily_budget_usd":    float(os.getenv("BOUNDARY_DAILY_BUDGET_USD", "100")),
+            "max_trades_per_day":  int(os.getenv("BOUNDARY_MAX_TRADES_PER_DAY", "10")),
+            "boundary_budget_spent_today": 0.0,
+        },
+        "classification_counts": [],
+        "lookahead_summary": {
+            "n_with_60s":      0,
+            "n_with_300s":     0,
+            "avg_delta_60s":   None,
+            "avg_delta_300s":  None,
+            "n_positive_60s":  0,
+            "n_positive_300s": 0,
+        },
+        "sign_off": {
+            "rows_needed":     30,
+            "would_fire_rows": 0,
+            "ready":           False,
+            "blockers":        [],
+        },
+        "recent_rows": [],
+        "lookback_days": int(lookback_days),
+    }
+    if not os.path.exists(db):
+        return out
+
+    days = max(1, int(lookback_days))
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+
+        # Sanity: does the table exist?  If not, return zeros (operator
+        # may not have run the bot yet on this DB).
+        try:
+            conn.execute("SELECT 1 FROM boundary_trigger_log LIMIT 1")
+        except sqlite3.OperationalError:
+            return out
+
+        # ---- Summary counts ---------------------------------------
+        try:
+            r = conn.execute(
+                "SELECT "
+                "  COUNT(*) AS n_total, "
+                "  SUM(CASE WHEN substr(evaluated_at_utc,1,10)=? THEN 1 ELSE 0 END) AS n_today, "
+                "  SUM(CASE WHEN would_fire=1 THEN 1 ELSE 0 END) AS n_would, "
+                "  SUM(CASE WHEN would_fire=1 AND substr(evaluated_at_utc,1,10)=? THEN 1 ELSE 0 END) AS n_would_today, "
+                "  SUM(CASE WHEN actually_fired=1 THEN 1 ELSE 0 END) AS n_actual, "
+                "  SUM(CASE WHEN actually_fired=1 AND substr(evaluated_at_utc,1,10)=? THEN 1 ELSE 0 END) AS n_actual_today, "
+                "  COALESCE(SUM(CASE WHEN actually_fired=1 AND substr(evaluated_at_utc,1,10)=? "
+                "    THEN would_fire_size_usd ELSE 0 END), 0) AS spent_today "
+                "FROM boundary_trigger_log "
+                "WHERE evaluated_at_utc >= ?",
+                (today, today, today, today, cutoff_iso),
+            ).fetchone()
+            out["summary"]["rows_total"]            = int(r["n_total"] or 0)
+            out["summary"]["rows_today"]            = int(r["n_today"] or 0)
+            out["summary"]["would_fire_total"]      = int(r["n_would"] or 0)
+            out["summary"]["would_fire_today"]      = int(r["n_would_today"] or 0)
+            out["summary"]["actually_fired_total"]  = int(r["n_actual"] or 0)
+            out["summary"]["actually_fired_today"]  = int(r["n_actual_today"] or 0)
+            out["summary"]["boundary_budget_spent_today"] = float(r["spent_today"] or 0)
+        except sqlite3.OperationalError:
+            pass
+
+        # ---- Classification breakdown -----------------------------
+        # The headline diagnostic: of every cycle the watcher evaluated,
+        # what did the trigger logic say?  'confirmed' should dominate
+        # arming-day buckets; 'contradicted' rows are the disagreement
+        # signal we track for gate #2 of the sign-off.
+        try:
+            rows = conn.execute(
+                "SELECT COALESCE(trigger_classification, 'unknown') AS cls, "
+                "  COUNT(*) AS n, "
+                "  SUM(CASE WHEN would_fire=1 THEN 1 ELSE 0 END) AS n_would "
+                "FROM boundary_trigger_log "
+                "WHERE evaluated_at_utc >= ? "
+                "GROUP BY cls ORDER BY n DESC",
+                (cutoff_iso,),
+            ).fetchall()
+            out["classification_counts"] = [
+                {"classification": r["cls"], "n": int(r["n"]),
+                 "n_would_fire": int(r["n_would"] or 0)}
+                for r in rows
+            ]
+        except sqlite3.OperationalError:
+            pass
+
+        # ---- Lookahead distribution -------------------------------
+        # For every would_fire row, compare market_prob_at_eval to
+        # market_prob_60s_later and _300s_later.  Positive delta = the
+        # market repriced TOWARD our trigger; that's the latency edge.
+        try:
+            rows = conn.execute(
+                "SELECT market_prob_at_eval, market_prob_60s_later, market_prob_300s_later "
+                "FROM boundary_trigger_log "
+                "WHERE would_fire = 1 AND evaluated_at_utc >= ?",
+                (cutoff_iso,),
+            ).fetchall()
+            deltas_60: list = []
+            deltas_300: list = []
+            for r in rows:
+                base = r["market_prob_at_eval"]
+                if base is None:
+                    continue
+                base = float(base)
+                if r["market_prob_60s_later"] is not None:
+                    deltas_60.append(float(r["market_prob_60s_later"]) - base)
+                if r["market_prob_300s_later"] is not None:
+                    deltas_300.append(float(r["market_prob_300s_later"]) - base)
+            la = out["lookahead_summary"]
+            la["n_with_60s"]      = len(deltas_60)
+            la["n_with_300s"]     = len(deltas_300)
+            la["avg_delta_60s"]   = (sum(deltas_60)/len(deltas_60))   if deltas_60  else None
+            la["avg_delta_300s"]  = (sum(deltas_300)/len(deltas_300)) if deltas_300 else None
+            la["n_positive_60s"]  = sum(1 for d in deltas_60  if d > 0)
+            la["n_positive_300s"] = sum(1 for d in deltas_300 if d > 0)
+        except sqlite3.OperationalError:
+            pass
+
+        # ---- Sign-off readiness -----------------------------------
+        # Gates 1-3 are checkable from data; gate 4 is operator eyeball.
+        # Dashboard shows what blocks each gate; flipping DRY_RUN=0
+        # remains a manual action.
+        blockers: list = []
+        wf = out["summary"]["would_fire_total"]
+        out["sign_off"]["would_fire_rows"] = wf
+        if wf < 30:
+            blockers.append(f"need {30 - wf} more would-fire rows "
+                            f"(have {wf}/30)")
+        la = out["lookahead_summary"]
+        if la["n_with_60s"] < 10:
+            blockers.append(f"need 60s lookahead data on >=10 fires "
+                            f"(have {la['n_with_60s']})")
+        elif la["avg_delta_60s"] is not None and la["avg_delta_60s"] <= 0:
+            blockers.append(f"60s avg delta is {la['avg_delta_60s']:+.3f} "
+                            f"(want > 0 — market should reprice TOWARD trigger)")
+        # Contradiction rate: any contradicted row is a T-group disagreeing
+        # with a prior strong/at_boundary signal.  Rate must be < 30%.
+        try:
+            r = conn.execute(
+                "SELECT "
+                "  SUM(CASE WHEN trigger_classification='contradicted' THEN 1 ELSE 0 END) AS n_contra, "
+                "  SUM(CASE WHEN trigger_classification IN "
+                "        ('confirmed','strong','at_boundary','contradicted') THEN 1 ELSE 0 END) AS n_classed "
+                "FROM boundary_trigger_log WHERE evaluated_at_utc >= ?",
+                (cutoff_iso,),
+            ).fetchone()
+            n_contra  = int(r["n_contra"] or 0)
+            n_classed = int(r["n_classed"] or 0)
+            if n_classed > 0:
+                contra_rate = n_contra / n_classed
+                out["sign_off"]["contradiction_rate"] = contra_rate
+                out["sign_off"]["contradicted_count"] = n_contra
+                out["sign_off"]["classified_count"]   = n_classed
+                if contra_rate > 0.30:
+                    blockers.append(f"contradiction rate {contra_rate:.1%} "
+                                    f"exceeds 30% (gate threshold)")
+        except sqlite3.OperationalError:
+            pass
+        # Gate 4 (manual eyeball) cannot auto-clear.
+        blockers.append("manual eyeball of first 5 confirmed rows pending")
+        out["sign_off"]["blockers"] = blockers
+        out["sign_off"]["ready"]    = (len(blockers) <= 1 and
+                                          blockers == ["manual eyeball of first 5 confirmed rows pending"])
+
+        # ---- Recent rows ------------------------------------------
+        # Last 200 by evaluated_at desc — enough for the eyeball check
+        # without blowing up the page weight.
+        try:
+            rows = conn.execute(
+                "SELECT id, evaluated_at_utc, city, event_date, contract_id, "
+                "  bin_label, settlement_unit, cycle_kind, "
+                "  reading_native_c, reading_settlement, "
+                "  boundary_value_settlement, margin_from_boundary, "
+                "  trigger_classification, arm_state, "
+                "  would_fire, would_fire_size_usd, would_fire_limit_price, "
+                "  actually_fired, actual_order_id, "
+                "  conflict_with_predictor, "
+                "  market_prob_at_eval, market_prob_60s_later, market_prob_300s_later, "
+                "  forecast_high_c, forecast_peak_hour, observed_max_c, "
+                "  signal_origin, notes "
+                "FROM boundary_trigger_log "
+                "WHERE evaluated_at_utc >= ? "
+                "ORDER BY evaluated_at_utc DESC LIMIT 200",
+                (cutoff_iso,),
+            ).fetchall()
+            out["recent_rows"] = [dict(r) for r in rows]
+        except sqlite3.OperationalError:
+            pass
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Polymarket data API — authoritative LIVE positions / P&L
 # ---------------------------------------------------------------------------
 
@@ -984,7 +1216,8 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
                      generated_at_utc: str,
                      auto_refresh_sec: int | None = None,
                      live_positions: list[dict] | None = None,
-                     analysis: dict | None = None) -> str:
+                     analysis: dict | None = None,
+                     boundary: dict | None = None) -> str:
     """Build the full HTML page.  All data filtering / aggregation happens
     in JS so the mode toggle is instant and reuses one data blob."""
     cities_meta = _us_cities()
@@ -994,6 +1227,8 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
     positions_json = json.dumps(live_positions or [], default=str,
                                   separators=(",", ":"))
     analysis_json  = json.dumps(analysis or {}, default=str,
+                                  separators=(",", ":"))
+    boundary_json  = json.dumps(boundary or {}, default=str,
                                   separators=(",", ":"))
     # Dashboard's default mode mirrors the bot's PREDICTOR_MODE so a fresh
     # browser (no localStorage) shows what the bot is actually doing.
@@ -1029,6 +1264,7 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
       <button id="view-signals" class="active view">Signals</button>
       <button id="view-trades" class="view">Trades</button>
       <button id="view-analysis" class="view">Analysis</button>
+      <button id="view-boundary" class="view">Boundary</button>
     </div>
   </div>
   <div class="meta">generated {generated_at_utc} {refresh_badge}<br>
@@ -1200,6 +1436,120 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
 
 </div>
 
+<!-- ===================== BOUNDARY TAB ===================== -->
+<!-- Observational surface for the boundary-crossing latency strategy.
+     Lives entirely in dry-run telemetry until the four-gate sign-off
+     clears.  The classification breakdown + lookahead delta are the
+     load-bearing metrics; the recent-rows table is the eyeball check. -->
+<div id="boundary-section" style="display:none;padding:0 24px 24px">
+
+  <!-- Status banner -->
+  <div id="bd-banner" style="margin:18px 0;padding:12px 16px;border-radius:8px;
+       background:#0f172a;border:1px solid #334155;font-size:13px;
+       display:flex;gap:24px;flex-wrap:wrap;align-items:center">
+    <span>Strategy: <strong id="bd-strategy-state">--</strong></span>
+    <span>Dry-run: <strong id="bd-dryrun-state">--</strong></span>
+    <span>Max entry $: <strong id="bd-max-entry">--</strong></span>
+    <span>Target stake $: <strong id="bd-target-stake">--</strong></span>
+    <span>Daily budget: <strong id="bd-daily-budget">--</strong></span>
+    <span>Trades cap/day: <strong id="bd-trades-cap">--</strong></span>
+  </div>
+
+  <!-- Headline KPIs -->
+  <div class="section-title">Boundary watcher (last <span id="bd-lookback">30</span> days)</div>
+  <div class="kpis" id="bd-kpis"></div>
+
+  <!-- Sign-off readiness -->
+  <div class="section-title" style="margin-top:24px">Dry-run sign-off readiness</div>
+  <div style="color:#94a3b8;font-size:12px;margin-bottom:8px">
+    All four gates must clear before flipping <code>BOUNDARY_DRY_RUN=0</code>.
+    Gates 1-3 auto-clear from data; gate 4 (manual eyeball) is operator action.
+  </div>
+  <div id="bd-signoff" style="background:#1e293b;padding:14px 18px;border-radius:8px;
+                                font-size:13px;border:1px solid #334155"></div>
+
+  <!-- Classification breakdown -->
+  <div class="section-title" style="margin-top:24px">Trigger classification breakdown</div>
+  <div style="color:#94a3b8;font-size:12px;margin-bottom:8px">
+    Every cycle the watcher evaluated.  Higher <code>confirmed</code> and
+    lower <code>contradicted</code> = trigger is sound.  <code>at_boundary</code>
+    is the jitter zone we exclude by design — count should be non-zero
+    (proves the filter is engaging) but always shows would_fire=0.
+  </div>
+  <table class="signals" id="bd-cls-table" style="max-width:680px">
+    <thead><tr>
+      <th>Classification</th><th>Total</th><th>Would fire</th><th>% would fire</th>
+    </tr></thead>
+    <tbody id="bd-cls-tbody"></tbody>
+  </table>
+
+  <!-- Lookahead distribution -->
+  <div class="section-title" style="margin-top:24px">Lookahead delta (the latency edge metric)</div>
+  <div style="color:#94a3b8;font-size:12px;margin-bottom:8px">
+    For each would-fire row, compare <code>market_prob_at_eval</code> to
+    <code>market_prob_60s_later</code> and <code>_300s_later</code>.
+    POSITIVE delta = the market repriced TOWARD our trigger — that's
+    the latency edge we're paid for.  Negative or zero = we'd be
+    chasing reverted reads.
+  </div>
+  <div class="kpis" id="bd-lookahead-kpis"></div>
+
+  <!-- Recent rows table -->
+  <div class="section-title" style="margin-top:24px">Recent triggers (last 200)</div>
+  <div style="color:#94a3b8;font-size:12px;margin-bottom:8px">
+    The eyeball check.  Skim the most recent <code>confirmed</code> rows
+    and verify the reading really did cross the bin boundary in the
+    underlying METAR.
+  </div>
+  <div class="filters" style="margin-bottom:8px">
+    <div>
+      <label>City</label>
+      <select id="bd-f-city"><option value="">All</option></select>
+    </div>
+    <div>
+      <label>Class</label>
+      <select id="bd-f-cls">
+        <option value="">All</option>
+        <option>no_signal</option>
+        <option>at_boundary</option>
+        <option>strong</option>
+        <option>confirmed</option>
+        <option>contradicted</option>
+      </select>
+    </div>
+    <div>
+      <label>Would fire only</label>
+      <input type="checkbox" id="bd-f-wouldfire">
+    </div>
+    <div class="count" id="bd-count">--</div>
+  </div>
+  <div style="overflow-x:auto">
+    <table class="signals" id="bd-rows-table">
+      <thead><tr>
+        <th>Evaluated (UTC)</th>
+        <th>City</th>
+        <th>Event date</th>
+        <th>Bin</th>
+        <th>Cycle</th>
+        <th title="Settlement-unit reading (e.g., °F for US bins)">Reading</th>
+        <th>Boundary</th>
+        <th title="Signed distance from boundary in settlement units">Margin</th>
+        <th>Class</th>
+        <th>Arm</th>
+        <th>Mkt p at eval</th>
+        <th>+60s</th>
+        <th>+300s</th>
+        <th>Would fire</th>
+        <th>Actually fired</th>
+        <th>Order id</th>
+        <th>Notes</th>
+      </tr></thead>
+      <tbody id="bd-rows-tbody"></tbody>
+    </table>
+  </div>
+
+</div>
+
 <!-- ===================== CITY-DETAIL DRILLDOWN ===================== -->
 <!-- Shown when the user clicks a city link in the Analysis table.
      Driven by location.hash = "#detail/<city>/<event_date>". -->
@@ -1276,6 +1626,7 @@ let SIGNALS = {sig_json};
 let LIVE_ORDERS = {live_json};
 let LIVE_POSITIONS = {positions_json};   // from Polymarket data API
 let ANALYSIS = {analysis_json};          // Analysis tab data
+let BOUNDARY = {boundary_json};          // Boundary tab data
 const CITIES = {cities_json};
 
 // Index live positions by asset (token_id) for O(1) lookup when computing
@@ -2086,7 +2437,7 @@ document.querySelectorAll("#trades-table th").forEach(th => {{
 function setView(v) {{
   VIEW_MODE = v;
   saveState({{view: v}});
-  ["signals", "trades", "analysis"].forEach(x => {{
+  ["signals", "trades", "analysis", "boundary"].forEach(x => {{
     const btn = $("view-" + x);
     if (btn) btn.classList.toggle("active", x === v);
   }});
@@ -2095,6 +2446,8 @@ function setView(v) {{
   $("trades-table").style.display    = (v === "trades"   ? "" : "none");
   const an = $("analysis-section");
   if (an) an.style.display           = (v === "analysis" ? "" : "none");
+  const bd = $("boundary-section");
+  if (bd) bd.style.display           = (v === "boundary" ? "" : "none");
   // Exit the detail drilldown when switching primary views — otherwise
   // detail stays open over the new tab.  The hash gets cleared so
   // hashchange doesn't loop us back in.
@@ -2107,22 +2460,28 @@ function setView(v) {{
                           location.pathname + location.search);
     }}
   }}
-  // Analysis tab hides the per-city panel + filters (they don't apply
-  // to the historical-analysis view).
+  // Analysis & Boundary tabs both hide the per-city panel + filters
+  // (those only apply to Signals/Trades).
   const panelsTitle  = $("panels-title");
   const filters      = document.querySelector(".filters");
   const cityGrid     = $("city-grid");
   const signalsTitle = $("signals-title");
-  const hideForAnalysis = (v === "analysis");
-  if (panelsTitle)  panelsTitle.style.display  = hideForAnalysis ? "none" : "";
-  if (filters)      filters.style.display      = hideForAnalysis ? "none" : "";
-  if (cityGrid)     cityGrid.style.display     = hideForAnalysis ? "none" : "";
-  if (signalsTitle) signalsTitle.style.display = hideForAnalysis ? "none" : "";
+  const hideForFullPage = (v === "analysis" || v === "boundary");
+  if (panelsTitle)  panelsTitle.style.display  = hideForFullPage ? "none" : "";
+  if (filters)      filters.style.display      = hideForFullPage ? "none" : "";
+  if (cityGrid)     cityGrid.style.display     = hideForFullPage ? "none" : "";
+  if (signalsTitle) signalsTitle.style.display = hideForFullPage ? "none" : "";
   renderAll();
+  if (v === "boundary") {{
+    try {{ renderBoundary(); }}
+    catch (e) {{ console.error("renderBoundary raised:", e); }}
+  }}
 }}
 $("view-signals").addEventListener("click",  () => setView("signals"));
 $("view-trades").addEventListener("click",   () => setView("trades"));
 $("view-analysis").addEventListener("click", () => setView("analysis"));
+const _bdBtn = $("view-boundary");
+if (_bdBtn) _bdBtn.addEventListener("click", () => setView("boundary"));
 
 // Belt-and-suspenders dispatch for the Analysis tab.  setView/setMode
 // route through renderAll() which calls a chain of upstream functions
@@ -3010,6 +3369,227 @@ $("mode-paper").addEventListener("click", () => setMode("paper"));
 $("mode-live").addEventListener("click",  () => setMode("live"));
 $("mode-both").addEventListener("click",  () => setMode("both"));
 
+// ===== Boundary tab render =====
+// Surfaces boundary_trigger_log telemetry for the four-gate dry-run
+// sign-off.  No mode toggle — boundary is its own strategy independent
+// of paper/live (it has its own DRY_RUN switch).
+let BD_CITY_FILTER = "";
+let BD_CLS_FILTER  = "";
+let BD_WOULDFIRE_ONLY = false;
+
+function _bdFmtDelta(v) {{
+  if (v == null || isNaN(v)) return "--";
+  const n = Number(v);
+  const sgn = n > 0 ? "+" : "";
+  return sgn + n.toFixed(3);
+}}
+function _bdFmtMargin(v) {{
+  if (v == null || isNaN(v)) return "--";
+  const n = Number(v);
+  const sgn = n > 0 ? "+" : "";
+  return sgn + n.toFixed(2);
+}}
+function _bdClassPill(cls) {{
+  const colors = {{
+    confirmed:    "background:#22c55e;color:white",
+    strong:       "background:#16a34a;color:white",
+    at_boundary:  "background:#fbbf24;color:#1e293b",
+    contradicted: "background:#ef4444;color:white",
+    no_signal:    "background:#475569;color:#cbd5e1",
+  }};
+  const s = colors[cls] || "background:#334155;color:#cbd5e1";
+  return `<span style="${{s}};padding:1px 6px;border-radius:4px;
+                        font-size:11px;font-weight:700;font-family:monospace">
+            ${{cls || "?"}}
+          </span>`;
+}}
+function _bdBoolPill(v, trueLabel, falseLabel) {{
+  const yes = !!v;
+  const c = yes ? "#22c55e" : "#475569";
+  const label = yes ? trueLabel : falseLabel;
+  return `<span style="background:${{c}};color:white;padding:1px 6px;
+                        border-radius:4px;font-size:11px;font-weight:600">
+            ${{label}}
+          </span>`;
+}}
+function _bdRefreshCityDropdown() {{
+  const sel = $("bd-f-city");
+  if (!sel) return;
+  const cur = sel.value;
+  const cities = new Set();
+  (BOUNDARY.recent_rows || []).forEach(r => {{ if (r.city) cities.add(r.city); }});
+  const sorted = Array.from(cities).sort();
+  sel.innerHTML = '<option value="">All</option>' +
+    sorted.map(c => `<option value="${{c}}"${{c === cur ? " selected" : ""}}>${{c}}</option>`).join("");
+}}
+function renderBoundary() {{
+  if (!BOUNDARY || typeof BOUNDARY !== "object") return;
+  const s  = BOUNDARY.summary || {{}};
+  const la = BOUNDARY.lookahead_summary || {{}};
+  const so = BOUNDARY.sign_off || {{}};
+
+  // Lookback caption
+  const lb = $("bd-lookback");
+  if (lb) lb.textContent = BOUNDARY.lookback_days || 30;
+
+  // -- Status banner --
+  const ss = $("bd-strategy-state");
+  if (ss) ss.innerHTML = _bdBoolPill(s.strategy_enabled, "ENABLED", "OFF");
+  const dr = $("bd-dryrun-state");
+  if (dr) {{
+    // Inverted color logic: dry-run=ON is the SAFE state (green);
+    // dry-run=OFF means live execution (yellow warning).
+    dr.innerHTML = s.dry_run_enabled
+      ? '<span style="background:#22c55e;color:white;padding:1px 6px;border-radius:4px;font-size:11px;font-weight:600">DRY-RUN (safe)</span>'
+      : '<span style="background:#f59e0b;color:white;padding:1px 6px;border-radius:4px;font-size:11px;font-weight:700">LIVE</span>';
+  }}
+  const me = $("bd-max-entry");  if (me) me.textContent = "$" + Number(s.max_entry_price || 0).toFixed(2);
+  const ts = $("bd-target-stake"); if (ts) ts.textContent = "$" + Number(s.target_stake_usd || 0).toFixed(0);
+  const db = $("bd-daily-budget");
+  if (db) db.textContent =
+    "$" + Number(s.boundary_budget_spent_today || 0).toFixed(0) +
+    " / $" + Number(s.daily_budget_usd || 0).toFixed(0);
+  const tc = $("bd-trades-cap");
+  if (tc) tc.textContent =
+    (s.actually_fired_today || 0) + " / " + (s.max_trades_per_day || 0);
+
+  // -- Headline KPIs --
+  const kpis = $("bd-kpis");
+  if (kpis) {{
+    kpis.innerHTML = [
+      `<div class="kpi"><div class="v">${{s.rows_total || 0}}</div><div class="l">trigger evals (window)</div></div>`,
+      `<div class="kpi"><div class="v">${{s.would_fire_total || 0}}</div><div class="l">would-fire (window)</div></div>`,
+      `<div class="kpi"><div class="v">${{s.would_fire_today || 0}}</div><div class="l">would-fire today</div></div>`,
+      `<div class="kpi"><div class="v">${{s.actually_fired_total || 0}}</div><div class="l">actually fired (window)</div></div>`,
+      `<div class="kpi"><div class="v">${{s.actually_fired_today || 0}}</div><div class="l">actually fired today</div></div>`,
+    ].join("");
+  }}
+
+  // -- Sign-off readiness --
+  const so_el = $("bd-signoff");
+  if (so_el) {{
+    const blockers = so.blockers || [];
+    const ready = !!so.ready;
+    const header = ready
+      ? '<div style="color:#22c55e;font-weight:700;margin-bottom:8px">All auto-gates clear — final eyeball check is yours.</div>'
+      : '<div style="color:#fbbf24;font-weight:700;margin-bottom:8px">Blockers (' + blockers.length + '):</div>';
+    const items = blockers.length === 0
+      ? '<div style="color:#94a3b8">No blockers detected.</div>'
+      : '<ul style="margin:0 0 0 18px;padding:0;color:#e2e8f0">' +
+          blockers.map(b => `<li style="margin-bottom:4px">${{b}}</li>`).join('') +
+        '</ul>';
+    const wf = so.would_fire_rows || 0;
+    const need = so.rows_needed || 30;
+    const pct = Math.min(100, (wf / need) * 100);
+    const bar =
+      `<div style="margin-top:10px">
+         <div style="font-size:11px;color:#94a3b8;margin-bottom:3px">
+           Would-fire rows: ${{wf}} / ${{need}}
+         </div>
+         <div style="background:#0f172a;border-radius:4px;height:8px;
+                       border:1px solid #334155;overflow:hidden">
+           <div style="height:100%;width:${{pct.toFixed(0)}}%;
+                       background:${{wf >= need ? '#22c55e' : '#3b82f6'}}"></div>
+         </div>
+       </div>`;
+    so_el.innerHTML = header + items + bar;
+  }}
+
+  // -- Classification breakdown --
+  const cls_tb = $("bd-cls-tbody");
+  if (cls_tb) {{
+    const rows = BOUNDARY.classification_counts || [];
+    if (rows.length === 0) {{
+      cls_tb.innerHTML = '<tr><td colspan="4" style="color:#64748b">No data yet</td></tr>';
+    }} else {{
+      cls_tb.innerHTML = rows.map(r => {{
+        const pct = r.n > 0 ? (100 * r.n_would_fire / r.n) : 0;
+        return `<tr>
+          <td>${{_bdClassPill(r.classification)}}</td>
+          <td class="num">${{r.n}}</td>
+          <td class="num">${{r.n_would_fire}}</td>
+          <td class="num">${{pct.toFixed(1)}}%</td>
+        </tr>`;
+      }}).join("");
+    }}
+  }}
+
+  // -- Lookahead KPIs --
+  const lk = $("bd-lookahead-kpis");
+  if (lk) {{
+    const d60   = la.avg_delta_60s;
+    const d300  = la.avg_delta_300s;
+    const p60p  = la.n_with_60s > 0   ? (100 * (la.n_positive_60s  || 0) / la.n_with_60s)  : 0;
+    const p300p = la.n_with_300s > 0  ? (100 * (la.n_positive_300s || 0) / la.n_with_300s) : 0;
+    const d60Color  = d60  != null && d60  > 0 ? "color:#22c55e" : "color:#ef4444";
+    const d300Color = d300 != null && d300 > 0 ? "color:#22c55e" : "color:#ef4444";
+    lk.innerHTML = [
+      `<div class="kpi"><div class="v" style="${{d60Color}}">${{_bdFmtDelta(d60)}}</div><div class="l">avg Δ +60s (${{la.n_with_60s || 0}} rows)</div></div>`,
+      `<div class="kpi"><div class="v" style="${{d300Color}}">${{_bdFmtDelta(d300)}}</div><div class="l">avg Δ +300s (${{la.n_with_300s || 0}} rows)</div></div>`,
+      `<div class="kpi"><div class="v">${{p60p.toFixed(0)}}%</div><div class="l">% Δ +60s > 0</div></div>`,
+      `<div class="kpi"><div class="v">${{p300p.toFixed(0)}}%</div><div class="l">% Δ +300s > 0</div></div>`,
+    ].join("");
+  }}
+
+  // -- Recent-rows table --
+  _bdRefreshCityDropdown();
+  const tb = $("bd-rows-tbody");
+  if (tb) {{
+    const all = BOUNDARY.recent_rows || [];
+    const filtered = all.filter(r => {{
+      if (BD_CITY_FILTER && r.city !== BD_CITY_FILTER) return false;
+      if (BD_CLS_FILTER && r.trigger_classification !== BD_CLS_FILTER) return false;
+      if (BD_WOULDFIRE_ONLY && !r.would_fire) return false;
+      return true;
+    }});
+    const cnt = $("bd-count");
+    if (cnt) cnt.textContent = filtered.length + " row" + (filtered.length === 1 ? "" : "s");
+    if (filtered.length === 0) {{
+      tb.innerHTML = '<tr><td colspan="17" style="color:#64748b">No rows match.</td></tr>';
+    }} else {{
+      tb.innerHTML = filtered.map(r => {{
+        const t = (r.evaluated_at_utc || "").replace("T", " ").slice(0, 19);
+        return `<tr>
+          <td class="tstamp">${{t}}</td>
+          <td>${{r.city || ""}}</td>
+          <td>${{r.event_date || ""}}</td>
+          <td>${{r.bin_label || ""}}</td>
+          <td>${{r.cycle_kind || ""}}</td>
+          <td class="num">${{r.reading_settlement != null ? Number(r.reading_settlement).toFixed(2) : "--"}}</td>
+          <td class="num">${{r.boundary_value_settlement != null ? Number(r.boundary_value_settlement).toFixed(2) : "--"}}</td>
+          <td class="num">${{_bdFmtMargin(r.margin_from_boundary)}}</td>
+          <td>${{_bdClassPill(r.trigger_classification)}}</td>
+          <td>${{r.arm_state || ""}}</td>
+          <td class="num">${{r.market_prob_at_eval != null ? Number(r.market_prob_at_eval).toFixed(3) : "--"}}</td>
+          <td class="num">${{r.market_prob_60s_later != null ? Number(r.market_prob_60s_later).toFixed(3) : "--"}}</td>
+          <td class="num">${{r.market_prob_300s_later != null ? Number(r.market_prob_300s_later).toFixed(3) : "--"}}</td>
+          <td>${{r.would_fire ? _bdBoolPill(true, "YES", "") : ""}}</td>
+          <td>${{r.actually_fired ? _bdBoolPill(true, "FIRED", "") : ""}}</td>
+          <td style="font-family:monospace;font-size:11px">${{r.actual_order_id ? r.actual_order_id.slice(0, 12) : ""}}</td>
+          <td style="font-size:11px;color:#94a3b8;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{(r.notes || "").replace(/"/g, '&quot;')}}">${{r.notes || ""}}</td>
+        </tr>`;
+      }}).join("");
+    }}
+  }}
+}}
+
+// In-tab filter wiring
+const _bdCitySel = $("bd-f-city");
+if (_bdCitySel) _bdCitySel.addEventListener("change", () => {{
+  BD_CITY_FILTER = _bdCitySel.value || "";
+  renderBoundary();
+}});
+const _bdClsSel = $("bd-f-cls");
+if (_bdClsSel) _bdClsSel.addEventListener("change", () => {{
+  BD_CLS_FILTER = _bdClsSel.value || "";
+  renderBoundary();
+}});
+const _bdWfChk = $("bd-f-wouldfire");
+if (_bdWfChk) _bdWfChk.addEventListener("change", () => {{
+  BD_WOULDFIRE_ONLY = !!_bdWfChk.checked;
+  renderBoundary();
+}});
+
 // ===== Restore persisted UI state on page load =====
 // ALWAYS call setMode/setView to force button states to match the
 // persisted MODE_FILTER/VIEW_MODE values.  Calling unconditionally
@@ -3104,12 +3684,15 @@ async function silentRefresh() {{
     const newLiveOrders = extractJsonBlob(text, "LIVE_ORDERS");
     const newLivePos    = extractJsonBlob(text, "LIVE_POSITIONS");
     const newAnalysis   = extractJsonBlob(text, "ANALYSIS");
+    const newBoundary   = extractJsonBlob(text, "BOUNDARY");
     if (newSignals === null && newLiveOrders === null
-        && newLivePos === null && newAnalysis === null) return;
+        && newLivePos === null && newAnalysis === null
+        && newBoundary === null) return;
     if (newSignals !== null)    SIGNALS = newSignals;
     if (newLiveOrders !== null) LIVE_ORDERS = newLiveOrders;
     if (newLivePos !== null)    LIVE_POSITIONS = newLivePos;
     if (newAnalysis !== null)   ANALYSIS = newAnalysis;
+    if (newBoundary !== null)   BOUNDARY = newBoundary;
     recomputeDerived();
     const onDetail = location.hash.startsWith("#detail/");
     if (onDetail) {{
@@ -3219,19 +3802,24 @@ def main() -> int:
         live_orders = load_live_orders(args.db, since)
         live_positions = fetch_live_positions()    # Polymarket data API
         analysis = load_analysis_data(args.db, lookback_days=_analysis_days)
+        boundary = load_boundary_data(args.db, lookback_days=_analysis_days)
         _pu = analysis.get("purchases", [])
         _live = sum(1 for r in _pu if int(r.get("is_paper", 0)) == 0)
         _paper = len(_pu) - _live
+        _bd_rows = len(boundary.get("recent_rows", []))
+        _bd_wf   = boundary.get("summary", {}).get("would_fire_total", 0)
         log.info(f"regenerate: {len(signals)} signals + "
                   f"{len(live_orders)} live orders + "
                   f"{len(live_positions)} live positions + "
                   f"analysis(purchases={len(_pu)} = "
-                  f"{_live} live + {_paper} paper)")
+                  f"{_live} live + {_paper} paper) + "
+                  f"boundary({_bd_rows} rows, {_bd_wf} would-fire)")
         generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         html = build_dashboard(signals, live_orders, generated_at,
                                 auto_refresh_sec=args.watch or None,
                                 live_positions=live_positions,
-                                analysis=analysis)
+                                analysis=analysis,
+                                boundary=boundary)
         os.makedirs(os.path.dirname(args.html) or ".", exist_ok=True)
         with open(args.html, "w", encoding="utf-8") as fh:
             fh.write(html)

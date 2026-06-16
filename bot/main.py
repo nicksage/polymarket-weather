@@ -1138,6 +1138,108 @@ def main():
             max_instances=1,
         )
 
+    # Boundary-crossing latency watcher (Phase 6 dry-run by default).
+    # See bot/boundary_watcher.py for the full strategy doc.
+    #
+    # Two interval jobs: one at normal cadence, one at hard-poll
+    # cadence active only in the :52-:59 minute-of-hour window when the
+    # T-group confirmation can arrive.  We can't gate APScheduler by
+    # minute-of-hour, so we run the hard-poll job continuously and let
+    # the watcher's internal `in_hard_poll_window` short-circuit when
+    # we're not in the window.  At 20s cadence outside the window the
+    # short-circuit costs almost nothing (one DB lookup of the time).
+    #
+    # CRITICAL: both jobs are wrapped in try/except so a boundary-
+    # watcher bug can NEVER crash the predictor service.  Failure
+    # mode is "watcher dies quietly, predictor keeps running."
+    try:
+        from boundary_watcher import (
+            BOUNDARY_STRATEGY_ENABLED,
+            BOUNDARY_NORMAL_POLL_SEC,
+            BOUNDARY_HARD_POLL_SEC,
+            run_boundary_watcher_tick,
+            in_hard_poll_window,
+        )
+    except Exception as _e:
+        logger.warning(f"boundary_watcher import failed: {_e} — strategy disabled")
+        BOUNDARY_STRATEGY_ENABLED = False
+
+    if BOUNDARY_STRATEGY_ENABLED:
+        def _boundary_normal_job() -> None:
+            try:
+                from datetime import datetime, timezone
+                now = datetime.now(timezone.utc)
+                # Outside hard-poll window: this is our cadence.  Inside
+                # the window: skip (the hard-poll job handles it).
+                if in_hard_poll_window(now):
+                    return
+                from db import _get_conn
+                with _get_conn() as conn:
+                    n = run_boundary_watcher_tick(conn)
+                if n:
+                    logger.info(f"[BOUNDARY] normal-tick wrote {n} trigger row(s)")
+            except Exception as e:
+                logger.exception(f"[BOUNDARY] normal-tick failed (non-fatal): {e}")
+
+        def _boundary_hard_poll_job() -> None:
+            try:
+                from datetime import datetime, timezone
+                now = datetime.now(timezone.utc)
+                # ONLY active in the :52-:59 hard-poll window.
+                if not in_hard_poll_window(now):
+                    return
+                from db import _get_conn
+                with _get_conn() as conn:
+                    n = run_boundary_watcher_tick(conn)
+                if n:
+                    logger.info(f"[BOUNDARY] hard-poll wrote {n} trigger row(s)")
+            except Exception as e:
+                logger.exception(f"[BOUNDARY] hard-poll failed (non-fatal): {e}")
+
+        def _boundary_lookahead_job() -> None:
+            """Populate market_prob_60s_later / 300s_later on rows whose
+            evaluation time is in the past — the calibration metric."""
+            try:
+                from boundary_watcher import populate_lookahead
+                from db import _get_conn
+                from polymarket import get_market_price_now  # if available
+                with _get_conn() as conn:
+                    n = populate_lookahead(conn, get_market_price_now)
+                if n:
+                    logger.debug(f"[BOUNDARY] lookahead updated {n} rows")
+            except ImportError:
+                # No get_market_price_now available — log and skip.
+                # This won't break anything; the dry-run can still
+                # collect would_fire data, just without lookahead.
+                logger.debug("[BOUNDARY] lookahead skipped: no price-fetch fn")
+            except Exception as e:
+                logger.exception(f"[BOUNDARY] lookahead failed (non-fatal): {e}")
+
+        scheduler.add_job(
+            _boundary_normal_job,
+            trigger=IntervalTrigger(seconds=BOUNDARY_NORMAL_POLL_SEC),
+            id="boundary_normal",
+            name=f"Boundary watcher (normal {BOUNDARY_NORMAL_POLL_SEC}s)",
+            misfire_grace_time=15, coalesce=True, max_instances=1,
+        )
+        scheduler.add_job(
+            _boundary_hard_poll_job,
+            trigger=IntervalTrigger(seconds=BOUNDARY_HARD_POLL_SEC),
+            id="boundary_hard_poll",
+            name=f"Boundary watcher (hard-poll {BOUNDARY_HARD_POLL_SEC}s, "
+                  f":52-:59 only)",
+            misfire_grace_time=5, coalesce=True, max_instances=1,
+        )
+        scheduler.add_job(
+            _boundary_lookahead_job,
+            trigger=IntervalTrigger(seconds=30),
+            id="boundary_lookahead",
+            name="Boundary watcher lookahead (30s)",
+            misfire_grace_time=15, coalesce=True, max_instances=1,
+        )
+        logger.info("[BOUNDARY] watcher enabled — normal=%ss hard=%ss",
+                      BOUNDARY_NORMAL_POLL_SEC, BOUNDARY_HARD_POLL_SEC)
+
     # Aggressive REST trade-fill polling -- DISABLED 2026-05-03.
     #
     # This job was doubling share counts because of a cold-start dedup

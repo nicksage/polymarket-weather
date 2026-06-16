@@ -136,33 +136,84 @@ REQUIRED_NAMES: list[str] = [
     # otherwise expensive bins silently hit MPV_MAX_PRICE=0.32 and never fill.
     "PREDICTOR_PROBABILITY_MAX_PRICE",
     "max_price_cap",                         # key in sig_for_exec dict
+
+    # --- Boundary-crossing latency strategy (2026-06-16) ---
+    # Schema additions live in scheduled_predictor's _SCHEMA_SQL.  If any
+    # of these go missing, boundary_watcher.write_trigger_log silently
+    # no-ops and we lose the entire learning signal.
+    "boundary_trigger_log",                  # table name in _SCHEMA_SQL
+    "signal_origin",                         # column on positions table
 ]
+
+# Names that must be present in bot/main.py to confirm the boundary
+# watcher is wired into the scheduler.  Without these the module loads
+# but no job fires, and the strategy silently does nothing.
+MAIN_REQUIRED_NAMES: list[str] = [
+    "boundary_watcher",                      # import line
+    "run_boundary_watcher_tick",             # function called from jobs
+    "BOUNDARY_STRATEGY_ENABLED",             # gate check
+    "_boundary_normal_job",                  # APScheduler job
+    "_boundary_hard_poll_job",               # APScheduler job
+]
+
+# Names that must be present in bot/boundary_watcher.py itself.  The
+# whole module is new; if a refactor accidentally deletes a critical
+# helper the import succeeds (Python is forgiving) but the trigger
+# pipeline breaks at runtime in a hard-to-debug way.
+BOUNDARY_REQUIRED_NAMES: list[str] = [
+    "BOUNDARY_STRATEGY_ENABLED",
+    "BOUNDARY_DRY_RUN",
+    "BOUNDARY_MAX_ENTRY_PRICE",
+    "def compute_arming_state",
+    "def evaluate_trigger",
+    "def run_boundary_watcher_tick",
+    "def write_trigger_log",
+    "def in_hard_poll_window",
+    "def is_supported_bin",
+    "def settlement_unit_round",
+]
+
+MAIN_FILE = REPO_ROOT / "bot" / "main.py"
+BOUNDARY_FILE = REPO_ROOT / "bot" / "boundary_watcher.py"
+
+
+def _check_file(path: Path, required: list[str]) -> list[tuple[str, str]]:
+    """Return list of (file_label, missing_name) for any required name
+    not present in the file at `path`.  If the file itself is missing,
+    every required name counts as missing."""
+    label = path.name
+    if not path.exists():
+        return [(label, f"<file not found: {path}>")]
+    src = path.read_text(encoding="utf-8")
+    return [(label, n) for n in required if n not in src]
 
 
 def main() -> int:
-    if not TARGET_FILE.exists():
-        print(f"FATAL: {TARGET_FILE} not found", file=sys.stderr)
-        return 1
-
-    src = TARGET_FILE.read_text(encoding="utf-8")
-    missing = [n for n in REQUIRED_NAMES if n not in src]
+    checks = [
+        (TARGET_FILE, REQUIRED_NAMES),
+        (MAIN_FILE, MAIN_REQUIRED_NAMES),
+        (BOUNDARY_FILE, BOUNDARY_REQUIRED_NAMES),
+    ]
+    total_required = sum(len(r) for _, r in checks)
+    missing: list[tuple[str, str]] = []
+    for path, required in checks:
+        missing.extend(_check_file(path, required))
 
     if not missing:
         print(f"deploy_safety_check: PASS "
-              f"({len(REQUIRED_NAMES)} required names present in "
-              f"{TARGET_FILE.name})")
+              f"({total_required} required names present across "
+              f"{len(checks)} files)")
         return 0
 
     print("=" * 70, file=sys.stderr)
     print("DEPLOY SAFETY VIOLATION", file=sys.stderr)
     print("=" * 70, file=sys.stderr)
-    print(f"{len(missing)} required name(s) missing from {TARGET_FILE.name}:",
-          file=sys.stderr)
-    for name in missing:
-        print(f"  - {name!r}", file=sys.stderr)
+    print(f"{len(missing)} required name(s) missing:", file=sys.stderr)
+    for label, name in missing:
+        print(f"  - [{label}] {name!r}", file=sys.stderr)
     print("", file=sys.stderr)
     print("This commit would remove load-bearing functionality.  If the", file=sys.stderr)
-    print("removal is intentional, edit REQUIRED_NAMES in", file=sys.stderr)
+    print("removal is intentional, edit the relevant *_REQUIRED_NAMES list in", file=sys.stderr)
     print(f"  {Path(__file__).relative_to(REPO_ROOT)}", file=sys.stderr)
     print("in the SAME commit as the source file change.", file=sys.stderr)
     print("", file=sys.stderr)

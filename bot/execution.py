@@ -397,6 +397,12 @@ def execute_signal(signal: dict, client: ClobClient | None = None) -> dict:
         pre_entry_volatility = _pre_vol,
         pre_entry_trend      = _pre_trend,
         pre_entry_momentum   = _pre_momentum,
+        # Per-position strategy attribution.  Lets boundary_watcher
+        # rows be filtered out of predictor analytics and counted
+        # separately for the boundary daily-budget cap.  Predictor
+        # signals omit this (signal_origin=None means "predictor"
+        # by convention).
+        signal_origin        = signal.get("signal_origin"),
     )
 
     # -------------------------------------------------------------------------

@@ -375,6 +375,64 @@ CREATE TABLE IF NOT EXISTS resolution_observations (
 CREATE INDEX IF NOT EXISTS idx_ro_city_date
     ON resolution_observations(city, event_date);
 
+-- Boundary-crossing latency strategy logging.  Phase 6 of the boundary
+-- watcher (see bot/boundary_watcher.py).  EVERY trigger evaluation
+-- writes one row regardless of whether it would fire — that's how we
+-- measure the contradiction rate and the post-trigger market-move
+-- distribution before risking real capital.
+--
+-- market_prob_60s_later / _300s_later are populated by a periodic
+-- lookahead job that revisits each row N seconds after evaluation and
+-- records what Polymarket had repriced to.  These two columns are the
+-- single most important calibration metric: if would_fire rows
+-- consistently precede a favorable market move, the latency edge is
+-- real; if they don't, the strategy isn't profitable.
+--
+-- The flip from BOUNDARY_DRY_RUN=1 to =0 requires:
+--   1. >=30 would_fire rows logged
+--   2. Acceptable contradiction rate (provisional T-group disagreement)
+--   3. Favorable market_prob_60s_later - market_prob_at_eval median
+--   4. Manual operator sign-off (no auto-flip)
+CREATE TABLE IF NOT EXISTS boundary_trigger_log (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    evaluated_at_utc            TEXT NOT NULL,
+    city                        TEXT,
+    event_date                  TEXT,
+    contract_id                 TEXT,
+    bin_label                   TEXT,
+    bin_range_low               REAL,
+    bin_range_high              REAL,
+    settlement_unit             TEXT,          -- 'fahrenheit' | 'celsius'
+    cycle_timestamp_utc         TEXT,          -- the METAR cycle this eval was driven by
+    cycle_kind                  TEXT,          -- 'speci' | 't_group'
+    reading_native_c            REAL,          -- raw temperature from METAR in degC
+    reading_settlement          REAL,          -- converted + rounded in settlement unit
+    boundary_value_settlement   REAL,          -- bin's lower edge in settlement unit
+    margin_from_boundary        REAL,          -- signed distance past boundary, settlement unit
+    trigger_classification      TEXT,          -- no_signal | at_boundary | strong | confirmed | contradicted
+    arm_state                   TEXT,          -- armed | disarmed | never_armed
+    would_fire                  INTEGER,       -- 0/1 (1 = strategy would have fired live)
+    would_fire_size_usd         REAL,
+    would_fire_limit_price      REAL,
+    actually_fired              INTEGER,       -- 0/1 (always 0 in dry-run)
+    actual_order_id             TEXT,
+    conflict_with_predictor     INTEGER,       -- 0/1 = predictor already held a bin on this event
+    market_prob_at_eval         REAL,
+    market_prob_60s_later       REAL,          -- populated by lookahead job
+    market_prob_300s_later      REAL,
+    forecast_high_c             REAL,
+    forecast_peak_hour          INTEGER,
+    observed_max_c              REAL,
+    signal_origin               TEXT,          -- boundary_confirmed | boundary_strong
+    notes                       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_btl_evaluated
+    ON boundary_trigger_log(evaluated_at_utc);
+CREATE INDEX IF NOT EXISTS idx_btl_city_date
+    ON boundary_trigger_log(city, event_date);
+CREATE INDEX IF NOT EXISTS idx_btl_would_fire
+    ON boundary_trigger_log(would_fire, evaluated_at_utc);
+
 -- Invariant guard violations.  Permanent observational record of every
 -- within-day monotonicity / coherence violation surfaced by the guards
 -- in scripts/invariant_guards.py.  WRITE-ONLY from this file's perspective:
@@ -441,6 +499,14 @@ def ensure_schema() -> None:
         # FROM raw_metar_log GROUP BY temp_precision tells you what
         # fraction of obs are precision-quality at any given station.
         _add_column("raw_metar_log", "temp_precision", "TEXT")
+
+        # signal_origin: per-position strategy attribution.  Lets the
+        # boundary watcher's positions coexist with predictor positions
+        # on the same event (per-event 1-bin cap is bypassed only for
+        # boundary signals).  Values: 'predictor' (default for legacy
+        # rows), 'boundary_confirmed', 'boundary_strong'.  See
+        # boundary_watcher.py for the strategy that uses this.
+        _add_column("positions", "signal_origin", "TEXT")
         conn.commit()
 
 
