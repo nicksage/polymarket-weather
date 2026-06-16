@@ -682,6 +682,219 @@ def test_insert_position_accepts_signal_origin():
     )
 
 
+# ============================================================
+# Market-consensus override (2026-06-16): SF case where forecast
+# is 80°F but market consensus is 70-71°F at 96%.  Forecast-anchored
+# logic would pick 82-83 (unreachable today); override should pick
+# 72-73 (just above consensus).
+# ============================================================
+
+def _make_signals_conn():
+    """In-memory DB with paper_predictor_signals seeded so
+    find_candidate_bin can run against it."""
+    conn = _sqlite3.connect(":memory:")
+    conn.execute("""
+        CREATE TABLE paper_predictor_signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scanned_at_utc  TEXT NOT NULL,
+            city            TEXT NOT NULL,
+            event_date      TEXT,
+            contract_id     TEXT,
+            yes_token_id    TEXT,
+            bin_label       TEXT,
+            bin_range_low   REAL,
+            bin_range_high  REAL,
+            unit            TEXT,
+            market_prob     REAL,
+            liquidity_usd   REAL
+        )
+    """)
+    return conn
+
+
+def _seed_sf_bins(conn):
+    """Seed San Francisco 2026-06-16 with the bin set from the real
+    Polymarket market: 65 -> 84+ in 2°F increments, with 70-71 at 96%."""
+    bins = [
+        # (label, lo, hi, market_prob)
+        ("65F-or-below", 65, 65, 0.005),   # 1°F bin — gets filtered by is_supported_bin
+        ("66-67F", 66, 67, 0.005),
+        ("68-69F", 68, 69, 0.005),
+        ("70-71F", 70, 71, 0.96),          # the consensus bin
+        ("72-73F", 72, 73, 0.02),          # the candidate in override mode
+        ("74-75F", 74, 75, 0.05),
+        ("76-77F", 76, 77, 0.01),
+        ("78-79F", 78, 79, 0.005),
+        ("80-81F", 80, 81, 0.005),         # forecast bin (forecast=80°F)
+        ("82-83F", 82, 83, 0.005),         # forecast-anchored candidate
+        ("84F-or-above", 84, 84, 0.005),   # 1°F bin — filtered
+    ]
+    for label, lo, hi, mp in bins:
+        conn.execute(
+            "INSERT INTO paper_predictor_signals "
+            "(scanned_at_utc, city, event_date, contract_id, yes_token_id, "
+            " bin_label, bin_range_low, bin_range_high, unit, "
+            " market_prob, liquidity_usd) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("2026-06-16T12:00:00+00:00", "San Francisco", "2026-06-16",
+             f"0xCONT{lo}", f"tok-{lo}", label, lo, hi, "fahrenheit",
+             mp, 500.0),
+        )
+    conn.commit()
+
+
+class TestConsensusOverride:
+    """SF case: forecast=80°F (≈26.7°C); consensus=70-71°F at 96%."""
+
+    SF_FORECAST_C = (80 - 32) * 5/9   # ≈ 26.667
+
+    def test_override_disabled_default_picks_forecast_bin(self, monkeypatch):
+        """With BOUNDARY_CONSENSUS_OVERRIDE_ENABLED=0 (default), the
+        SF case picks 82-83°F (the bin just above the 80°F forecast).
+        This is the pre-override behavior — must NOT change for callers
+        who don't opt in."""
+        monkeypatch.setattr(bw, "BOUNDARY_CONSENSUS_OVERRIDE_ENABLED", False)
+        conn = _make_signals_conn()
+        _seed_sf_bins(conn)
+        from boundary_watcher import find_candidate_bin
+        cand = find_candidate_bin(conn, "San Francisco", "2026-06-16",
+                                       self.SF_FORECAST_C)
+        assert cand is not None
+        assert cand["bin_label"] == "82-83F"
+        assert cand["anchor_mode"] == "forecast"
+
+    def test_override_enabled_picks_above_consensus(self, monkeypatch):
+        """With override ON, the SF case picks 72-73°F (just above
+        the 70-71 consensus bin) — NOT the forecast-anchored 82-83."""
+        monkeypatch.setattr(bw, "BOUNDARY_CONSENSUS_OVERRIDE_ENABLED", True)
+        monkeypatch.setattr(bw, "BOUNDARY_CONSENSUS_OVERRIDE_THRESHOLD", 0.70)
+        conn = _make_signals_conn()
+        _seed_sf_bins(conn)
+        from boundary_watcher import find_candidate_bin
+        cand = find_candidate_bin(conn, "San Francisco", "2026-06-16",
+                                       self.SF_FORECAST_C)
+        assert cand is not None
+        assert cand["bin_label"] == "72-73F"
+        assert cand["anchor_mode"] == "market_consensus"
+        # Override metadata surfaced so the dashboard can show it
+        assert cand["consensus_bin_label"] == "70-71F"
+        assert abs(cand["consensus_market_prob"] - 0.96) < 1e-6
+
+    def test_override_skipped_when_max_market_p_below_threshold(self, monkeypatch):
+        """If no bin reaches the consensus threshold (e.g., dispersed
+        market), override does NOT trigger — falls through to forecast."""
+        monkeypatch.setattr(bw, "BOUNDARY_CONSENSUS_OVERRIDE_ENABLED", True)
+        monkeypatch.setattr(bw, "BOUNDARY_CONSENSUS_OVERRIDE_THRESHOLD", 0.99)
+        # Above threshold is 0.99 but max bin is 0.96 → no override
+        conn = _make_signals_conn()
+        _seed_sf_bins(conn)
+        from boundary_watcher import find_candidate_bin
+        cand = find_candidate_bin(conn, "San Francisco", "2026-06-16",
+                                       self.SF_FORECAST_C)
+        assert cand is not None
+        assert cand["anchor_mode"] == "forecast"
+        assert cand["bin_label"] == "82-83F"
+
+    def test_override_skipped_when_consensus_agrees_with_forecast(self, monkeypatch):
+        """If consensus bin is the forecast bin (or higher), override
+        does NOT apply — the original forecast logic already does the
+        right thing in that case.  Forecast 70°F + consensus 70-71°F
+        → no override (they agree)."""
+        monkeypatch.setattr(bw, "BOUNDARY_CONSENSUS_OVERRIDE_ENABLED", True)
+        monkeypatch.setattr(bw, "BOUNDARY_CONSENSUS_OVERRIDE_THRESHOLD", 0.70)
+        conn = _make_signals_conn()
+        _seed_sf_bins(conn)
+        forecast_70c = (70 - 32) * 5/9   # ≈ 21.1°C
+        from boundary_watcher import find_candidate_bin
+        cand = find_candidate_bin(conn, "San Francisco", "2026-06-16",
+                                       forecast_70c)
+        assert cand is not None
+        # Consensus upper edge is 71.5°F; forecast is 70°F → consensus
+        # upper is ABOVE forecast → "agrees", no override → forecast
+        # picks the bin just above 70°F boundary, which is 72-73.
+        assert cand["anchor_mode"] == "forecast"
+
+    def test_arming_consensus_mode_uses_observed_max_gate(self, monkeypatch):
+        """In market_consensus mode, the arming gate is observed_max
+        within OBS_MARGIN of the boundary — NOT the forecast-margin
+        gate.  An SF-style event with forecast 80°F (way above the new
+        72-73 boundary) but observed_max 70°F should ARM."""
+        monkeypatch.setattr(bw, "BOUNDARY_ARM_OBS_MARGIN_F", 3.0)
+        monkeypatch.setattr(bw, "BOUNDARY_ARM_MAX_MARKET_PRICE", 0.05)
+        from boundary_watcher import compute_arming_state
+        st = compute_arming_state(
+            forecast_high_c     = 26.67,         # 80°F — way above boundary
+            forecast_peak_hour  = 15,
+            current_local_hour  = 12,
+            settlement_unit     = "fahrenheit",
+            candidate_bin_lo    = 72.0,
+            candidate_bin_hi    = 73.0,
+            candidate_market_p  = 0.02,
+            observed_max_c      = (70 - 32) * 5/9,   # 70°F, 1.5°F below 71.5 boundary
+            anchor_mode         = "market_consensus",
+        )
+        assert st.armed is True, f"should arm; got reason={st.reason!r}"
+
+    def test_arming_consensus_mode_rejects_observed_too_far(self, monkeypatch):
+        """Same setup but observed_max 60°F — too far below the
+        71.5°F boundary (margin 11.5°F > 3°F threshold).  Reject."""
+        monkeypatch.setattr(bw, "BOUNDARY_ARM_OBS_MARGIN_F", 3.0)
+        monkeypatch.setattr(bw, "BOUNDARY_ARM_MAX_MARKET_PRICE", 0.05)
+        from boundary_watcher import compute_arming_state
+        st = compute_arming_state(
+            forecast_high_c     = 26.67,
+            forecast_peak_hour  = 15,
+            current_local_hour  = 12,
+            settlement_unit     = "fahrenheit",
+            candidate_bin_lo    = 72.0,
+            candidate_bin_hi    = 73.0,
+            candidate_market_p  = 0.02,
+            observed_max_c      = (60 - 32) * 5/9,   # 60°F
+            anchor_mode         = "market_consensus",
+        )
+        assert st.armed is False
+        assert "observed_too_far_below_boundary" in st.reason
+
+    def test_arming_consensus_mode_rejects_observed_at_boundary(self, monkeypatch):
+        """If observed_max is already AT or ABOVE the boundary, the
+        market already saw it — no latency edge left.  Reject."""
+        monkeypatch.setattr(bw, "BOUNDARY_ARM_OBS_MARGIN_F", 3.0)
+        from boundary_watcher import compute_arming_state
+        st = compute_arming_state(
+            forecast_high_c     = 26.67,
+            forecast_peak_hour  = 15,
+            current_local_hour  = 12,
+            settlement_unit     = "fahrenheit",
+            candidate_bin_lo    = 72.0,
+            candidate_bin_hi    = 73.0,
+            candidate_market_p  = 0.02,
+            observed_max_c      = (72 - 32) * 5/9,   # 72°F, already past 71.5
+            anchor_mode         = "market_consensus",
+        )
+        assert st.armed is False
+        assert "observed_already_at_or_above_boundary" in st.reason
+
+    def test_arming_default_mode_unchanged(self, monkeypatch):
+        """Regression: arming with anchor_mode='forecast' (default)
+        MUST behave identically to pre-override code.  No accidental
+        cross-contamination from the new branch."""
+        from boundary_watcher import compute_arming_state
+        # Forecast 93.2°F = 34°C, boundary 93.5°F (94-95 bin) → margin
+        # 0.3°F, within 0.9°F threshold → should arm.
+        st = compute_arming_state(
+            forecast_high_c     = 34.0,
+            forecast_peak_hour  = 15,
+            current_local_hour  = 12,
+            settlement_unit     = "fahrenheit",
+            candidate_bin_lo    = 94.0,
+            candidate_bin_hi    = 95.0,
+            candidate_market_p  = 0.02,
+            observed_max_c      = 30.0,
+            # anchor_mode omitted → defaults to "forecast"
+        )
+        assert st.armed is True
+
+
 def test_execute_signal_threads_signal_origin():
     """The execute_signal function must read signal.get('signal_origin')
     into position_kwargs.  Without this the position row gets a NULL

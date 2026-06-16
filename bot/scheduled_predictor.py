@@ -424,6 +424,7 @@ CREATE TABLE IF NOT EXISTS boundary_trigger_log (
     forecast_peak_hour          INTEGER,
     observed_max_c              REAL,
     signal_origin               TEXT,          -- boundary_confirmed | boundary_strong
+    anchor_mode                 TEXT,          -- forecast | market_consensus (which rule picked the bin)
     notes                       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_btl_evaluated
@@ -507,6 +508,14 @@ def ensure_schema() -> None:
         # rows), 'boundary_confirmed', 'boundary_strong'.  See
         # boundary_watcher.py for the strategy that uses this.
         _add_column("positions", "signal_origin", "TEXT")
+        # anchor_mode: per boundary-trigger row, which selection rule
+        # picked the bin.  'forecast' (default; bin just above forecast)
+        # or 'market_consensus' (override path; bin just above a high-
+        # confidence consensus bin that disagrees with forecast).  Lets
+        # the dry-run sign-off measure the two modes' EV separately —
+        # they have very different shapes and shouldn't be mixed in the
+        # lookahead-delta distribution.
+        _add_column("boundary_trigger_log", "anchor_mode", "TEXT")
         conn.commit()
 
 

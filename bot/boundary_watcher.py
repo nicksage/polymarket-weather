@@ -162,6 +162,30 @@ BOUNDARY_REPRICE_LOOKAHEAD_SEC = int(
 BOUNDARY_REPRICE_LOOKAHEAD_LONG_SEC = int(
     os.getenv("BOUNDARY_REPRICE_LOOKAHEAD_LONG_SEC", "300"))
 
+# --- Market-consensus override (2026-06-16) ---------------------------
+# Original strategy anchored the candidate bin to the forecast.  When the
+# forecast is wildly wrong (e.g., SF forecast 80°F but market consensus
+# is 70-71°F at 96%), the forecast-anchored candidate (82-83°F, boundary
+# 81.5°F) is unreachable and the watcher silently does nothing.
+#
+# Consensus override: when one bin's market_prob exceeds the threshold AND
+# that bin sits BELOW the forecast bin, switch the anchor to the consensus
+# bin.  Candidate becomes the bin just above consensus (in the SF example:
+# 72-73°F, boundary 71.5°F — a realistic latency-arb target if the day
+# unexpectedly spikes).
+#
+# Default DISABLED.  Enable per-deployment so the new mode's EV can be
+# measured in dry-run lookahead BEFORE turning it on for live execution.
+BOUNDARY_CONSENSUS_OVERRIDE_ENABLED = bool(int(
+    os.getenv("BOUNDARY_CONSENSUS_OVERRIDE_ENABLED", "0")))
+BOUNDARY_CONSENSUS_OVERRIDE_THRESHOLD = float(
+    os.getenv("BOUNDARY_CONSENSUS_OVERRIDE_THRESHOLD", "0.70"))
+# Arming gate for override mode: observed_max must be within this many
+# °F BELOW the candidate boundary.  Replaces the forecast-margin gate
+# (which makes no sense when forecast is far above the new boundary).
+BOUNDARY_ARM_OBS_MARGIN_F = float(
+    os.getenv("BOUNDARY_ARM_OBS_MARGIN_F", "3.0"))
+
 
 # ===========================================================================
 # Pure unit-handling helpers (testable in isolation)
@@ -252,13 +276,26 @@ def compute_arming_state(
     candidate_bin_hi:    float,
     candidate_market_p:  float,
     observed_max_c:      float,
+    anchor_mode:         str = "forecast",
 ) -> ArmingState:
     """Decide whether to arm a watcher for (city, event, candidate_bin).
 
-    Caller is responsible for selecting the candidate bin as "the next
-    bin above the forecast" (the bin whose lower edge is the smallest
-    value > forecast in settlement units).  We don't pick the bin
-    here — we just validate it.
+    Caller is responsible for selecting the candidate bin (see
+    find_candidate_bin).  The `anchor_mode` parameter tells us which
+    rule was used so we can apply the right arming gate:
+
+    - 'forecast' (default): the candidate is the bin just above the
+      forecast.  Arming requires the forecast itself to be within
+      BOUNDARY_ARM_FORECAST_MARGIN_C of the boundary — otherwise the
+      forecast says we're nowhere near, and there's no edge to capture.
+
+    - 'market_consensus': the forecast is far off and we're targeting
+      a bin above the market's consensus instead.  Forecast-margin gate
+      doesn't apply (forecast is wildly above the new boundary by
+      construction).  Replace with: observed_max must be within
+      BOUNDARY_ARM_OBS_MARGIN_F of the boundary — that's what tells us
+      reality is actually close enough to make a surprise crossing
+      plausible.
     """
     # Bin must be one we support (US 2°F)
     if not is_supported_bin(candidate_bin_lo, candidate_bin_hi, settlement_unit):
@@ -268,24 +305,49 @@ def compute_arming_state(
     bin_range = bin_settlement_range(candidate_bin_lo, candidate_bin_hi,
                                          settlement_unit)
     boundary  = bin_range[0]
-    fc_in_settlement = reading_in_settlement_unit(forecast_high_c,
-                                                     settlement_unit)
-    # Forecast must be BELOW the boundary (above-boundary forecast =
-    # no latency-arb shape; the market has already priced the bin in).
-    if fc_in_settlement >= boundary:
-        return ArmingState(False, "forecast_at_or_above_boundary",
-                              candidate_bin_lo, candidate_bin_hi, boundary)
-    # And forecast must be WITHIN margin of the boundary
-    fc_margin_settlement = boundary - fc_in_settlement
-    margin_unit = (BOUNDARY_ARM_FORECAST_MARGIN_C
-                   if str(settlement_unit).lower() == "celsius"
-                   else BOUNDARY_ARM_FORECAST_MARGIN_C * 9.0 / 5.0)
-    if fc_margin_settlement > margin_unit:
-        return ArmingState(False,
-            f"forecast_too_far_below_boundary "
-            f"({fc_margin_settlement:.2f} > {margin_unit:.2f})",
-            candidate_bin_lo, candidate_bin_hi, boundary)
 
+    # --- Anchor-specific "is the temperature close enough?" gate ----
+    if anchor_mode == "market_consensus":
+        # Override mode: gate on observed_max, NOT on forecast.  The
+        # forecast is far above the new boundary by definition of
+        # how this candidate was picked.
+        if observed_max_c is None or observed_max_c <= -50:
+            return ArmingState(False, "no_observed_max",
+                                  candidate_bin_lo, candidate_bin_hi, boundary)
+        obs_in_settlement = reading_in_settlement_unit(observed_max_c,
+                                                         settlement_unit)
+        obs_margin = boundary - obs_in_settlement
+        if obs_margin <= 0:
+            # Temp already at/above boundary — market already saw it,
+            # no latency edge.
+            return ArmingState(False, "observed_already_at_or_above_boundary",
+                                  candidate_bin_lo, candidate_bin_hi, boundary)
+        margin_unit = (BOUNDARY_ARM_OBS_MARGIN_F * 5.0 / 9.0
+                        if str(settlement_unit).lower() == "celsius"
+                        else BOUNDARY_ARM_OBS_MARGIN_F)
+        if obs_margin > margin_unit:
+            return ArmingState(False,
+                f"observed_too_far_below_boundary "
+                f"({obs_margin:.2f} > {margin_unit:.2f})",
+                candidate_bin_lo, candidate_bin_hi, boundary)
+    else:
+        # Default forecast mode: gate on forecast vs boundary.
+        fc_in_settlement = reading_in_settlement_unit(forecast_high_c,
+                                                         settlement_unit)
+        if fc_in_settlement >= boundary:
+            return ArmingState(False, "forecast_at_or_above_boundary",
+                                  candidate_bin_lo, candidate_bin_hi, boundary)
+        fc_margin_settlement = boundary - fc_in_settlement
+        margin_unit = (BOUNDARY_ARM_FORECAST_MARGIN_C
+                       if str(settlement_unit).lower() == "celsius"
+                       else BOUNDARY_ARM_FORECAST_MARGIN_C * 9.0 / 5.0)
+        if fc_margin_settlement > margin_unit:
+            return ArmingState(False,
+                f"forecast_too_far_below_boundary "
+                f"({fc_margin_settlement:.2f} > {margin_unit:.2f})",
+                candidate_bin_lo, candidate_bin_hi, boundary)
+
+    # --- Mode-independent gates -------------------------------------
     # Next-bin must be underpriced
     if candidate_market_p is None:
         return ArmingState(False, "no_market_p", candidate_bin_lo,
@@ -790,14 +852,27 @@ def _execute_boundary_fire(
 def find_candidate_bin(conn: sqlite3.Connection, city: str,
                           event_date: str, forecast_high_c: float,
                           ) -> Optional[dict]:
-    """Find the single 'next bin above forecast' for this event.
+    """Pick the single bin the watcher will target for this event.
 
-    Returns a dict with bin metadata + latest market_prob, or None if no
-    eligible bin exists.  Uses the latest scan's bin set so the prices
-    are fresh; ties broken by lowest range_low (the closest bin above
-    the forecast).
+    Returns a dict including bin metadata, latest market_prob, and an
+    `anchor_mode` field ('forecast' or 'market_consensus') indicating
+    which rule selected the bin.  Returns None if no eligible bin exists.
+
+    Selection rules (in priority order):
+
+    1. **Market-consensus override** (when
+       BOUNDARY_CONSENSUS_OVERRIDE_ENABLED): if any bin has
+       market_prob >= THRESHOLD (default 0.70) AND that bin's UPPER edge
+       sits below the forecast bin's lower edge, anchor on the consensus
+       bin and return the bin just above its upper edge.
+
+    2. **Forecast-anchored** (default): return the closest bin whose
+       lower edge sits above the forecast.
+
+    Ties broken by lowest range_low (the closest unfilled bin above the
+    anchor).  Override is gated by an env flag so the new mode can be
+    measured in dry-run before being enabled for live.
     """
-    forecast_f = c_to_f(forecast_high_c)
     try:
         rows = conn.execute(
             """
@@ -817,33 +892,74 @@ def find_candidate_bin(conn: sqlite3.Connection, city: str,
         ).fetchall()
     except sqlite3.OperationalError:
         return None
-    # Filter: bins whose lower-edge settlement value > forecast.  Pick the
-    # smallest such — the closest unfilled bin above the forecast.
-    candidates = []
+
+    # Build the full bin list once — both override and default rules
+    # iterate over it.
+    all_bins = []
     for r in rows:
         cid, tok, lbl, lo, hi, unit, mkt, liq = r
         if not is_supported_bin(lo, hi, unit):
             continue
         boundary = bin_settlement_range(lo, hi, unit)[0]
-        fc_settlement = (forecast_f if str(unit).lower() == "fahrenheit"
+        all_bins.append({
+            "contract_id":  cid,
+            "yes_token_id": tok,
+            "bin_label":    lbl,
+            "bin_range_low": float(lo),
+            "bin_range_high": float(hi),
+            "unit":         unit,
+            "market_prob":  float(mkt) if mkt is not None else None,
+            "liquidity_usd": float(liq) if liq is not None else None,
+            "boundary":     boundary,
+        })
+    if not all_bins:
+        return None
+
+    forecast_f = c_to_f(forecast_high_c)
+
+    # --- Rule 1: consensus override ----------------------------------
+    # Triggers ONLY when (a) the override flag is on, (b) some bin has
+    # market_prob >= threshold, AND (c) that bin's upper edge sits
+    # below the forecast (i.e., market and forecast disagree).  When
+    # they agree, fall through to the original forecast logic.
+    if BOUNDARY_CONSENSUS_OVERRIDE_ENABLED:
+        with_prob = [b for b in all_bins if b["market_prob"] is not None]
+        if with_prob:
+            consensus = max(with_prob, key=lambda b: b["market_prob"])
+            if consensus["market_prob"] >= BOUNDARY_CONSENSUS_OVERRIDE_THRESHOLD:
+                unit = consensus["unit"]
+                fc_settlement = (forecast_f if str(unit).lower() == "fahrenheit"
+                                  else float(forecast_high_c))
+                cons_upper_settlement = bin_settlement_range(
+                    consensus["bin_range_low"], consensus["bin_range_high"],
+                    unit)[1]
+                if cons_upper_settlement < fc_settlement:
+                    above = [b for b in all_bins
+                              if b["bin_range_low"] > consensus["bin_range_high"]]
+                    if above:
+                        above.sort(key=lambda b: b["boundary"])
+                        chosen = dict(above[0])
+                        chosen["anchor_mode"]           = "market_consensus"
+                        chosen["consensus_bin_label"]   = consensus["bin_label"]
+                        chosen["consensus_market_prob"] = consensus["market_prob"]
+                        return chosen
+                    # Else: consensus IS the highest bin — no "above"
+                    # candidate.  Fall through to forecast logic, which
+                    # will return None for the same reason.
+
+    # --- Rule 2: forecast-anchored (default) -------------------------
+    candidates = []
+    for b in all_bins:
+        fc_settlement = (forecast_f if str(b["unit"]).lower() == "fahrenheit"
                          else float(forecast_high_c))
-        if boundary > fc_settlement:
-            candidates.append({
-                "contract_id":  cid,
-                "yes_token_id": tok,
-                "bin_label":    lbl,
-                "bin_range_low": float(lo),
-                "bin_range_high": float(hi),
-                "unit":         unit,
-                "market_prob":  float(mkt) if mkt is not None else None,
-                "liquidity_usd": float(liq) if liq is not None else None,
-                "boundary":     boundary,
-            })
+        if b["boundary"] > fc_settlement:
+            candidates.append(b)
     if not candidates:
         return None
-    # Smallest boundary = closest above forecast = the one in play first
     candidates.sort(key=lambda c: c["boundary"])
-    return candidates[0]
+    chosen = dict(candidates[0])
+    chosen["anchor_mode"] = "forecast"
+    return chosen
 
 
 def latest_metar_cycle(conn: sqlite3.Connection, icao: str,
@@ -897,7 +1013,8 @@ def evaluate_one_event(
     candidate = find_candidate_bin(conn, city, event_date, forecast_high_c)
     if not candidate:
         return None
-    # Check arming
+    # Check arming — anchor_mode comes from find_candidate_bin (defaults
+    # to 'forecast' when consensus override didn't apply).
     arm = compute_arming_state(
         forecast_high_c     = forecast_high_c,
         forecast_peak_hour  = forecast_peak_hour,
@@ -905,6 +1022,7 @@ def evaluate_one_event(
         settlement_unit     = candidate["unit"],
         candidate_bin_lo    = candidate["bin_range_low"],
         candidate_bin_hi    = candidate["bin_range_high"],
+        anchor_mode         = candidate.get("anchor_mode", "forecast"),
         candidate_market_p  = candidate["market_prob"] or 0,
         observed_max_c      = observed_max_c if observed_max_c is not None else -100,
     )
@@ -933,6 +1051,7 @@ def evaluate_one_event(
             "forecast_high_c":            forecast_high_c,
             "forecast_peak_hour":         forecast_peak_hour,
             "observed_max_c":             observed_max_c,
+            "anchor_mode":                candidate.get("anchor_mode", "forecast"),
             "notes":                      "no_metar_cycle_available",
         }
         return write_trigger_log(conn, row)
@@ -1018,6 +1137,7 @@ def evaluate_one_event(
         "forecast_peak_hour":         forecast_peak_hour,
         "observed_max_c":             observed_max_c,
         "signal_origin":              signal_origin,
+        "anchor_mode":                candidate.get("anchor_mode", "forecast"),
         "notes":                      (f"arm={arm.reason}; trigger={tr.notes}"
                                          f"{arm_note_suffix}"
                                          + (f"; exec={exec_result.get('exec_notes', '')}"

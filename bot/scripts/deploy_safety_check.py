@@ -143,6 +143,7 @@ REQUIRED_NAMES: list[str] = [
     # no-ops and we lose the entire learning signal.
     "boundary_trigger_log",                  # table name in _SCHEMA_SQL
     "signal_origin",                         # column on positions table
+    "anchor_mode",                           # column on boundary_trigger_log
 ]
 
 # Names that must be present in bot/main.py to confirm the boundary
@@ -164,6 +165,9 @@ BOUNDARY_REQUIRED_NAMES: list[str] = [
     "BOUNDARY_STRATEGY_ENABLED",
     "BOUNDARY_DRY_RUN",
     "BOUNDARY_MAX_ENTRY_PRICE",
+    "BOUNDARY_CONSENSUS_OVERRIDE_ENABLED",
+    "BOUNDARY_CONSENSUS_OVERRIDE_THRESHOLD",
+    "BOUNDARY_ARM_OBS_MARGIN_F",
     "def compute_arming_state",
     "def evaluate_trigger",
     "def run_boundary_watcher_tick",
@@ -171,6 +175,9 @@ BOUNDARY_REQUIRED_NAMES: list[str] = [
     "def in_hard_poll_window",
     "def is_supported_bin",
     "def settlement_unit_round",
+    "def find_candidate_bin",
+    "anchor_mode",                           # logged in trigger row dict
+    "market_consensus",                      # the new anchor mode value
 ]
 
 MAIN_FILE = REPO_ROOT / "bot" / "main.py"

@@ -859,8 +859,14 @@ def _load_boundary_eligibility(conn: sqlite3.Connection) -> list:
                 pass
 
         boundary = cand.get("boundary")
-        margin = (boundary - fc_settlement) if (boundary is not None
-                                                  and fc_settlement is not None) else None
+        margin_to_forecast = (boundary - fc_settlement) if (boundary is not None
+                                                              and fc_settlement is not None) else None
+        margin_to_observed = (boundary - obs_settlement) if (boundary is not None
+                                                                and obs_settlement is not None) else None
+        # In market_consensus mode the gate cares about observed_max,
+        # not forecast — surface the relevant margin in the display.
+        anchor = cand.get("anchor_mode", "forecast")
+        margin = margin_to_observed if anchor == "market_consensus" else margin_to_forecast
 
         # Apply the real arming gate
         arm = compute_arming_state(
@@ -879,6 +885,9 @@ def _load_boundary_eligibility(conn: sqlite3.Connection) -> list:
             "event_date": event_date,
             "armed": bool(arm.armed),
             "reason": arm.reason,
+            "anchor_mode":           cand.get("anchor_mode", "forecast"),
+            "consensus_bin_label":   cand.get("consensus_bin_label"),
+            "consensus_market_prob": cand.get("consensus_market_prob"),
             "candidate_bin_label":   cand.get("bin_label"),
             "candidate_bin_lo":      cand.get("bin_range_low"),
             "candidate_bin_hi":      cand.get("bin_range_high"),
@@ -1109,7 +1118,7 @@ def load_boundary_data(db: str, lookback_days: int = 30) -> dict:
                 "  conflict_with_predictor, "
                 "  market_prob_at_eval, market_prob_60s_later, market_prob_300s_later, "
                 "  forecast_high_c, forecast_peak_hour, observed_max_c, "
-                "  signal_origin, notes "
+                "  signal_origin, anchor_mode, notes "
                 "FROM boundary_trigger_log "
                 "WHERE evaluated_at_utc >= ? "
                 "ORDER BY evaluated_at_utc DESC LIMIT 200",
@@ -1644,10 +1653,11 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
         <th>City</th>
         <th>Event date</th>
         <th>Status</th>
-        <th title="The 'next bin above forecast' the watcher would arm against">Candidate bin</th>
+        <th title="forecast = bin just above forecast; market_consensus = override path (bin just above a high-confidence consensus bin that disagrees with forecast)">Anchor</th>
+        <th title="The bin the watcher would arm against">Candidate bin</th>
         <th title="Lower edge of the candidate bin in settlement units (°F for US)">Boundary</th>
         <th title="Forecast high in settlement units (°F for US)">Forecast</th>
-        <th title="How far below the boundary the current forecast sits — must be ≤ 0.5°C (~0.9°F) to arm">Margin to boundary</th>
+        <th title="In forecast mode: forecast must be ≤ 0.9°F below boundary. In market_consensus mode: observed_max must be ≤ 3°F below boundary.">Margin to boundary</th>
         <th title="Latest market price on YES for the candidate bin — must be ≤ 0.05 to arm">Mkt p</th>
         <th title="Observed daily-high so far in settlement units">Observed max</th>
         <th title="Local clock hour at last scan / forecast peak hour">Time</th>
@@ -1732,6 +1742,7 @@ def build_dashboard(signals: list[dict], live_orders: list[dict],
         <th>City</th>
         <th>Event date</th>
         <th>Bin</th>
+        <th title="forecast = bin just above forecast; consensus = override path">Anchor</th>
         <th>Cycle</th>
         <th title="Settlement-unit reading (e.g., °F for US bins)">Reading</th>
         <th>Boundary</th>
@@ -3679,7 +3690,7 @@ function renderBoundary() {{
   const eligTb = $("bd-elig-tbody");
   if (eligTb) {{
     if (elig.length === 0) {{
-      eligTb.innerHTML = '<tr><td colspan="11" style="color:#64748b">' +
+      eligTb.innerHTML = '<tr><td colspan="12" style="color:#64748b">' +
         'No predictor scans for today yet, or boundary_watcher module ' +
         'not importable on this host.</td></tr>';
     }} else {{
@@ -3689,6 +3700,18 @@ function renderBoundary() {{
           : '<span style="background:#475569;color:#cbd5e1;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600">--</span>';
         const unit = r.settlement_unit === "fahrenheit" ? "°F" :
                      (r.settlement_unit === "celsius" ? "°C" : "");
+        // Anchor pill: 'forecast' is the default (gray); 'market_consensus'
+        // is the override (purple, with tooltip showing the consensus bin)
+        const anchor = r.anchor_mode || "forecast";
+        let anchorPill;
+        if (anchor === "market_consensus") {{
+          const tip = (r.consensus_bin_label && r.consensus_market_prob != null)
+            ? `consensus: ${{r.consensus_bin_label}} @ ${{(Number(r.consensus_market_prob)*100).toFixed(0)}}%`
+            : "consensus override";
+          anchorPill = `<span title="${{tip}}" style="background:#7c3aed;color:white;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700;font-family:monospace">consensus</span>`;
+        }} else {{
+          anchorPill = '<span style="background:#475569;color:#cbd5e1;padding:1px 6px;border-radius:4px;font-size:10px;font-family:monospace">forecast</span>';
+        }}
         const bin = r.candidate_bin_label
           ? `<b>${{r.candidate_bin_label}}</b>`
           : '<span style="color:#94a3b8">--</span>';
@@ -3698,12 +3721,20 @@ function renderBoundary() {{
         const fc = r.forecast_high_settlement != null
           ? Number(r.forecast_high_settlement).toFixed(1) + unit
           : (r.forecast_high_c != null ? Number(r.forecast_high_c).toFixed(1) + "°C" : "--");
-        // Margin: positive = forecast below boundary; color by arming threshold
+        // Margin: in forecast mode = boundary - forecast; in consensus
+        // mode = boundary - observed_max (server computed the right one).
+        // Color by which arming threshold applies in each mode.
         let marginCell = '<span style="color:#94a3b8">--</span>';
         if (r.margin_to_boundary != null) {{
           const m = Number(r.margin_to_boundary);
-          // 0.5°C ≈ 0.9°F is the arming margin for °F bins; show in unit
-          const threshold = (r.settlement_unit === "fahrenheit") ? 0.9 : 0.5;
+          let threshold;
+          if (anchor === "market_consensus") {{
+            // BOUNDARY_ARM_OBS_MARGIN_F default 3.0°F
+            threshold = (r.settlement_unit === "fahrenheit") ? 3.0 : (3.0 * 5/9);
+          }} else {{
+            // BOUNDARY_ARM_FORECAST_MARGIN_C default 0.5°C ≈ 0.9°F
+            threshold = (r.settlement_unit === "fahrenheit") ? 0.9 : 0.5;
+          }}
           const c = (m > 0 && m <= threshold) ? "#22c55e" :
                     (m > 0 && m <= threshold * 2) ? "#fbbf24" : "#94a3b8";
           const sign = m > 0 ? "+" : "";
@@ -3728,6 +3759,7 @@ function renderBoundary() {{
           <td><b>${{r.city || ""}}</b></td>
           <td>${{r.event_date || ""}}</td>
           <td>${{armedPill}}</td>
+          <td>${{anchorPill}}</td>
           <td>${{bin}}</td>
           <td class="num">${{boundary}}</td>
           <td class="num">${{fc}}</td>
@@ -3833,15 +3865,20 @@ function renderBoundary() {{
     const cnt = $("bd-count");
     if (cnt) cnt.textContent = filtered.length + " row" + (filtered.length === 1 ? "" : "s");
     if (filtered.length === 0) {{
-      tb.innerHTML = '<tr><td colspan="17" style="color:#64748b">No rows match.</td></tr>';
+      tb.innerHTML = '<tr><td colspan="18" style="color:#64748b">No rows match.</td></tr>';
     }} else {{
       tb.innerHTML = filtered.map(r => {{
         const t = (r.evaluated_at_utc || "").replace("T", " ").slice(0, 19);
+        const anc = r.anchor_mode || "forecast";
+        const ancCell = anc === "market_consensus"
+          ? '<span style="background:#7c3aed;color:white;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:700;font-family:monospace" title="market consensus override">cons</span>'
+          : '<span style="color:#64748b;font-size:10px;font-family:monospace">fc</span>';
         return `<tr>
           <td class="tstamp">${{t}}</td>
           <td>${{r.city || ""}}</td>
           <td>${{r.event_date || ""}}</td>
           <td>${{r.bin_label || ""}}</td>
+          <td>${{ancCell}}</td>
           <td>${{r.cycle_kind || ""}}</td>
           <td class="num">${{r.reading_settlement != null ? Number(r.reading_settlement).toFixed(2) : "--"}}</td>
           <td class="num">${{r.boundary_value_settlement != null ? Number(r.boundary_value_settlement).toFixed(2) : "--"}}</td>
