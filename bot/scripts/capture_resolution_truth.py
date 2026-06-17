@@ -301,11 +301,32 @@ def capture_one(conn, collector_conn, event_id: str,
     }
 
 
-def already_captured(conn, event_id: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM resolution_observations WHERE event_id = ? LIMIT 1",
-        (event_id,),
-    ).fetchone()
+def already_captured(conn, event_id: str,
+                        *, only_if_complete: bool = False) -> bool:
+    """Has this event_id been captured?
+
+    only_if_complete=False (default): row exists at all.
+    only_if_complete=True:  row exists AND has non-NULL truth columns.
+       Used by --force-refresh / --force-refill-nulls so we re-fetch
+       rows that were inserted with NULL truth columns by a prior run
+       where the source fetches all returned None (e.g., Wunderground
+       JS-rendered breakage, missing METAR rows, format-mismatched
+       event_date).
+    """
+    if only_if_complete:
+        row = conn.execute(
+            "SELECT 1 FROM resolution_observations WHERE event_id = ? "
+            "AND wunderground_high_c IS NOT NULL "
+            "AND metar_peak_t_group_c IS NOT NULL "
+            "AND bot_observed_max_c IS NOT NULL "
+            "LIMIT 1",
+            (event_id,),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT 1 FROM resolution_observations WHERE event_id = ? LIMIT 1",
+            (event_id,),
+        ).fetchone()
     return row is not None
 
 
@@ -321,7 +342,8 @@ def insert_observation(conn, row: dict) -> None:
 
 
 def run_capture(signals_db: str, collector_db: str,
-                  backfill_days: int | None, fetch_wunderground: bool) -> int:
+                  backfill_days: int | None, fetch_wunderground: bool,
+                  *, force_refill_nulls: bool = False) -> int:
     if not os.path.exists(collector_db):
         log.error(f"collector DB not found: {collector_db}")
         return 1
@@ -353,7 +375,8 @@ def run_capture(signals_db: str, collector_db: str,
     failed = 0
     for r in rs_rows:
         event_id = r["event_id"]
-        if already_captured(sconn, event_id):
+        if already_captured(sconn, event_id,
+                              only_if_complete=force_refill_nulls):
             skipped += 1
             continue
         try:
@@ -386,6 +409,12 @@ def main() -> int:
     p.add_argument("--no-wunderground", action="store_true",
                     help="skip Wunderground fetching (still capture METAR "
                          "decomposition columns)")
+    p.add_argument("--force-refill-nulls", action="store_true",
+                    help="re-fetch any event whose existing row has NULL "
+                         "in any of the truth columns (wunderground_high_c, "
+                         "metar_peak_t_group_c, bot_observed_max_c).  "
+                         "Use to recover from silent-NULL writes after the "
+                         "source fetches start working again.")
     args = p.parse_args()
 
     return run_capture(
@@ -393,6 +422,7 @@ def main() -> int:
         collector_db      = args.collector_db,
         backfill_days     = args.backfill_days,
         fetch_wunderground= not args.no_wunderground,
+        force_refill_nulls= args.force_refill_nulls,
     )
 
 
