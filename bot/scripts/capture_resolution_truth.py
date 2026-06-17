@@ -31,11 +31,29 @@ Without this script's output, every audit relies on the manual
 METAR-vs-Wunderground comparison the user did by hand for Atlanta
 2026-06-12.  This automates it.
 
+DATA SOURCE
+-----------
+The script discovers resolved events from `paper_predictor_signals`
+(default `--source=signals`).  An event is considered resolved if any
+bin on its LATEST scan has market_prob >= 0.99 — the same heuristic
+the dashboard uses to surface the winner.  This removes the legacy
+dependency on the standalone backtest-collector DB; the script reads
+only from the bot's own signals.db.
+
+The legacy `--source=collector` path is still available for callers
+that still run the backtest-collector — it reads event metadata from
+a `resolutions` table in a separate DB.  Use it only if you have
+that collector populated.
+
 Run nightly via cron:
     0 4 * * *  /path/to/venv/bin/python -m scripts.capture_resolution_truth
 
 Or one-shot for backfill:
     cd bot && python -m scripts.capture_resolution_truth --backfill-days 30
+
+To refill rows that were written with NULL truth columns (e.g.,
+after fixing a broken city-name lookup or restoring a dead source):
+    python -m scripts.capture_resolution_truth --backfill-days 30 --force-refill-nulls
 """
 
 from __future__ import annotations
@@ -223,22 +241,18 @@ def fetch_wunderground_daily_high_c(icao: str, event_date: str,
 # Main capture
 # ============================================================
 
-def capture_one(conn, collector_conn, event_id: str,
-                  fetch_wunderground: bool) -> dict:
+def capture_one(conn, res_meta: dict, fetch_wunderground: bool) -> dict:
     """Capture all five reference values for one resolved market.
-    Returns a dict suitable for insertion into resolution_observations."""
-    res_row = collector_conn.execute(
-        """SELECT event_id, city, date,
-                  winning_contract_id,
-                  winning_range_low, winning_range_high
-           FROM resolutions WHERE event_id = ?""",
-        (event_id,),
-    ).fetchone()
-    if not res_row:
-        return {"event_id": event_id, "capture_notes": "no_resolution_row"}
+    Returns a dict suitable for insertion into resolution_observations.
 
-    city = res_row["city"]
-    event_date = res_row["date"]
+    res_meta is the event metadata produced by either the legacy
+    collector path or the newer discover_resolved_events_from_signals().
+    Required keys: event_id, city, event_date, winning_range_low,
+    winning_range_high.  Optional: winning_contract_id.
+    """
+    event_id   = res_meta["event_id"]
+    city       = res_meta["city"]
+    event_date = res_meta["event_date"]
     icao = None
     meta = CITY_STATIONS.get(city)
     if meta:
@@ -274,8 +288,8 @@ def capture_one(conn, collector_conn, event_id: str,
     # Construct a label for the winning bin.  range_low/high are integer
     # °F for US markets; build "92-93°F" style.
     winning_label = None
-    wl = res_row["winning_range_low"]
-    wh = res_row["winning_range_high"]
+    wl = res_meta.get("winning_range_low")
+    wh = res_meta.get("winning_range_high")
     if wl is not None and wh is not None:
         winning_label = f"{int(wl)}-{int(wh)}°F"
     elif wh is not None:
@@ -341,46 +355,129 @@ def insert_observation(conn, row: dict) -> None:
     conn.commit()
 
 
+def discover_resolved_events_from_signals(
+    conn, backfill_days: int | None,
+) -> list[dict]:
+    """Discover events the bot itself observed resolving.
+
+    Reads from paper_predictor_signals: an event is "resolved" if SOME
+    bin in its latest scan has market_prob >= 0.99 (the same heuristic
+    the dashboard uses to label the winner).  This removes the dead-
+    collector dependency the capture script used to have — every
+    (city, event_date) the bot scanned is discoverable here.
+
+    Returns list of dicts with the same shape capture_one expects:
+        {event_id, city, event_date, winning_range_low,
+         winning_range_high, winning_contract_id}
+    """
+    if backfill_days is not None:
+        date_clause = "AND event_date >= date('now', ?)"
+        date_arg: tuple = (f"-{int(backfill_days)} days",)
+    else:
+        date_clause = ""
+        date_arg = ()
+
+    # Latest scan per (city, event_date), then the bin(s) on that scan
+    # with market_prob >= 0.99.  Most events resolve to one bin; the
+    # GROUP BY collapses the rare multi-winner case (shouldn't happen
+    # on properly-formed markets but doesn't hurt to be defensive).
+    rows = conn.execute(
+        f"""
+        WITH latest_scan AS (
+            SELECT city, event_date, MAX(scanned_at_utc) AS max_ts
+            FROM paper_predictor_signals
+            WHERE event_date IS NOT NULL
+              {date_clause}
+            GROUP BY city, event_date
+        )
+        SELECT s.event_id, s.city, s.event_date,
+               s.contract_id  AS winning_contract_id,
+               s.bin_range_low  AS winning_range_low,
+               s.bin_range_high AS winning_range_high,
+               s.unit           AS winning_unit
+        FROM paper_predictor_signals s
+        JOIN latest_scan ls
+          ON ls.city = s.city AND ls.event_date = s.event_date
+         AND ls.max_ts = s.scanned_at_utc
+        WHERE s.market_prob >= 0.99
+          AND s.event_id IS NOT NULL
+        ORDER BY s.event_date DESC
+        """,
+        date_arg,
+    ).fetchall()
+
+    return [dict(r) for r in rows]
+
+
 def run_capture(signals_db: str, collector_db: str,
                   backfill_days: int | None, fetch_wunderground: bool,
-                  *, force_refill_nulls: bool = False) -> int:
-    if not os.path.exists(collector_db):
-        log.error(f"collector DB not found: {collector_db}")
-        return 1
+                  *, force_refill_nulls: bool = False,
+                  source: str = "signals") -> int:
+    # Only signals DB is strictly required.  Collector DB is checked
+    # later inside the source='collector' branch.
     if not os.path.exists(signals_db):
         log.error(f"signals DB not found: {signals_db}")
         return 1
 
     sconn = sqlite3.connect(signals_db, timeout=30.0)
     sconn.row_factory = sqlite3.Row
-    cconn = sqlite3.connect(collector_db, timeout=30.0)
-    cconn.row_factory = sqlite3.Row
 
-    # Resolved events to consider
-    if backfill_days is not None:
-        from datetime import date, timedelta
-        cutoff = (date.today() - timedelta(days=backfill_days)).isoformat()
-        rs_rows = cconn.execute(
-            "SELECT event_id FROM resolutions WHERE date >= ? "
-            "ORDER BY date DESC",
-            (cutoff,),
-        ).fetchall()
+    # Discover resolved events to consider.  Default 'signals' source
+    # uses paper_predictor_signals (the bot's own resolution signal).
+    # Legacy 'collector' source reads from the standalone backtest-
+    # collector DB; kept available for users who still run that
+    # collector, but the script no longer requires it.
+    res_metas: list[dict] = []
+    if source == "signals":
+        res_metas = discover_resolved_events_from_signals(
+            sconn, backfill_days=backfill_days)
+        log.info(f"signals source: discovered {len(res_metas)} resolved events")
+    elif source == "collector":
+        if not os.path.exists(collector_db):
+            log.error(f"collector DB not found: {collector_db}")
+            sconn.close()
+            return 1
+        cconn = sqlite3.connect(collector_db, timeout=30.0)
+        cconn.row_factory = sqlite3.Row
+        if backfill_days is not None:
+            from datetime import date, timedelta
+            cutoff = (date.today() - timedelta(days=backfill_days)).isoformat()
+            rs_rows = cconn.execute(
+                "SELECT event_id, city, date AS event_date, "
+                "       winning_contract_id, winning_range_low, "
+                "       winning_range_high "
+                "FROM resolutions WHERE date >= ? "
+                "ORDER BY date DESC",
+                (cutoff,),
+            ).fetchall()
+        else:
+            rs_rows = cconn.execute(
+                "SELECT event_id, city, date AS event_date, "
+                "       winning_contract_id, winning_range_low, "
+                "       winning_range_high "
+                "FROM resolutions ORDER BY resolved_at DESC LIMIT 50"
+            ).fetchall()
+        res_metas = [dict(r) for r in rs_rows]
+        cconn.close()
+        log.info(f"collector source: read {len(res_metas)} resolved events")
     else:
-        rs_rows = cconn.execute(
-            "SELECT event_id FROM resolutions ORDER BY resolved_at DESC LIMIT 50"
-        ).fetchall()
+        log.error(f"unknown source: {source!r} (expected 'signals' or 'collector')")
+        sconn.close()
+        return 1
 
     captured = 0
     skipped = 0
     failed = 0
-    for r in rs_rows:
-        event_id = r["event_id"]
+    for rm in res_metas:
+        event_id = rm.get("event_id")
+        if not event_id:
+            continue
         if already_captured(sconn, event_id,
                               only_if_complete=force_refill_nulls):
             skipped += 1
             continue
         try:
-            obs = capture_one(sconn, cconn, event_id, fetch_wunderground)
+            obs = capture_one(sconn, rm, fetch_wunderground)
             insert_observation(sconn, obs)
             captured += 1
             if obs.get("capture_notes"):
@@ -393,7 +490,6 @@ def run_capture(signals_db: str, collector_db: str,
     log.info(f"capture complete: {captured} new, {skipped} already had, "
               f"{failed} failed")
     sconn.close()
-    cconn.close()
     return 0 if failed == 0 else 1
 
 
@@ -401,8 +497,16 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     p.add_argument("--signals-db", default=None,
                     help="signals DB (default: config.DB_PATH)")
+    p.add_argument("--source", choices=["signals", "collector"], default="signals",
+                    help="where to discover resolved events.  'signals' (default, "
+                         "recommended) reads from paper_predictor_signals — uses "
+                         "the bot's own resolution signal (market_prob >= 0.99 on "
+                         "latest scan).  'collector' reads from the legacy "
+                         "backtest-collector DB (kept for backwards compatibility "
+                         "but no longer required).")
     p.add_argument("--collector-db", default=DEFAULT_COLLECTOR_DB,
-                    help=f"resolutions DB (default: {DEFAULT_COLLECTOR_DB})")
+                    help=f"legacy collector DB path, only used with "
+                         f"--source=collector (default: {DEFAULT_COLLECTOR_DB})")
     p.add_argument("--backfill-days", type=int, default=None,
                     help="backfill captures for the last N days "
                          "(default: most-recent 50 resolutions)")
@@ -423,6 +527,7 @@ def main() -> int:
         backfill_days     = args.backfill_days,
         fetch_wunderground= not args.no_wunderground,
         force_refill_nulls= args.force_refill_nulls,
+        source            = args.source,
     )
 
 
