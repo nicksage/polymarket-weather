@@ -170,8 +170,6 @@ def main(argv: list[str] | None = None) -> int:
                        help="bin label substring, e.g. '94-95'")
     ap.add_argument("--fidelity-min", type=int, default=1,
                        help="CLOB price-history granularity in minutes")
-    ap.add_argument("--out-dir",     default=os.path.dirname(os.path.abspath(__file__)),
-                       help="CSVs go here (default = same dir as this script)")
     args = ap.parse_args(argv)
 
     tz = ZoneInfo(args.tz)
@@ -247,27 +245,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{key.strftime('%Y-%m-%d %H:%M:%S')}  {local:<12} {tf:>9} {tc:>9} "
               f"{prec:>10} {px:>11}")
 
-    # ----- CSV writes -----
-    if metars:
-        path = os.path.join(args.out_dir,
-                              f"miami_{args.date}_metar.csv")
-        with open(path, "w", newline="", encoding="utf-8") as fh:
-            w = csv.DictWriter(fh, fieldnames=["timestamp_utc", "temp_c",
-                                                   "temp_f", "precision", "raw"])
-            w.writeheader()
-            w.writerows(metars)
-        print(f"\nwrote {len(metars)} rows -> {path}")
-    if prices:
-        path = os.path.join(args.out_dir,
-                              f"miami_{args.date}_prices_{args.bin_label}.csv")
-        with open(path, "w", newline="", encoding="utf-8") as fh:
-            w = csv.writer(fh)
-            w.writerow(["timestamp_utc", "yes_price"])
-            for p in prices:
-                ts = datetime.fromtimestamp(int(p.get("t", 0)), tz=timezone.utc)
-                w.writerow([ts.isoformat(), float(p.get("p", 0))])
-        print(f"wrote {len(prices)} rows -> {path}")
-
+    print("=" * 96)
+    print(f"summary: {len(metars)} METAR observations, {len(prices)} price ticks")
     return 0
 
 
