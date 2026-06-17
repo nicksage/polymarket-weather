@@ -1,238 +1,172 @@
 #!/usr/bin/env python3
 """
-fetch_miami_history.py — pull Miami temperature observations (KMIA METAR
-via NWS) and Polymarket 94-95F YES price history over a local-time
-window and print them as a merged terminal table.  Standalone script,
-stdlib only.
+fetch_miami_history.py — print a merged terminal table of the temperature
+observations and Polymarket bin prices the bot has ALREADY SAVED to its
+local SQLite DB (bot/data/signals.db).
 
-Defaults to today, 11:00–16:00 Eastern, 94-95F bin.  Override via flags:
+Sources (no network calls):
+  - raw_metar_log              : NWS METAR readings (every ~5 min)
+  - paper_predictor_signals    : bin market_prob (every PREDICTOR_SCAN_MIN min)
+
+Defaults to today, 11:00–16:00 Eastern, Miami 94-95F bin.  Override:
 
     python scripts/fetch_miami_history.py \
         --date 2026-06-16 --start-local 11:00 --end-local 16:00 \
         --bin 94-95 --city Miami --station KMIA --tz America/New_York
 
-Output is a single time-aligned table to stdout — one row per minute
-that had either a METAR observation or a price tick.  No files written.
-
-The bin lookup hits Polymarket Gamma + CLOB.  No auth needed; both
-endpoints are public-read.
+Output: one row per minute that had either a METAR observation or a
+predictor scan in the window.  No files written.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
+import os
+import sqlite3
 import sys
-import urllib.parse
-import urllib.request
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-
-GAMMA_API = "https://gamma-api.polymarket.com"
-CLOB_API  = "https://clob.polymarket.com"
-NWS_API   = "https://api.weather.gov"
-
-
-# ---------------------------------------------------------------------------
-# HTTP helper — stdlib only so this runs anywhere
-# ---------------------------------------------------------------------------
-
-def http_get(url: str, params: dict | None = None,
-                accept: str = "application/json") -> dict | list:
-    if params:
-        url = url + "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(
-        url,
-        headers={"Accept": accept,
-                  "User-Agent": "polymarket-weather/fetch_miami_history (research)"},
-    )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read().decode("utf-8"))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_BOT_DIR = os.path.dirname(_HERE)
+DEFAULT_DB = os.path.join(_BOT_DIR, "data", "signals.db")
 
 
-# ---------------------------------------------------------------------------
-# Polymarket — find the daily-high event and pull the bin's token ID
-# ---------------------------------------------------------------------------
-
-def find_yes_token_id(city: str, date_iso: str, bin_label: str) -> str:
-    """Search Gamma for the daily-high event matching (city, date) and
-    return the yes_token_id for the bin whose title contains `bin_label`."""
-    # Gamma slug pattern: "highest-temperature-in-<city>-on-<month>-<day>-<year>"
-    month_name = datetime.strptime(date_iso, "%Y-%m-%d").strftime("%B").lower()
-    day_num    = datetime.strptime(date_iso, "%Y-%m-%d").day
-    year_num   = datetime.strptime(date_iso, "%Y-%m-%d").year
-    city_slug  = city.lower().replace(" ", "-")
-    slug_hint  = f"highest-temperature-in-{city_slug}-on-{month_name}-{day_num}-{year_num}"
-
-    # Search Gamma by slug substring.  Gamma's `slug` filter is exact;
-    # fall back to a tag/keyword search if exact miss.
-    events = http_get(f"{GAMMA_API}/events", params={"slug": slug_hint})
-    if not events:
-        # Loosen — search by title text
-        events = http_get(f"{GAMMA_API}/events",
-                            params={"limit": 50, "active": "true",
-                                     "tag_slug": "weather"})
-        events = [e for e in events
-                   if city.lower() in (e.get("title", "") + " " + e.get("slug", "")).lower()
-                   and date_iso in json.dumps(e)]
-    if not events:
-        raise RuntimeError(f"No Gamma event found for {city} {date_iso}")
-    event = events[0]
-    markets = event.get("markets") or []
-
-    # Pick the market (sub-question) whose groupItemTitle contains the bin label
-    target = None
-    for m in markets:
-        gtitle = (m.get("groupItemTitle") or m.get("question") or "")
-        if bin_label in gtitle:
-            target = m
-            break
-    if not target:
-        # Print what's available for debugging
-        avail = [m.get("groupItemTitle") or m.get("question") for m in markets]
-        raise RuntimeError(
-            f"No bin matching {bin_label!r} on event {event.get('slug')}. "
-            f"Available: {avail}"
-        )
-
-    # Token IDs sit in `clobTokenIds` as a JSON-encoded list [YES_id, NO_id]
-    raw = target.get("clobTokenIds") or "[]"
-    if isinstance(raw, str):
-        token_ids = json.loads(raw)
-    else:
-        token_ids = list(raw)
-    if not token_ids:
-        raise RuntimeError(f"No CLOB token IDs on market {target.get('id')}")
-    return str(token_ids[0])    # YES side
+def fetch_metars(conn: sqlite3.Connection, icao: str, event_date: str,
+                    start_utc: datetime, end_utc: datetime) -> list[dict]:
+    """raw_metar_log rows for (icao, event_date) within the UTC window.
+    The bot writes one row per METAR cycle (every ~5 min)."""
+    try:
+        rows = conn.execute(
+            """SELECT cycle_timestamp_utc, temp_c, temp_precision, raw_message
+               FROM raw_metar_log
+               WHERE icao = ? AND event_date = ?
+                 AND cycle_timestamp_utc >= ?
+                 AND cycle_timestamp_utc <= ?
+                 AND temp_c IS NOT NULL
+               ORDER BY cycle_timestamp_utc ASC""",
+            (icao, event_date,
+              start_utc.isoformat(), end_utc.isoformat()),
+        ).fetchall()
+    except sqlite3.OperationalError as e:
+        print(f"  ERROR reading raw_metar_log: {e}")
+        return []
+    out = []
+    for ts, t_c, prec, raw in rows:
+        out.append({
+            "timestamp_utc": ts,
+            "temp_c":        float(t_c),
+            "temp_f":        float(t_c) * 9.0/5.0 + 32.0,
+            "precision":     prec or "whole",
+            "raw":           raw or "",
+        })
+    return out
 
 
-def fetch_prices_history(token_id: str, start_ts: int, end_ts: int,
-                            fidelity_min: int = 1) -> list[dict]:
-    """CLOB prices-history endpoint.  Returns list of {t: unix_seconds, p: price}."""
-    data = http_get(
-        f"{CLOB_API}/prices-history",
-        params={"market": token_id,
-                 "startTs": start_ts, "endTs": end_ts,
-                 "fidelity": fidelity_min},
-    )
-    history = data.get("history") if isinstance(data, dict) else data
-    return history or []
+def fetch_prices(conn: sqlite3.Connection, city: str, event_date: str,
+                    bin_label: str,
+                    start_utc: datetime, end_utc: datetime) -> list[dict]:
+    """paper_predictor_signals rows for (city, event_date, bin) within
+    the UTC window.  The bot writes one row per bin per scan."""
+    # Bin matching: bot's bin_label is like '94F-95F' or '94-95F' depending
+    # on city — use LIKE to be lenient.
+    bin_pat = f"%{bin_label}%"
+    try:
+        rows = conn.execute(
+            """SELECT scanned_at_utc, market_prob, our_prob, edge, action,
+                       bin_label
+               FROM paper_predictor_signals
+               WHERE city = ? AND event_date = ?
+                 AND bin_label LIKE ?
+                 AND scanned_at_utc >= ?
+                 AND scanned_at_utc <= ?
+                 AND market_prob IS NOT NULL
+               ORDER BY scanned_at_utc ASC""",
+            (city, event_date, bin_pat,
+              start_utc.isoformat(), end_utc.isoformat()),
+        ).fetchall()
+    except sqlite3.OperationalError as e:
+        print(f"  ERROR reading paper_predictor_signals: {e}")
+        return []
+    out = []
+    for ts, mp, op, edge, action, lbl in rows:
+        out.append({
+            "scanned_at_utc": ts,
+            "market_prob":    float(mp),
+            "our_prob":       float(op) if op is not None else None,
+            "edge":           float(edge) if edge is not None else None,
+            "action":         action or "",
+            "bin_label":      lbl or "",
+        })
+    return out
 
-
-# ---------------------------------------------------------------------------
-# NWS — METAR observations for the station within the window
-# ---------------------------------------------------------------------------
-
-def fetch_metar_observations(station: str,
-                                  start_iso: str, end_iso: str) -> list[dict]:
-    """NWS station observations endpoint.  Returns GeoJSON features."""
-    data = http_get(
-        f"{NWS_API}/stations/{station}/observations",
-        params={"start": start_iso, "end": end_iso, "limit": 500},
-    )
-    return data.get("features") or []
-
-
-def parse_metar_feature(feat: dict) -> dict | None:
-    props = feat.get("properties") or {}
-    ts = props.get("timestamp")
-    temp = (props.get("temperature") or {}).get("value")
-    if ts is None or temp is None:
-        return None
-    raw = props.get("rawMessage") or ""
-    # T-group precision detection: "T00" remarks group encodes tenths.
-    is_t_group = " T0" in raw or " T1" in raw
-    return {
-        "timestamp_utc": ts,
-        "temp_c":        float(temp),
-        "temp_f":        float(temp) * 9.0/5.0 + 32.0,
-        "precision":     "tenths" if is_t_group else "whole",
-        "raw":           raw,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
     today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     ap = argparse.ArgumentParser(description=__doc__,
                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--date",        default=today_iso, help="YYYY-MM-DD (default today UTC)")
-    ap.add_argument("--start-local", default="11:00",   help="HH:MM in local TZ")
-    ap.add_argument("--end-local",   default="16:00",   help="HH:MM in local TZ")
+    ap.add_argument("--date",        default=today_iso, help="YYYY-MM-DD (default: today UTC)")
+    ap.add_argument("--start-local", default="11:00")
+    ap.add_argument("--end-local",   default="16:00")
     ap.add_argument("--tz",          default="America/New_York")
     ap.add_argument("--city",        default="Miami")
     ap.add_argument("--station",     default="KMIA")
     ap.add_argument("--bin",         dest="bin_label", default="94-95",
-                       help="bin label substring, e.g. '94-95'")
-    ap.add_argument("--fidelity-min", type=int, default=1,
-                       help="CLOB price-history granularity in minutes")
+                       help="bin label substring (LIKE match)")
+    ap.add_argument("--db",          default=DEFAULT_DB,
+                       help=f"path to signals.db (default: {DEFAULT_DB})")
     args = ap.parse_args(argv)
 
+    if not os.path.exists(args.db):
+        print(f"FATAL: DB not found at {args.db}", file=sys.stderr)
+        return 1
+
     tz = ZoneInfo(args.tz)
-    start_local = datetime.strptime(f"{args.date} {args.start_local}", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
-    end_local   = datetime.strptime(f"{args.date} {args.end_local}",   "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+    start_local = datetime.strptime(f"{args.date} {args.start_local}",
+                                       "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+    end_local   = datetime.strptime(f"{args.date} {args.end_local}",
+                                       "%Y-%m-%d %H:%M").replace(tzinfo=tz)
     start_utc = start_local.astimezone(timezone.utc)
     end_utc   = end_local.astimezone(timezone.utc)
 
+    print(f"db:      {args.db}")
     print(f"window:  {start_local.isoformat()}  ->  {end_local.isoformat()}  "
           f"({args.tz})")
     print(f"         {start_utc.isoformat()}  ->  {end_utc.isoformat()}  (UTC)")
     print(f"city:    {args.city}   station: {args.station}   bin: {args.bin_label}")
     print()
 
-    # ----- Polymarket -----
-    print("[1/2] Polymarket: finding event + token id …")
-    try:
-        token_id = find_yes_token_id(args.city, args.date, args.bin_label)
-        print(f"      yes_token_id: {token_id[:16]}…{token_id[-8:]}")
-        prices = fetch_prices_history(token_id,
-                                          int(start_utc.timestamp()),
-                                          int(end_utc.timestamp()),
-                                          fidelity_min=args.fidelity_min)
-        print(f"      {len(prices)} price points returned")
-    except Exception as e:
-        print(f"      ERROR: {e}")
-        prices = []
+    with sqlite3.connect(args.db) as conn:
+        metars = fetch_metars(conn, args.station, args.date, start_utc, end_utc)
+        prices = fetch_prices(conn, args.city, args.date, args.bin_label,
+                                start_utc, end_utc)
 
-    # ----- NWS METAR -----
-    print("[2/2] NWS: pulling KMIA observations …")
-    try:
-        feats = fetch_metar_observations(
-            args.station,
-            start_utc.isoformat(timespec="seconds").replace("+00:00", "Z"),
-            end_utc.isoformat(timespec="seconds").replace("+00:00", "Z"),
-        )
-        metars = [m for m in (parse_metar_feature(f) for f in feats) if m]
-        metars.sort(key=lambda r: r["timestamp_utc"])
-        print(f"      {len(metars)} observations parsed")
-    except Exception as e:
-        print(f"      ERROR: {e}")
-        metars = []
-
-    # ----- Print combined timeline -----
+    print(f"loaded:  {len(metars)} METAR rows, {len(prices)} predictor-scan rows")
     print()
-    print("=" * 96)
-    print(f"{'UTC time':<22} {'local':<12} {'temp °F':>9} {'temp °C':>9} "
-          f"{'precision':>10} {'YES price':>11}")
-    print("-" * 96)
 
-    # Merge: every minute in the window, look up nearest METAR (within ±15min)
-    # and nearest price (within ±2*fidelity min).  Print only minutes that
-    # had at least one of the two.
+    # Merge by minute so the two streams align visually.  Different
+    # cadences (METAR ~5 min, scans every PREDICTOR_SCAN_MIN min) mean
+    # most minutes have only one side; that's fine.
     by_minute: dict[datetime, dict] = {}
     for m in metars:
         ts = datetime.fromisoformat(m["timestamp_utc"].replace("Z", "+00:00"))
         key = ts.replace(second=0, microsecond=0)
         by_minute.setdefault(key, {})["metar"] = m
     for p in prices:
-        ts = datetime.fromtimestamp(int(p.get("t", 0)), tz=timezone.utc)
+        ts = datetime.fromisoformat(p["scanned_at_utc"].replace("Z", "+00:00"))
         key = ts.replace(second=0, microsecond=0)
-        by_minute.setdefault(key, {})["price"] = float(p.get("p", 0))
+        by_minute.setdefault(key, {})["price"] = p
 
+    if not by_minute:
+        print("(no rows — check that the bot has been scanning this city today, "
+              "and that raw_metar_log has KMIA observations for this date)")
+        return 0
+
+    width = 112
+    print("=" * width)
+    print(f"{'UTC time':<22} {'local':<10} {'temp °F':>9} {'temp °C':>9} "
+          f"{'prec':>6} {'mkt p':>8} {'our p':>8} {'edge':>8} {'action':<10}")
+    print("-" * width)
     for key in sorted(by_minute):
         row = by_minute[key]
         m = row.get("metar")
@@ -240,13 +174,16 @@ def main(argv: list[str] | None = None) -> int:
         tf = f"{m['temp_f']:>7.2f}" if m else "      --"
         tc = f"{m['temp_c']:>7.2f}" if m else "      --"
         prec = m["precision"] if m else ""
-        px = f"{p:>9.4f}" if p is not None else "       --"
+        mp = f"{p['market_prob']:>6.4f}" if p else "      --"
+        op = (f"{p['our_prob']:>6.4f}" if p and p["our_prob"] is not None
+              else "      --")
+        edge = (f"{p['edge']:>+6.3f}" if p and p["edge"] is not None
+                else "      --")
+        act = (p["action"] if p else "")[:10]
         local = key.astimezone(tz).strftime("%H:%M:%S")
-        print(f"{key.strftime('%Y-%m-%d %H:%M:%S')}  {local:<12} {tf:>9} {tc:>9} "
-              f"{prec:>10} {px:>11}")
-
-    print("=" * 96)
-    print(f"summary: {len(metars)} METAR observations, {len(prices)} price ticks")
+        print(f"{key.strftime('%Y-%m-%d %H:%M:%S')}  {local:<10} {tf:>9} {tc:>9} "
+              f"{prec:>6} {mp:>8} {op:>8} {edge:>8} {act:<10}")
+    print("=" * width)
     return 0
 
 
