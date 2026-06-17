@@ -144,6 +144,17 @@ REQUIRED_NAMES: list[str] = [
     "boundary_trigger_log",                  # table name in _SCHEMA_SQL
     "signal_origin",                         # column on positions table
     "anchor_mode",                           # column on boundary_trigger_log
+
+    # --- Cold-bias Day 1 work (2026-06-17) ---
+    # Three load-bearing names: the loss-stopper gate, its reason
+    # string (so the dashboard categorization stays stable), and the
+    # checker that gates the temporary gate's retirement.  If any of
+    # these disappear silently, the gate either stops firing OR becomes
+    # permanent — both regressions are subtle and high-impact.
+    "LOSS_STOPPER_ENABLED",
+    "loss_stopper_high_disagreement",        # gate reason string
+    "def check_loss_stopper_removal_condition",
+    "loss-stopper REMOVAL CONDITION MET",    # WARN log line — operator's trigger to act
 ]
 
 # Names that must be present in bot/main.py to confirm the boundary

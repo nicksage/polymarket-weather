@@ -115,10 +115,27 @@ def test_w4_fires_after_low_edge_check():
 # Regression coverage so future edits don't accidentally reshape these
 # ---------------------------------------------------------------------------
 
-def test_market_too_skeptical_blocks_garbage_signals():
+def test_market_too_skeptical_blocks_garbage_signals(monkeypatch):
+    # As of 2026-06-17, the loss-stopper gate sits ABOVE
+    # market_too_skeptical and catches the same garbage with a more
+    # specific reason.  Disable it here so this test isolates
+    # market_too_skeptical's behavior.  When LOSS_STOPPER_ENABLED is
+    # eventually removed (per its checked removal trigger), this
+    # monkeypatch becomes a no-op and the test still passes.
+    import scheduled_predictor as sp
+    monkeypatch.setattr(sp, "LOSS_STOPPER_ENABLED", False)
     ok, reason = evaluate_gates(**_ok_gate_call(market_p=0.05, edge=0.85))
     assert not ok
     assert "market_too_skeptical" in reason
+
+
+def test_loss_stopper_fires_before_market_too_skeptical():
+    """Lock in the new gate order: loss-stopper takes precedence over
+    market_too_skeptical when both would match, because its reason is
+    more diagnostic for the cold-bias failure mode."""
+    ok, reason = evaluate_gates(**_ok_gate_call(market_p=0.05, edge=0.85))
+    assert not ok
+    assert "loss_stopper_high_disagreement" in reason
 
 
 def test_too_early_blocks_before_min_hour():

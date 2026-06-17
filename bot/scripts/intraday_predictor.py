@@ -1867,7 +1867,15 @@ def predict_bins(event: dict, settlement_obs: list[dict],
             # center — fall back to non-bin-lock behavior.
             if bin_lo_c is not None and bin_hi_c is not None:
                 mu = (bin_lo_c + bin_hi_c) / 2          # bin center
-                sigma = max(0.15, (bin_hi_c - bin_lo_c) / 6)  # 3σ each side
+                # CORRECTNESS FIX (2026-06-17): bin-lock used to collapse
+                # σ to (bin_width/6) ≈ 0.19°C for a 2°F bin, IGNORING
+                # PREDICTOR_SIGMA_FLOOR_C set above in _predict_mu_sigma.
+                # That converted any off-by-one bin error into a total
+                # loss (Chicago 6/14: ±0.30°C, 93% confidence, lost full
+                # stake).  Floor here too so a single safety variable
+                # actually governs every code path that sets σ.
+                sigma = max(PREDICTOR_SIGMA_FLOOR_C,
+                              (bin_hi_c - bin_lo_c) / 6)
                 # Relax truncation by 0.1°C to admit measurement uncertainty
                 # in the observation (NWS reports in 0.1°C precision).
                 truncate_at = bin_lo_c - 0.1

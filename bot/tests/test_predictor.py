@@ -877,9 +877,25 @@ def test_houston_scenario_bin_locks_correctly():
         f"90-91°F ({bin_90['our_prob']:.3f}) should be top-P, not "
         f"92-93°F ({bin_92['our_prob']:.3f})"
     )
-    assert bin_90["our_prob"] > 0.7, (
-        f"With bin-lock, 90-91°F should be very confident "
-        f"(got {bin_90['our_prob']:.3f})"
+    # 2026-06-17: bin-lock σ now respects PREDICTOR_SIGMA_FLOOR_C (1.3°C
+    # default) instead of collapsing to (bin_width/6) ≈ 0.19°C.  That
+    # intentionally widens the distribution under bin-lock — single-bin
+    # confidence drops from ~0.9 to ~0.45 in exchange for converting
+    # "off-by-one bin → total loss" into "off-by-one bin → partial loss"
+    # (Chicago 6/14 case).  We still expect bin_90 to be the top-P bin
+    # and substantially more confident than uniform (1/n_bins), but the
+    # high-90s confidence the old σ collapse produced is no longer
+    # acceptable — that overconfidence was the bug, not the feature.
+    n_bins = len(pred["bins"])
+    uniform_p = 1.0 / max(1, n_bins)
+    assert bin_90["our_prob"] > 2 * uniform_p, (
+        f"bin_90 should still be meaningfully confident vs uniform "
+        f"({bin_90['our_prob']:.3f} vs uniform={uniform_p:.3f})"
+    )
+    assert bin_90["our_prob"] > 0.30, (
+        f"bin_90 should be the top-P bin with non-trivial mass; "
+        f"got {bin_90['our_prob']:.3f}.  If this drops below 0.30, "
+        f"the σ floor may be too generous for bin-lock — investigate."
     )
 
 

@@ -180,10 +180,17 @@ def test_probability_mode_custom_threshold(monkeypatch):
 # Cross-mode invariants — other gates still apply
 # ============================================================
 
-def test_probability_mode_market_sanity_floor_still_applies(prob_mode):
-    """MIN_MARKET_PROB=0.15 sanity floor protects probability mode too —
-    even if our_p is high, market_p<0.15 means model is almost certainly
-    broken."""
+def test_probability_mode_market_sanity_floor_still_applies(prob_mode, monkeypatch):
+    """MIN_MARKET_PROB sanity floor protects probability mode too —
+    even if our_p is high, market_p<MIN means model is almost certainly
+    broken.
+
+    As of 2026-06-17 the loss-stopper gate sits above market_too_skeptical
+    and catches the same garbage with a more specific reason.  Disable
+    it here so this test isolates the market sanity floor.  When
+    LOSS_STOPPER_ENABLED is retired per its checked removal trigger,
+    this monkeypatch becomes a no-op."""
+    monkeypatch.setattr(sp, "LOSS_STOPPER_ENABLED", False)
     ok, reason = sp.evaluate_gates(
         current_hour=15, edge=0.00, market_p=0.05,
         liquidity=500.0, deployed_today=0.0, trades_today=0,

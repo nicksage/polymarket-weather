@@ -166,6 +166,33 @@ MARKET_DISAGREEMENT_LIQ_THRESHOLD = float(
 MARKET_DISAGREEMENT_PP_THRESHOLD  = float(
     os.getenv("PREDICTOR_MARKET_DISAGREEMENT_PP_THRESHOLD", "0.40"))
 
+# === TEMPORARY loss-stopper (2026-06-17) ====================================
+# Added after the 6/10-6/16 ledger review surfaced a systematic cold bias
+# (~6 of 7 μ-mutation branches in intraday_predictor pull DOWN; stacked
+# multiplicatively on mid-afternoon hot-city scans).  The bias manufactures
+# false disagreement: when model_p >= 35% on a bin the market correctly
+# prices at <= 15%, the model is essentially betting against a market
+# that's seeing reality the model is missing.  Realized edge in that zone
+# is negative.
+#
+# This veto is intentionally tighter than the 40pp W4 gate above — it
+# catches the 24-34pp disagreement cases that W4 misses.  It's separate
+# code path with its own reason string so the dashboard can distinguish.
+#
+# **REMOVAL TRIGGER** (checked at scan startup by
+# check_loss_stopper_removal_condition below — NOT just a comment):
+#   1. Per-city mean(actual - model_mu_c) within ±1°C across last 30+ closed events, AND
+#   2. High-disagreement bucket (model_p>=0.35, mkt_p<=0.15) shows
+#      non-negative cumulative PnL over the last 30+ events.
+# When both clear, the bot logs a WARNING at scan start urging removal.
+# A loss-stopper that outlives the loss is a self-imposed ceiling.
+LOSS_STOPPER_ENABLED       = bool(int(os.getenv("PREDICTOR_LOSS_STOPPER_ENABLED", "1")))
+LOSS_STOPPER_MODEL_P_MIN   = float(os.getenv("PREDICTOR_DISAGREEMENT_VETO_MODEL_P_MIN", "0.35"))
+LOSS_STOPPER_MKT_P_MAX     = float(os.getenv("PREDICTOR_DISAGREEMENT_VETO_MKT_P_MAX", "0.15"))
+# Removal-trigger evaluation parameters (override only when retuning).
+LOSS_STOPPER_REMOVAL_MIN_N           = int(  os.getenv("PREDICTOR_LOSS_STOPPER_REMOVAL_MIN_N",     "30"))
+LOSS_STOPPER_REMOVAL_BIAS_TOL_C      = float(os.getenv("PREDICTOR_LOSS_STOPPER_REMOVAL_BIAS_TOL_C", "1.0"))
+
 # Cold-start detection (data-quality contract).  If the first scan of a
 # city's day is at or after this local hour, NWS /forecastHourly may
 # have returned only evening cooling periods on that very first fetch —
@@ -577,6 +604,18 @@ def evaluate_gates(*, current_hour: int, edge: float, market_p: float,
         return False, f"too_early (hour={current_hour} < {MIN_TRIGGER_HOUR})"
     if current_hour > MAX_TRIGGER_HOUR:
         return False, f"too_late (hour={current_hour} > {MAX_TRIGGER_HOUR})"
+    # TEMPORARY loss-stopper (2026-06-17) — placed BEFORE
+    # market_too_skeptical so its more specific reason string surfaces
+    # in the dashboard for trades that would otherwise be lumped into
+    # the generic "market too skeptical" bucket.  See LOSS_STOPPER_*
+    # constants for rationale + the REMOVAL TRIGGER condition.
+    if (LOSS_STOPPER_ENABLED
+        and our_p is not None
+        and our_p >= LOSS_STOPPER_MODEL_P_MIN
+        and market_p <= LOSS_STOPPER_MKT_P_MAX):
+        return False, (f"loss_stopper_high_disagreement "
+                        f"(our_p={our_p:.3f} >= {LOSS_STOPPER_MODEL_P_MIN:.2f}, "
+                        f"mkt_p={market_p:.3f} <= {LOSS_STOPPER_MKT_P_MAX:.2f})")
     # Market sanity floor — bin must have at least MIN_MARKET_PROB market
     # confidence.  Catches catastrophic model errors: if market thinks a
     # bin has <15% chance, our model claiming 100% is almost certainly
@@ -1307,6 +1346,150 @@ def reconcile_pending_orders(conn: sqlite3.Connection) -> dict:
 # Main scan
 # ---------------------------------------------------------------------------
 
+def check_loss_stopper_removal_condition(
+    conn: sqlite3.Connection,
+    *, lookback_days: int = 30,
+    min_n: int = LOSS_STOPPER_REMOVAL_MIN_N,
+    bias_tol_c: float = LOSS_STOPPER_REMOVAL_BIAS_TOL_C,
+) -> dict:
+    """Check whether the temporary loss-stopper gate's removal conditions
+    are met based on the latest closed-trade data.  Returns a dict with
+    {'should_remove': bool, 'reasons': [...]} and emits a WARN log line
+    when both conditions clear.
+
+    REMOVAL CONDITIONS (must BOTH pass):
+      1. Per-city mean(actual - model_mu_c) within ±bias_tol_c (1°C
+         default) across at least min_n closed events PER CITY.
+      2. The high-disagreement bucket (our_p >= LOSS_STOPPER_MODEL_P_MIN
+         AND mkt_p <= LOSS_STOPPER_MKT_P_MAX) shows NON-NEGATIVE
+         cumulative PnL over at least min_n events (or zero events —
+         the gate is currently doing its job and there's nothing to
+         evaluate, AND cond1 has cleared).
+
+    The function is informational — never auto-disables.  The operator
+    flips PREDICTOR_LOSS_STOPPER_ENABLED=0 after reading the log.
+    """
+    result = {"should_remove": False, "reasons": [], "checked": True,
+              "cities_within_tol": [], "cities_out_of_tol": [],
+              "disagreement_bucket_pnl": None,
+              "disagreement_bucket_n": 0}
+    if not LOSS_STOPPER_ENABLED:
+        result["reasons"].append("gate already disabled")
+        return result
+
+    # --- Condition 1: per-city bias within tolerance --------------
+    try:
+        rows = conn.execute(f"""
+            WITH first_buy AS (
+                SELECT * FROM (
+                    SELECT s.contract_id, s.event_date, s.action, s.city,
+                           s.mu_c, s.scanned_at_utc,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY s.contract_id, s.event_date, s.action
+                               ORDER BY s.scanned_at_utc ASC
+                           ) AS rn
+                    FROM paper_predictor_signals s
+                    WHERE s.action = 'LIVE_BUY'
+                      AND s.event_date >= date('now', '-{lookback_days} days')
+                ) WHERE rn = 1
+            )
+            SELECT pa.city, COUNT(*) AS n,
+                   AVG(COALESCE(r.wunderground_high_c, r.metar_peak_t_group_c,
+                                  r.bot_observed_max_c) - s.mu_c) AS bias
+            FROM positions pa
+            JOIN first_buy s
+              ON s.contract_id = pa.contract_id AND s.event_date = pa.date
+            JOIN resolution_observations r
+              ON r.city = pa.city AND r.event_date = pa.date
+            WHERE pa.status = 'closed'
+              AND COALESCE(pa.is_paper, 0) = 0
+              AND pa.date >= date('now', '-{lookback_days} days')
+              AND s.mu_c IS NOT NULL
+            GROUP BY pa.city
+        """).fetchall()
+        for r in rows:
+            city, n, bias = r[0], int(r[1] or 0), r[2]
+            if n < min_n:
+                continue   # not enough data for this city; skip
+            if bias is not None and abs(float(bias)) <= bias_tol_c:
+                result["cities_within_tol"].append({
+                    "city": city, "n": n, "bias_c": float(bias)})
+            else:
+                result["cities_out_of_tol"].append({
+                    "city": city, "n": n,
+                    "bias_c": float(bias) if bias is not None else None})
+    except sqlite3.OperationalError as e:
+        result["reasons"].append(f"bias query failed: {e}")
+        return result
+
+    cond1 = (len(result["cities_within_tol"]) > 0
+             and len(result["cities_out_of_tol"]) == 0)
+
+    # --- Condition 2: high-disagreement bucket cumulative PnL ----
+    try:
+        r2 = conn.execute(f"""
+            WITH first_buy AS (
+                SELECT * FROM (
+                    SELECT s.contract_id, s.event_date, s.action,
+                           s.our_prob, s.market_prob, s.scanned_at_utc,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY s.contract_id, s.event_date, s.action
+                               ORDER BY s.scanned_at_utc ASC
+                           ) AS rn
+                    FROM paper_predictor_signals s
+                    WHERE s.action = 'LIVE_BUY'
+                      AND s.event_date >= date('now', '-{lookback_days} days')
+                ) WHERE rn = 1
+            )
+            SELECT COUNT(*) AS n, COALESCE(SUM(pa.pnl_net), 0) AS pnl
+            FROM positions pa
+            JOIN first_buy s
+              ON s.contract_id = pa.contract_id AND s.event_date = pa.date
+            WHERE pa.status = 'closed'
+              AND COALESCE(pa.is_paper, 0) = 0
+              AND pa.date >= date('now', '-{lookback_days} days')
+              AND s.our_prob   >= ?
+              AND s.market_prob <= ?
+        """, (LOSS_STOPPER_MODEL_P_MIN, LOSS_STOPPER_MKT_P_MAX)).fetchone()
+        n_dis = int(r2[0] or 0)
+        pnl_dis = float(r2[1] or 0)
+        result["disagreement_bucket_n"]   = n_dis
+        result["disagreement_bucket_pnl"] = pnl_dis
+    except sqlite3.OperationalError as e:
+        result["reasons"].append(f"disagreement-bucket query failed: {e}")
+        return result
+
+    # Cond2 passes if EITHER (no trades in the bucket — gate is doing
+    # its job, nothing measured) OR (enough trades AND non-negative
+    # cumulative PnL).  Zero-trades alone is NOT sufficient — without
+    # cond1 also being met, removing the gate would re-admit losses
+    # we don't yet have data on.
+    cond2 = (n_dis == 0) or (n_dis >= min_n and pnl_dis >= 0)
+
+    if cond1 and cond2:
+        result["should_remove"] = True
+        log.warning(
+            "loss-stopper REMOVAL CONDITION MET — consider disabling "
+            "(set PREDICTOR_LOSS_STOPPER_ENABLED=0).  "
+            f"Bias within tol for {len(result['cities_within_tol'])} cities. "
+            f"Disagreement bucket: n={n_dis} pnl=${pnl_dis:+.2f}"
+        )
+    else:
+        if not cond1:
+            result["reasons"].append(
+                f"cond1: {len(result['cities_out_of_tol'])} cities still "
+                f"outside ±{bias_tol_c}°C tolerance "
+                f"(within={len(result['cities_within_tol'])}, "
+                f"need all cities within)"
+            )
+        if not cond2:
+            result["reasons"].append(
+                f"cond2: high-disagreement bucket n={n_dis}/{min_n}, "
+                f"cumulative pnl=${pnl_dis:+.2f}"
+            )
+    return result
+
+
 def run_intraday_scan(*, dry_run: bool = False) -> dict:
     """Single scan across all US cities.  Returns summary dict.  Safe to
     call standalone for testing.
@@ -1328,6 +1511,16 @@ def run_intraday_scan(*, dry_run: bool = False) -> dict:
         _load_station_bias()
     except Exception as e:
         log.warning(f"station bias load failed: {e}")
+
+    # Loss-stopper removal-trigger check.  Cheap (single SQL pass) and
+    # purely observational — emits a WARN log when the temporary gate
+    # should be retired.  Failure here MUST NOT crash the scan.
+    if LOSS_STOPPER_ENABLED:
+        try:
+            with sqlite3.connect(DB_PATH) as _ls_conn:
+                check_loss_stopper_removal_condition(_ls_conn)
+        except Exception as e:
+            log.debug(f"loss-stopper removal check raised: {e}")
 
     us_cities = list(US_CITY_STATES.keys()) if US_CITY_STATES else [
         c for c, m in CITY_STATIONS.items() if m[0].startswith("K")
