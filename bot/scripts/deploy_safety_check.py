@@ -155,6 +155,14 @@ REQUIRED_NAMES: list[str] = [
     "loss_stopper_high_disagreement",        # gate reason string
     "def check_loss_stopper_removal_condition",
     "loss-stopper REMOVAL CONDITION MET",    # WARN log line — operator's trigger to act
+
+    # --- TWC settlement-truth audit (2026-06-17) ---
+    # New table for the TWC API integration's Phase 1 (settlement-
+    # truth verification).  Schema is in _SCHEMA_SQL.  If the table
+    # name disappears, the audit script falls back to creating it
+    # itself via ensure_audit_table, but losing the canonical
+    # definition means the two will drift.
+    "twc_settlement_audit",
 ]
 
 # Names that must be present in bot/main.py to confirm the boundary

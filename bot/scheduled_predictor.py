@@ -454,6 +454,47 @@ CREATE TABLE IF NOT EXISTS boundary_trigger_log (
     anchor_mode                 TEXT,          -- forecast | market_consensus (which rule picked the bin)
     notes                       TEXT
 );
+
+-- The Weather Company (TWC) settlement-truth audit.  Phase 1 of TWC
+-- API integration.  Per resolved Polymarket event, capture what TWC's
+-- two candidate endpoints (Historical Daily Summary + Site-Based
+-- Observations) say the day's max was, round into the settlement
+-- unit using Polymarket's half-up convention, assign to a bin, and
+-- compare to the bin Polymarket actually settled on.  Decides
+-- whether TWC can replace the dead Wunderground scraper as the
+-- ground-truth source.  Pure measurement — no live-trading code
+-- reads this table.
+CREATE TABLE IF NOT EXISTS twc_settlement_audit (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id                    TEXT NOT NULL UNIQUE,
+    city                        TEXT,
+    event_date                  TEXT,
+    icao                        TEXT,
+    settlement_unit             TEXT,           -- 'fahrenheit' | 'celsius'
+    polymarket_winning_low      REAL,
+    polymarket_winning_high     REAL,
+    polymarket_winning_label    TEXT,
+    -- Candidate 1: TWC Historical Conditions - Daily Summary (CoD blend)
+    twc_dailysummary_max        REAL,
+    twc_dailysummary_unit       TEXT,           -- 'F' | 'C' as returned
+    twc_dailysummary_day_window TEXT,           -- '7am-7am-local' etc (whatever the API exposes)
+    twc_dailysummary_bin_low    REAL,
+    twc_dailysummary_bin_high   REAL,
+    dailysummary_match          INTEGER,        -- 0/1: rounded value falls inside winning bin
+    dailysummary_notes          TEXT,
+    -- Candidate 2: TWC Site-Based Observations (raw station)
+    twc_sitebased_max           REAL,           -- max we computed across the calendar day
+    twc_sitebased_unit          TEXT,
+    twc_sitebased_n_obs         INTEGER,        -- how many obs we aggregated
+    twc_sitebased_bin_low       REAL,
+    twc_sitebased_bin_high      REAL,
+    sitebased_match             INTEGER,
+    sitebased_notes             TEXT,
+    captured_at_utc             TEXT NOT NULL,
+    api_call_notes              TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_tsa_city_date
+    ON twc_settlement_audit(city, event_date);
 CREATE INDEX IF NOT EXISTS idx_btl_evaluated
     ON boundary_trigger_log(evaluated_at_utc);
 CREATE INDEX IF NOT EXISTS idx_btl_city_date
