@@ -207,7 +207,8 @@ def test_audit_one_writes_row_and_records_match(monkeypatch):
         "winning_high":   95.0,
         "winning_label":  "94-95°F",
     }
-    row = twc_mod.audit_one(conn, ev, dry_run=False, rate_limit_ms=0)
+    row = twc_mod.audit_one(conn, ev, dry_run=False, rate_limit_ms=0,
+                                  enable_sitebased=True)
     assert row["dailysummary_match"] == 1
     assert row["sitebased_match"] == 1
     # Persisted row should be readable back
@@ -243,9 +244,85 @@ def test_audit_one_records_miss_on_wrong_bin(monkeypatch):
         "winning_high":   95.0,
         "winning_label":  "94-95°F",
     }
-    row = twc_mod.audit_one(conn, ev, dry_run=False, rate_limit_ms=0)
+    row = twc_mod.audit_one(conn, ev, dry_run=False, rate_limit_ms=0,
+                                  enable_sitebased=True)
     assert row["dailysummary_match"] == 0
     assert row["sitebased_match"] == 0
+
+
+def test_30day_block_cached_per_icao(monkeypatch):
+    """Critical efficiency invariant: the 30-day endpoint is fetched
+    ONCE per (icao, units), not once per event.  This is what turns
+    ~95 calls into ~11.  If a future refactor breaks the cache, this
+    test screams."""
+    from scripts import twc_settlement_audit as twc_mod
+    # Clear the module-level cache so this test isn't polluted
+    twc_mod._DAILY_SUMMARY_CACHE.clear()
+
+    http_calls = {"n": 0}
+
+    def fake_get(path, params, *, dry_run=False):
+        http_calls["n"] += 1
+        # Return a valid-looking 30-day block for any (icao, date) lookup
+        return [{
+            "id": params.get("icaoCode"),
+            "v3-wx-conditions-historical-dailysummary-30day": {
+                "temperatureMax":  [94 for _ in range(30)],
+                "validTimeLocal":  [f"2026-06-{17-i:02d}T07:00:00-0500"
+                                     for i in range(30)],
+            }
+        }]
+    monkeypatch.setattr(twc_mod, "_twc_get", fake_get)
+
+    # 3 events on the same ICAO + 2 on a different one = 2 expected HTTP calls
+    for date_iso in ("2026-06-15", "2026-06-14", "2026-06-13"):
+        v, unit, win, notes = twc_mod.twc_daily_summary_max(
+            "KMIA", date_iso, "fahrenheit", dry_run=False)
+        assert v == 94, f"unexpected value for {date_iso}: {v} ({notes})"
+    for date_iso in ("2026-06-15", "2026-06-14"):
+        v, unit, win, notes = twc_mod.twc_daily_summary_max(
+            "KATL", date_iso, "fahrenheit", dry_run=False)
+        assert v == 94
+
+    assert http_calls["n"] == 2, (
+        f"expected 1 HTTP call per (icao, units) = 2 total, got {http_calls['n']}"
+    )
+
+
+def test_audit_one_sitebased_disabled_by_default_skips_call(monkeypatch):
+    """Default enable_sitebased=False — the site-based call must NOT
+    be made, and the row records skipped notes (distinguishable from
+    real API failures)."""
+    from scripts import twc_settlement_audit as twc_mod
+
+    call_count = {"ds": 0, "sb": 0}
+    def fake_ds(icao, date_iso, su, *, dry_run):
+        call_count["ds"] += 1
+        return (94.5, "F", "7am-7am-local", "")
+    def fake_sb(icao, date_iso, su, *, dry_run):
+        call_count["sb"] += 1
+        return (95.0, "F", 24, "")
+    monkeypatch.setattr(twc_mod, "twc_daily_summary_max", fake_ds)
+    monkeypatch.setattr(twc_mod, "twc_sitebased_daily_max", fake_sb)
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    ensure_audit_table(conn)
+    ev = {
+        "event_id": "test-event-skip-sb", "city": "Miami",
+        "event_date": "2026-06-15", "icao": "KMIA",
+        "settlement_unit": "fahrenheit",
+        "winning_low": 94.0, "winning_high": 95.0,
+        "winning_label": "94-95°F",
+    }
+    # NOT passing enable_sitebased — should default to False
+    row = twc_mod.audit_one(conn, ev, dry_run=False, rate_limit_ms=0)
+    assert call_count["ds"] == 1, "daily summary must still fire"
+    assert call_count["sb"] == 0, "site-based MUST NOT fire when disabled"
+    assert row["dailysummary_match"] == 1
+    assert row["sitebased_match"] is None
+    # Notes should make the skip visible, not look like a real failure
+    assert "skipped" in (row["sitebased_notes"] or "")
 
 
 def test_audit_one_records_none_on_api_failure(monkeypatch):
@@ -266,7 +343,8 @@ def test_audit_one_records_none_on_api_failure(monkeypatch):
         "winning_low": 94.0, "winning_high": 95.0,
         "winning_label": "94-95°F",
     }
-    row = twc_mod.audit_one(conn, ev, dry_run=False, rate_limit_ms=0)
+    row = twc_mod.audit_one(conn, ev, dry_run=False, rate_limit_ms=0,
+                                  enable_sitebased=True)
     assert row["dailysummary_match"] is None
     assert row["sitebased_match"] is None
     assert "http_error" in row["dailysummary_notes"]

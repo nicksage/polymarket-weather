@@ -88,6 +88,13 @@ logging.basicConfig(
 )
 log = logging.getLogger("twc_settlement_audit")
 
+# CRITICAL: httpx's INFO-level logger prints the full request URL on
+# every call, which INCLUDES the apiKey query parameter.  Silence it
+# so the key cannot leak into shell history / log files / pasted
+# terminal output.  Our own _twc_get() prints a redacted URL on demand.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 
 # ============================================================
 # TWC API conventions
@@ -101,14 +108,26 @@ log = logging.getLogger("twc_settlement_audit")
 TWC_API_BASE = os.getenv("TWC_API_BASE", "https://api.weather.com")
 TWC_API_KEY  = os.getenv("TWC_API_KEY", "")
 
-# Endpoint paths from the integration spec.  If TWC returns 404 on
-# either of these, the path moved and we update here.
+# Daily Summary 30-day endpoint per the TWC docs the operator pasted
+# 2026-06-17.  Returns ONE response per ICAO covering the most-recent
+# 30 days — we batch by station to make ~11 calls cover ~95 events
+# instead of 95 individual calls.
 TWC_DAILY_SUMMARY_PATH = os.getenv(
     "TWC_DAILY_SUMMARY_PATH",
-    "/v3/wx/conditions/historical/dailysummary")
+    "/v3/wx/conditions/historical/dailysummary/30day")
+# Site-based historical observations.  As of 2026-06-17 the operator's
+# TWC package (Weather Company Data - New Standard Weather APIs) does
+# not include this endpoint — 403 "apikey is not authorized for this
+# product".  Default OFF; --enable-sitebased re-attempts.
 TWC_SITEBASED_PATH = os.getenv(
     "TWC_SITEBASED_PATH",
     "/v3/wx/observations/historical/sitebased")
+TWC_SITEBASED_DEFAULT_ENABLED = bool(int(
+    os.getenv("TWC_SITEBASED_ENABLED", "0")))
+
+# Default 'language' param is REQUIRED per the docs.  Keeping a
+# constant so we set it consistently on every call.
+TWC_LANGUAGE = os.getenv("TWC_LANGUAGE", "en-US")
 
 # Per-call HTTP timeout.  TWC historical endpoints can be slow on
 # first call after a cold cache.
@@ -180,22 +199,21 @@ def _twc_units_for(settlement_unit: str) -> str:
 
 
 def _twc_get(path: str, params: dict, *, dry_run: bool = False) -> dict:
-    """Centralized TWC GET.  Logs the URL (with key REDACTED) on
-    every call so first-run failures are easy to reproduce by curl."""
+    """Centralized TWC GET.  Always includes the required `language`,
+    `format`, `apiKey` params.  Never logs the key.  Surfaces 4xx/5xx
+    bodies so first-run failures are easy to diagnose."""
     if not TWC_API_KEY and not dry_run:
         raise RuntimeError(
             "TWC_API_KEY env var is empty — set it in .env and re-run.")
-    full = {**params, "apiKey": TWC_API_KEY, "format": "json"}
-    redacted = {**params, "apiKey": "***REDACTED***", "format": "json"}
+    full = {**params,
+            "language": TWC_LANGUAGE,
+            "format":   "json",
+            "apiKey":   TWC_API_KEY}
     url = f"{TWC_API_BASE}{path}"
-    log.debug(f"TWC GET {url} {redacted}")
     if dry_run:
         return {"_dry_run": True}
     resp = httpx.get(url, params=full, timeout=TWC_TIMEOUT_S)
     if resp.status_code != 200:
-        # Surface 4xx/5xx with body so the user sees TWC's error
-        # explanation (often: "wrong units code", "ICAO not found",
-        # "endpoint path renamed").
         raise RuntimeError(
             f"TWC HTTP {resp.status_code} on {url}: {resp.text[:500]}")
     try:
@@ -204,66 +222,112 @@ def _twc_get(path: str, params: dict, *, dry_run: bool = False) -> dict:
         raise RuntimeError(f"TWC returned non-JSON: {resp.text[:500]}") from e
 
 
+# Per-station cache for the 30-day daily-summary call so we only hit
+# the endpoint ONCE per ICAO regardless of how many events we audit.
+# Keyed by (icao, units).  Cleared per script invocation.
+_DAILY_SUMMARY_CACHE: dict = {}
+
+
+def _twc_fetch_30day_block(
+    icao: str, settlement_unit: str, *, dry_run: bool = False,
+) -> tuple[Optional[dict], str]:
+    """One call per ICAO: fetch the full 30-day daily-summary block.
+    Returns (block_dict, notes) where block_dict has the parsed
+    'temperatureMax' / 'validTimeLocal' arrays the date lookup uses.
+    Cached so multiple events on the same station share the call."""
+    key = (icao, settlement_unit)
+    if key in _DAILY_SUMMARY_CACHE:
+        return _DAILY_SUMMARY_CACHE[key]
+    try:
+        data = _twc_get(TWC_DAILY_SUMMARY_PATH, {
+            "icaoCode": icao,
+            "units":    _twc_units_for(settlement_unit),
+        }, dry_run=dry_run)
+    except Exception as e:
+        _DAILY_SUMMARY_CACHE[key] = (None, f"http_error: {e}")
+        return _DAILY_SUMMARY_CACHE[key]
+    if dry_run:
+        _DAILY_SUMMARY_CACHE[key] = (None, "dry_run")
+        return _DAILY_SUMMARY_CACHE[key]
+    # Response shape from the TWC docs:
+    #   [{"id": "...", "v3-wx-conditions-historical-dailysummary-30day": {
+    #       "temperatureMax": [86, ...], "validTimeLocal": [...], ...}}]
+    try:
+        if isinstance(data, list) and data:
+            wrapper = data[0]
+        elif isinstance(data, dict):
+            wrapper = data
+        else:
+            _DAILY_SUMMARY_CACHE[key] = (
+                None, f"unexpected_response_type: {type(data).__name__}")
+            return _DAILY_SUMMARY_CACHE[key]
+        # The nested key matches the product name.  Find it by suffix
+        # to avoid hard-coding the full string in case TWC versions it.
+        block = None
+        for k, v in wrapper.items():
+            if k == "id":
+                continue
+            if isinstance(v, dict) and "temperatureMax" in v:
+                block = v
+                break
+        if block is None:
+            _DAILY_SUMMARY_CACHE[key] = (
+                None,
+                f"no_temperatureMax_block (wrapper_keys={list(wrapper.keys())})")
+            return _DAILY_SUMMARY_CACHE[key]
+        _DAILY_SUMMARY_CACHE[key] = (block, "")
+        return _DAILY_SUMMARY_CACHE[key]
+    except Exception as e:
+        _DAILY_SUMMARY_CACHE[key] = (None, f"parse_error: {e}")
+        return _DAILY_SUMMARY_CACHE[key]
+
+
 def twc_daily_summary_max(
     icao: str, date_iso: str, settlement_unit: str,
     *, dry_run: bool = False,
 ) -> tuple[Optional[float], str, str, str]:
-    """Hit /v3/wx/conditions/historical/dailysummary for one (icao, date).
+    """Look up the day's max from the cached 30-day block for this
+    (icao, units).  First call per ICAO triggers the actual HTTP fetch;
+    subsequent events on the same station read from cache.
 
     Returns (max_temp_in_returned_unit, returned_unit, day_window, notes).
 
-    On first real run, if the response shape doesn't match the
-    assumed paths below, the parse code will fail loudly — fix the
-    'PARSE PATH:' lines and re-run.
+    Day-window note is always '7am-7am-local' per the TWC docs —
+    this is THE critical caveat the audit spec told us to record per
+    event, because the 7am-7am window can clip a daily-max that
+    occurs near 7am.
     """
-    ymd = date_iso.replace("-", "")
-    try:
-        data = _twc_get(TWC_DAILY_SUMMARY_PATH, {
-            "icaoCode":  icao,
-            "startDate": ymd,
-            "endDate":   ymd,
-            "units":     _twc_units_for(settlement_unit),
-        }, dry_run=dry_run)
-    except Exception as e:
-        return None, "", "", f"http_error: {e}"
+    day_window = "7am-7am-local"
+    unit_returned = "F" if _twc_units_for(settlement_unit) == "e" else "C"
 
-    if dry_run:
-        return None, "", "", "dry_run"
+    block, block_notes = _twc_fetch_30day_block(
+        icao, settlement_unit, dry_run=dry_run)
+    if block is None:
+        return None, unit_returned, day_window, block_notes
 
-    # PARSE PATH (TWC v3 convention guess — adjust on first failure):
-    #   data["summaries"][0]["temperatureMax"]
-    #   data["summaries"][0]["validTimeLocal"]
-    # Alternates seen in TWC docs:
-    #   data["observations"][...]
-    #   data["dailySummary"][0]["maxTemp"]
-    try:
-        summaries = (data.get("summaries")
-                       or data.get("observations")
-                       or [])
-        if not summaries:
-            return None, "", "", f"no_summaries_in_response (keys={list(data.keys())})"
-        s = summaries[0]
-        # Try the most common TWC v3 field names in order
-        v = (s.get("temperatureMax")
-             if "temperatureMax" in s else
-             s.get("maxTemp")
-             if "maxTemp" in s else
-             s.get("temp_max")
-             if "temp_max" in s else
-             None)
-        # Unit hint from the units param we sent
-        unit_returned = "F" if _twc_units_for(settlement_unit) == "e" else "C"
-        # Day-window note (the spec flags this as critical to record)
-        day_window = "7am-7am-local"   # per TWC docs; verify on first run
-        if v is None:
-            return None, unit_returned, day_window, (
-                f"no_temperatureMax_field (sample_keys={list(s.keys())[:8]})")
-        return float(v), unit_returned, day_window, ""
-    except (KeyError, IndexError, TypeError) as e:
-        # Save the raw response shape so a follow-up parser fix has
-        # something to work with.
-        keys = list(data.keys()) if isinstance(data, dict) else "(not dict)"
-        return None, "", "", f"parse_error: {e} (top_keys={keys})"
+    # The 30-day arrays are aligned by index.  Find the day whose
+    # validTimeLocal STARTS WITH our event_date (the local-time '07:00'
+    # marker shows the start of TWC's 7am-7am window for that calendar day).
+    times = block.get("validTimeLocal") or []
+    temps = block.get("temperatureMax") or []
+    if len(times) != len(temps):
+        return None, unit_returned, day_window, (
+            f"misaligned_arrays (times={len(times)}, temps={len(temps)})")
+    target_prefix = date_iso     # 'YYYY-MM-DD'
+    idx = None
+    for i, t in enumerate(times):
+        if isinstance(t, str) and t.startswith(target_prefix):
+            idx = i
+            break
+    if idx is None:
+        return None, unit_returned, day_window, (
+            f"date_not_in_30day_block (have {len(times)} days, "
+            f"first={times[0] if times else 'none'}, "
+            f"last={times[-1] if times else 'none'})")
+    v = temps[idx]
+    if v is None:
+        return None, unit_returned, day_window, "temperatureMax_null_for_date"
+    return float(v), unit_returned, day_window, ""
 
 
 def twc_sitebased_daily_max(
@@ -443,7 +507,8 @@ def attach_icao(events: list[dict]) -> list[dict]:
 
 
 def audit_one(conn: sqlite3.Connection, ev: dict, *,
-                  dry_run: bool, rate_limit_ms: int) -> dict:
+                  dry_run: bool, rate_limit_ms: int,
+                  enable_sitebased: bool = False) -> dict:
     """Hit both TWC endpoints for one resolved event, compute bin
     matches, write/upsert one row in twc_settlement_audit, return
     the row dict."""
@@ -454,9 +519,13 @@ def audit_one(conn: sqlite3.Connection, ev: dict, *,
     win_hi = ev["winning_high"]
 
     # --- Daily Summary candidate ---
+    # Cached per (icao, units): first event per station triggers the
+    # real HTTP fetch (rate-limit applied then); subsequent events on
+    # the same station are free cache hits.
+    cache_hit_before = (icao, settlement_unit) in _DAILY_SUMMARY_CACHE
     ds_max, ds_unit, ds_window, ds_notes = twc_daily_summary_max(
         icao, date_iso, settlement_unit, dry_run=dry_run)
-    if rate_limit_ms and not dry_run:
+    if rate_limit_ms and not dry_run and not cache_hit_before:
         time.sleep(rate_limit_ms / 1000.0)
     ds_bin_low = ds_bin_high = None
     ds_match: Optional[int] = None
@@ -466,18 +535,23 @@ def audit_one(conn: sqlite3.Connection, ev: dict, *,
             v_settled, win_lo, win_hi)
         ds_match = 1 if ds_matches else 0
 
-    # --- Site-Based candidate ---
-    sb_max, sb_unit, sb_n, sb_notes = twc_sitebased_daily_max(
-        icao, date_iso, settlement_unit, dry_run=dry_run)
-    if rate_limit_ms and not dry_run:
-        time.sleep(rate_limit_ms / 1000.0)
+    # --- Site-Based candidate (gated; not entitled by default) ---
+    sb_max = None
+    sb_unit = ""
+    sb_n = 0
+    sb_notes = "skipped (use --enable-sitebased once entitlement is confirmed)"
     sb_bin_low = sb_bin_high = None
     sb_match: Optional[int] = None
-    if sb_max is not None:
-        v_settled = _ensure_settlement_unit_value(sb_max, sb_unit, settlement_unit)
-        sb_bin_low, sb_bin_high, sb_matches = assign_bin_in_settlement_unit(
-            v_settled, win_lo, win_hi)
-        sb_match = 1 if sb_matches else 0
+    if enable_sitebased:
+        sb_max, sb_unit, sb_n, sb_notes = twc_sitebased_daily_max(
+            icao, date_iso, settlement_unit, dry_run=dry_run)
+        if rate_limit_ms and not dry_run:
+            time.sleep(rate_limit_ms / 1000.0)
+        if sb_max is not None:
+            v_settled = _ensure_settlement_unit_value(sb_max, sb_unit, settlement_unit)
+            sb_bin_low, sb_bin_high, sb_matches = assign_bin_in_settlement_unit(
+                v_settled, win_lo, win_hi)
+            sb_match = 1 if sb_matches else 0
 
     row = {
         "event_id":                 ev["event_id"],
@@ -631,7 +705,16 @@ def main(argv: list[str] | None = None) -> int:
                        help="Re-audit events already in twc_settlement_audit "
                             "(default: skip already-audited).")
     ap.add_argument("--rate-limit-ms", type=int, default=500,
-                       help="Sleep between API calls (default: 500ms = 2/sec).")
+                       help="Sleep between API calls (default: 500ms = 2/sec). "
+                            "Only applied on cache MISSES — daily-summary is "
+                            "cached per ICAO so re-using a station is free.")
+    ap.add_argument("--enable-sitebased", action="store_true",
+                       default=TWC_SITEBASED_DEFAULT_ENABLED,
+                       help="Also hit the site-based historical observations "
+                            "endpoint.  Default OFF — confirm your TWC plan "
+                            "includes 'Site-Based Historical Observations' "
+                            "before enabling, otherwise every call returns "
+                            "403 'apikey is not authorized for this product'.")
     ap.add_argument("--dry-run", action="store_true",
                        help="List events that would be audited; no API calls.")
     ap.add_argument("--report-only", action="store_true",
@@ -681,12 +764,15 @@ def main(argv: list[str] | None = None) -> int:
                   "Set it in .env and re-run.", file=sys.stderr)
             return 1
 
-        log.info(f"starting audit; rate_limit={args.rate_limit_ms}ms between calls")
+        log.info(f"starting audit; rate_limit={args.rate_limit_ms}ms on "
+                 f"cache MISSES (daily-summary cached per ICAO); "
+                 f"sitebased={'ON' if args.enable_sitebased else 'OFF'}")
         n_ok = n_fail = 0
         for i, ev in enumerate(events, 1):
             try:
                 r = audit_one(conn, ev, dry_run=False,
-                                  rate_limit_ms=args.rate_limit_ms)
+                                  rate_limit_ms=args.rate_limit_ms,
+                                  enable_sitebased=args.enable_sitebased)
                 ds_v = r["dailysummary_match"]
                 sb_v = r["sitebased_match"]
                 ds_s = "MATCH" if ds_v == 1 else ("miss" if ds_v == 0 else "fail")
