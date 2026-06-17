@@ -62,11 +62,66 @@ _BUCKET_ORDER = ["morning  (<12)", "early PM (12-13)", "mid PM   (14-15)",
                   "late PM  (16-17)", "evening  (>=18)", "(unknown)"]
 
 
+def probe_db(conn: sqlite3.Connection, days: int) -> None:
+    """Print a one-screen probe of what's actually in the DB.  Useful
+    when the main bias query returns zero rows — tells you whether the
+    issue is no live positions, no signal joins, or no resolution data."""
+    def n(q: str, args: tuple = ()) -> int:
+        try:
+            return int(conn.execute(q, args).fetchone()[0] or 0)
+        except sqlite3.OperationalError:
+            return -1
+    window = f"-{days} days"
+    print()
+    print("=" * 70)
+    print(f"DB probe (last {days} days)")
+    print("=" * 70)
+    print(f"  positions (any)                      : {n('SELECT COUNT(*) FROM positions WHERE date >= date(\"now\", ?)', (window,))}")
+    print(f"  positions live (is_paper=0)          : {n('SELECT COUNT(*) FROM positions WHERE date >= date(\"now\", ?) AND COALESCE(is_paper,0)=0', (window,))}")
+    print(f"  positions live, status=closed         : {n('SELECT COUNT(*) FROM positions WHERE date >= date(\"now\", ?) AND COALESCE(is_paper,0)=0 AND status=\"closed\"', (window,))}")
+    print(f"  positions live, status=open           : {n('SELECT COUNT(*) FROM positions WHERE date >= date(\"now\", ?) AND COALESCE(is_paper,0)=0 AND status=\"open\"', (window,))}")
+    print(f"  positions live, ANY status            : "
+          f"closed={n('SELECT COUNT(*) FROM positions WHERE date >= date(\"now\", ?) AND COALESCE(is_paper,0)=0 AND status=\"closed\"', (window,))}, "
+          f"open={n('SELECT COUNT(*) FROM positions WHERE date >= date(\"now\", ?) AND COALESCE(is_paper,0)=0 AND status=\"open\"', (window,))}, "
+          f"exiting={n('SELECT COUNT(*) FROM positions WHERE date >= date(\"now\", ?) AND COALESCE(is_paper,0)=0 AND status=\"exiting\"', (window,))}, "
+          f"other={n('SELECT COUNT(*) FROM positions WHERE date >= date(\"now\", ?) AND COALESCE(is_paper,0)=0 AND status NOT IN (\"closed\",\"open\",\"exiting\")', (window,))}")
+    print(f"  paper_predictor_signals LIVE_BUY     : {n('SELECT COUNT(*) FROM paper_predictor_signals WHERE action=\"LIVE_BUY\" AND event_date >= date(\"now\", ?)', (window,))}")
+    print(f"  resolution_observations              : {n('SELECT COUNT(*) FROM resolution_observations WHERE event_date >= date(\"now\", ?)', (window,))}")
+    # Winners: bins in latest-scan with market_prob >= 0.99 (the
+    # dashboard's resolution signal)
+    print(f"  paper_predictor_signals winners      : "
+          f"{n('SELECT COUNT(DISTINCT city || event_date) FROM paper_predictor_signals WHERE market_prob >= 0.99 AND event_date >= date(\"now\", ?)', (window,))}")
+    # Most recent event_dates with positions
+    try:
+        rows = conn.execute(
+            "SELECT date, COUNT(*) FROM positions "
+            "WHERE date >= date('now', ?) AND COALESCE(is_paper,0)=0 "
+            "GROUP BY date ORDER BY date DESC LIMIT 8",
+            (window,)
+        ).fetchall()
+        if rows:
+            print(f"  recent live-position dates           : "
+                  + ", ".join(f"{d}({n})" for d, n in rows))
+    except sqlite3.OperationalError:
+        pass
+    print()
+
+
 def fetch_closed_buys(conn: sqlite3.Connection, days: int,
-                          city_filter: Optional[str]) -> list[dict]:
-    """All closed live positions with their first_buy_signal model state
-    + the resolution truth.  Mirrors the Analysis tab's first_buy_signal
-    CTE so the numbers compare to what the dashboard shows."""
+                          city_filter: Optional[str],
+                          *, include_open: bool = False) -> list[dict]:
+    """All live positions with their first_buy_signal model state, the
+    resolution truth (if captured), AND the winner-bin midpoint as a
+    fallback actual.  Mirrors the Analysis tab's CTEs so the numbers
+    line up with what the dashboard shows.
+
+    include_open=True relaxes the status filter to also include open
+    positions whose market has resolved (winning bin known) — useful
+    when the bot hasn't sold/redeemed yet but we already know what
+    settled.
+    """
+    status_clause = ("AND pa.status IN ('closed', 'open', 'exiting')"
+                      if include_open else "AND pa.status = 'closed'")
     sql = f"""
     WITH first_buy_signal AS (
         SELECT * FROM (
@@ -85,11 +140,29 @@ def fetch_closed_buys(conn: sqlite3.Connection, days: int,
               AND s.event_date >= date('now', ?)
         )
         WHERE rn = 1
+    ),
+    latest_scan AS (
+        SELECT city, event_date, MAX(scanned_at_utc) AS max_ts
+        FROM paper_predictor_signals
+        WHERE event_date >= date('now', ?)
+        GROUP BY city, event_date
+    ),
+    winners AS (
+        SELECT s.city, s.event_date,
+               s.bin_range_low  AS win_lo,
+               s.bin_range_high AS win_hi,
+               s.unit           AS win_unit
+        FROM paper_predictor_signals s
+        JOIN latest_scan ls
+          ON ls.city = s.city AND ls.event_date = s.event_date
+         AND ls.max_ts = s.scanned_at_utc
+        WHERE s.market_prob >= 0.99
     )
     SELECT
         pa.city                AS city,
         pa.date                AS event_date,
         pa.contract_id         AS contract_id,
+        pa.status              AS pos_status,
         pa.range_low           AS bought_lo,
         pa.range_high          AS bought_hi,
         pa.unit                AS unit,
@@ -105,7 +178,9 @@ def fetch_closed_buys(conn: sqlite3.Connection, days: int,
         r.wunderground_high_c  AS wunderground_c,
         r.metar_peak_t_group_c AS metar_t_c,
         r.bot_observed_max_c   AS bot_obs_c,
-        r.winning_bin_label    AS winning_bin
+        w.win_lo               AS win_lo,
+        w.win_hi               AS win_hi,
+        w.win_unit             AS win_unit
     FROM positions pa
     JOIN first_buy_signal s
       ON s.contract_id = pa.contract_id
@@ -114,20 +189,28 @@ def fetch_closed_buys(conn: sqlite3.Connection, days: int,
        OR (COALESCE(pa.is_paper, 0) = 1 AND s.action = 'PAPER_BUY'))
     LEFT JOIN resolution_observations r
       ON r.city = pa.city AND r.event_date = pa.date
-    WHERE pa.status = 'closed'
-      AND COALESCE(pa.is_paper, 0) = 0
+    LEFT JOIN winners w
+      ON w.city = pa.city AND w.event_date = pa.date
+    WHERE COALESCE(pa.is_paper, 0) = 0
       AND pa.date >= date('now', ?)
+      {status_clause}
     """
-    # Two bindings: one for the first_buy_signal date cutoff, one for
-    # the positions date cutoff.  City filter applied in Python below.
     window = f"-{days} days"
-    rows = conn.execute(sql, (window, window)).fetchall()
+    # Three bindings: first_buy_signal date cutoff, latest_scan date cutoff,
+    # positions date cutoff.  City filter applied in Python below.
+    rows = conn.execute(sql, (window, window, window)).fetchall()
     out = []
     for r in rows:
         d = dict(r)
         if city_filter and d["city"] != city_filter:
             continue
-        # Pick actual_c: Wunderground > T-group > bot_observed; record source
+        # Pick actual_c.  Priority order:
+        #   1. wunderground_high_c            (most accurate, if capture ran)
+        #   2. metar_peak_t_group_c           (T-group tenths, very accurate)
+        #   3. bot_observed_max_c             (whole-°C body precision)
+        #   4. winning_bin midpoint           (least accurate, ±0.5 unit, but
+        #                                        always available when market
+        #                                        has resolved to a clear winner)
         if d["wunderground_c"] is not None:
             d["actual_c"]      = float(d["wunderground_c"])
             d["actual_source"] = "wunderground"
@@ -137,6 +220,14 @@ def fetch_closed_buys(conn: sqlite3.Connection, days: int,
         elif d["bot_obs_c"] is not None:
             d["actual_c"]      = float(d["bot_obs_c"])
             d["actual_source"] = "bot_observed_max"
+        elif d["win_lo"] is not None and d["win_hi"] is not None:
+            mid = (float(d["win_lo"]) + float(d["win_hi"])) / 2.0
+            unit = (d.get("win_unit") or "").lower()
+            if unit == "fahrenheit":
+                d["actual_c"] = (mid - 32.0) * 5.0 / 9.0
+            else:
+                d["actual_c"] = mid
+            d["actual_source"] = "winning_bin_midpoint"
         else:
             d["actual_c"]      = None
             d["actual_source"] = None
@@ -362,6 +453,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--db",   default=DEFAULT_DB)
     ap.add_argument("--days", type=int, default=30)
     ap.add_argument("--city", default=None, help="limit to one city")
+    ap.add_argument("--closed-only", action="store_true",
+                       help="strict status='closed' filter (default: include "
+                            "open + exiting positions where the market has "
+                            "resolved to a winner — mirrors dashboard logic)")
     args = ap.parse_args(argv)
 
     if not os.path.exists(args.db):
@@ -372,24 +467,40 @@ def main(argv: list[str] | None = None) -> int:
     print(f"window: last {args.days} days")
     if args.city:
         print(f"city:   {args.city}")
+    print(f"status: {'closed only' if args.closed_only else 'closed + open + exiting (resolved markets)'}")
 
     with sqlite3.connect(args.db) as conn:
         conn.row_factory = sqlite3.Row
-        rows = fetch_closed_buys(conn, args.days, args.city)
-    print(f"closed live trades found: {len(rows)}")
+        probe_db(conn, args.days)
+        rows = fetch_closed_buys(conn, args.days, args.city,
+                                      include_open=not args.closed_only)
+    print(f"live trades found (after filters): {len(rows)}")
     n_with_actual = sum(1 for r in rows if r.get("actual_c") is not None)
     n_wund        = sum(1 for r in rows if r.get("actual_source") == "wunderground")
     n_metar       = sum(1 for r in rows if r.get("actual_source") == "metar_t_group")
     n_bot         = sum(1 for r in rows if r.get("actual_source") == "bot_observed_max")
+    n_winbin      = sum(1 for r in rows if r.get("actual_source") == "winning_bin_midpoint")
     print(f"  with actual_c:       {n_with_actual}/{len(rows)}  "
           f"(wunderground={n_wund}, metar_t_group={n_metar}, "
-          f"bot_observed_max={n_bot})")
+          f"bot_observed_max={n_bot}, winning_bin_midpoint={n_winbin})")
 
+    if len(rows) == 0:
+        print()
+        print("No live trades joined to first_buy_signal.  Look at the DB probe")
+        print("above to see WHY -- typical causes:")
+        print("  * 0 live positions     -> the bot has been paper-only, or LIVE_BUY")
+        print("                              signals didn't reach execute_signal.")
+        print("  * positions but no LIVE_BUY signals -> action column mismatch")
+        print("                                          (LIVE_BUY vs PAPER_BUY).")
+        print("  * positions + signals but no resolved winners ->")
+        print("                              market hasn't settled yet today.")
+        return 0
     if n_with_actual == 0:
         print()
-        print("No resolution_observations rows joined — either none of the")
-        print("closed events have been captured, OR the capture script hasn't")
-        print("backfilled the window.  Run capture before re-running this.")
+        print("Joined positions but no actual_c source available.  Neither")
+        print("resolution_observations capture has run for these events nor")
+        print("does the latest scan show a >=99% market_p bin (winner).")
+        print("Re-run after settlement closes today's markets.")
         return 0
 
     print_per_city_table(rows)
