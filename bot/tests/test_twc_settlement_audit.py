@@ -250,6 +250,56 @@ def test_audit_one_records_miss_on_wrong_bin(monkeypatch):
     assert row["sitebased_match"] == 0
 
 
+def test_30day_block_handles_flat_response(monkeypatch):
+    """Regression test for 2026-06-17: TWC returns the daily-summary
+    fields FLAT on the wrapper, NOT nested under the product-name key
+    the published docs show.  Both shapes must work — flat is what
+    actually arrives in practice."""
+    from scripts import twc_settlement_audit as twc_mod
+    twc_mod._DAILY_SUMMARY_CACHE.clear()
+
+    def fake_get(path, params, *, dry_run=False):
+        # Flat dict — temperatureMax is a direct key on the response
+        return {
+            "dayOfWeek":      ["Monday", "Tuesday"],
+            "temperatureMax": [94, 92],
+            "temperatureMin": [76, 75],
+            "validTimeLocal": ["2026-06-16T07:00:00-0400",
+                                "2026-06-15T07:00:00-0400"],
+            "validTimeUtc":   [0, 0],
+        }
+    monkeypatch.setattr(twc_mod, "_twc_get", fake_get)
+
+    v, unit, win, notes = twc_mod.twc_daily_summary_max(
+        "KMIA", "2026-06-16", "fahrenheit", dry_run=False)
+    assert v == 94, f"expected 94 from flat response, got {v!r} ({notes})"
+    # And the date lookup correctly picks the second entry
+    v, unit, win, notes = twc_mod.twc_daily_summary_max(
+        "KMIA", "2026-06-15", "fahrenheit", dry_run=False)
+    assert v == 92
+
+
+def test_30day_block_handles_nested_response(monkeypatch):
+    """The published-doc shape (nested under product-name key) must
+    also still work — TWC may return it on other plans/products."""
+    from scripts import twc_settlement_audit as twc_mod
+    twc_mod._DAILY_SUMMARY_CACHE.clear()
+
+    def fake_get(path, params, *, dry_run=False):
+        return [{
+            "id": params.get("icaoCode"),
+            "v3-wx-conditions-historical-dailysummary-30day": {
+                "temperatureMax": [94],
+                "validTimeLocal": ["2026-06-16T07:00:00-0400"],
+            }
+        }]
+    monkeypatch.setattr(twc_mod, "_twc_get", fake_get)
+
+    v, unit, win, notes = twc_mod.twc_daily_summary_max(
+        "KMIA", "2026-06-16", "fahrenheit", dry_run=False)
+    assert v == 94, f"nested response broken: {v!r} ({notes})"
+
+
 def test_30day_block_cached_per_icao(monkeypatch):
     """Critical efficiency invariant: the 30-day endpoint is fetched
     ONCE per (icao, units), not once per event.  This is what turns

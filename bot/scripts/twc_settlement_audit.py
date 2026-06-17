@@ -249,9 +249,19 @@ def _twc_fetch_30day_block(
     if dry_run:
         _DAILY_SUMMARY_CACHE[key] = (None, "dry_run")
         return _DAILY_SUMMARY_CACHE[key]
-    # Response shape from the TWC docs:
-    #   [{"id": "...", "v3-wx-conditions-historical-dailysummary-30day": {
-    #       "temperatureMax": [86, ...], "validTimeLocal": [...], ...}}]
+    # TWC returns one of two shapes in practice:
+    #
+    #   (A) FLAT (observed 2026-06-17): the data fields are direct
+    #       keys on the response, e.g.
+    #         {"temperatureMax": [...], "validTimeLocal": [...], ...}
+    #
+    #   (B) NESTED (per the published doc example): keyed under the
+    #       product name, e.g.
+    #         [{"id": "...",
+    #           "v3-wx-conditions-historical-dailysummary-30day": {
+    #               "temperatureMax": [...], ...}}]
+    #
+    # Handle both — flat first since that's what we actually get.
     try:
         if isinstance(data, list) and data:
             wrapper = data[0]
@@ -261,15 +271,21 @@ def _twc_fetch_30day_block(
             _DAILY_SUMMARY_CACHE[key] = (
                 None, f"unexpected_response_type: {type(data).__name__}")
             return _DAILY_SUMMARY_CACHE[key]
-        # The nested key matches the product name.  Find it by suffix
-        # to avoid hard-coding the full string in case TWC versions it.
+
         block = None
-        for k, v in wrapper.items():
-            if k == "id":
-                continue
-            if isinstance(v, dict) and "temperatureMax" in v:
-                block = v
-                break
+        # CASE A: flat — temperatureMax is directly on the wrapper
+        if isinstance(wrapper, dict) and "temperatureMax" in wrapper:
+            block = wrapper
+        # CASE B: nested under a product-name key — find the dict
+        # child that has temperatureMax inside
+        elif isinstance(wrapper, dict):
+            for k, v in wrapper.items():
+                if k == "id":
+                    continue
+                if isinstance(v, dict) and "temperatureMax" in v:
+                    block = v
+                    break
+
         if block is None:
             _DAILY_SUMMARY_CACHE[key] = (
                 None,
@@ -697,10 +713,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--backfill-all", action="store_true",
                        help="Audit every resolved event (overrides --backfill-days)")
     ap.add_argument("--limit", type=int, default=10,
-                       help="Cap events audited THIS RUN (default: 10).  "
-                            "First run after schema deploy: keep small to "
-                            "burn-test the field paths without wasting "
-                            "trial credits.")
+                       help="Cap events audited THIS RUN (default: 10; "
+                            "pass 0 for unlimited).  First run after schema "
+                            "deploy: keep small to burn-test the field paths "
+                            "without wasting trial credits.")
     ap.add_argument("--include-existing", action="store_true",
                        help="Re-audit events already in twc_settlement_audit "
                             "(default: skip already-audited).")
@@ -748,7 +764,8 @@ def main(argv: list[str] | None = None) -> int:
             print_report(conn)
             return 0
 
-        events = events[: args.limit]
+        if args.limit and args.limit > 0:
+            events = events[: args.limit]
 
         if args.dry_run:
             print(f"\nDRY RUN — would audit {len(events)} events:")
