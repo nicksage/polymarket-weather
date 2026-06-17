@@ -2,7 +2,8 @@
 """
 fetch_miami_history.py — pull Miami temperature observations (KMIA METAR
 via NWS) and Polymarket 94-95F YES price history over a local-time
-window.  Standalone script, only stdlib + requests if available.
+window and print them as a merged terminal table.  Standalone script,
+stdlib only.
 
 Defaults to today, 11:00–16:00 Eastern, 94-95F bin.  Override via flags:
 
@@ -10,9 +11,8 @@ Defaults to today, 11:00–16:00 Eastern, 94-95F bin.  Override via flags:
         --date 2026-06-16 --start-local 11:00 --end-local 16:00 \
         --bin 94-95 --city Miami --station KMIA --tz America/New_York
 
-Output:
-  - prints both series to stdout, aligned to nearest minute
-  - writes two CSVs alongside this script (temps + prices)
+Output is a single time-aligned table to stdout — one row per minute
+that had either a METAR observation or a price tick.  No files written.
 
 The bin lookup hits Polymarket Gamma + CLOB.  No auth needed; both
 endpoints are public-read.
@@ -21,13 +21,11 @@ endpoints are public-read.
 from __future__ import annotations
 
 import argparse
-import csv
 import json
-import os
 import sys
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 
