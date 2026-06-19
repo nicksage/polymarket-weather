@@ -525,12 +525,12 @@ def main(argv: Optional[list] = None) -> int:
     ap.add_argument("--city", default=None,
                        help="single-city filter (default: all US cities)")
     ap.add_argument("--n-prototypes", type=int, default=N_PROTOTYPES_DEFAULT,
-                       help=f"how many prototypes TWC returns per station "
-                            f"(default: {N_PROTOTYPES_DEFAULT}, hard cap: "
-                            f"{N_PROTOTYPES_MAX} — the TWC Akamai-edge "
-                            f"limit verified 2026-06-19).  At N=100 the "
-                            f"Monte Carlo 95% CI on a p=30% bin is ±9pp.  "
-                            f"Requests above the cap return a cached 503.")
+                       help=(f"how many prototypes TWC returns per station "
+                             f"(default: {N_PROTOTYPES_DEFAULT}, hard cap: "
+                             f"{N_PROTOTYPES_MAX} -- the TWC Akamai-edge "
+                             f"limit verified 2026-06-19).  At N=100 the "
+                             f"Monte Carlo 95%% CI on a p=30%% bin is ~9pp. "
+                             f"Requests above the cap return a cached 503."))
     args = ap.parse_args(argv)
     if args.n_prototypes > N_PROTOTYPES_MAX:
         print(f"FATAL: --n-prototypes={args.n_prototypes} exceeds the TWC "
