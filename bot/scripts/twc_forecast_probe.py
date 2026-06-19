@@ -289,7 +289,8 @@ def synthesize_bins_from_samples(
 # ============================================================
 
 def probe_city(conn: sqlite3.Connection,
-                 city: str, event_date: str) -> dict:
+                 city: str, event_date: str,
+                 n_prototypes: int = N_PROTOTYPES_DEFAULT) -> dict:
     """Run the probe for one (city, event_date) and print results.
     Returns a small summary dict for the final overview table.
 
@@ -312,7 +313,7 @@ def probe_city(conn: sqlite3.Connection,
     unit_sym = "°F" if unit == "fahrenheit" else "°C"
 
     try:
-        fh = fetch_probabilistic(icao, unit)
+        fh = fetch_probabilistic(icao, unit, n_prototypes=n_prototypes)
     except Exception as e:
         print(f"\n{city} {event_date} ({icao}): TWC fetch failed: {e}")
         return {"city": city, "status": "fetch_error", "err": str(e)}
@@ -407,6 +408,12 @@ def main(argv: Optional[list] = None) -> int:
                        help=f"YYYY-MM-DD (default: today = {today_iso})")
     ap.add_argument("--city", default=None,
                        help="single-city filter (default: all US cities)")
+    ap.add_argument("--n-prototypes", type=int, default=N_PROTOTYPES_DEFAULT,
+                       help=f"how many prototypes TWC returns per station "
+                            f"(default: {N_PROTOTYPES_DEFAULT}).  More = "
+                            f"tighter Monte Carlo error on per-bin probabilities "
+                            f"(±13pp at N=50, ±6pp at N=200) at the "
+                            f"cost of larger responses.")
     args = ap.parse_args(argv)
 
     if not os.path.exists(args.db):
@@ -429,12 +436,13 @@ def main(argv: Optional[list] = None) -> int:
     print(f"=== TWC probabilistic forecast probe ===")
     print(f"event_date: {args.event_date}")
     print(f"cities ({len(cities)}): {', '.join(cities)}")
-    print(f"horizon: {HOURS_DEFAULT}h forecast, {N_PROTOTYPES_DEFAULT} prototypes per station")
+    print(f"horizon: {HOURS_DEFAULT}h forecast, {args.n_prototypes} prototypes per station")
 
     summaries: list[dict] = []
     with sqlite3.connect(args.db, timeout=30.0) as conn:
         for city in cities:
-            s = probe_city(conn, city, args.event_date)
+            s = probe_city(conn, city, args.event_date,
+                              n_prototypes=args.n_prototypes)
             summaries.append(s)
 
     # Final overview
