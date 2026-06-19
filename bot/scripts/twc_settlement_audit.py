@@ -145,15 +145,26 @@ def _round_half_up_int(x: float) -> int:
 
 def assign_bin_in_settlement_unit(
     temp_in_settlement_unit: float,
-    winning_low: float, winning_high: float,
+    winning_low: Optional[float], winning_high: Optional[float],
 ) -> tuple[float, float, bool]:
     """Round the temp half-up to a whole settlement unit, then return
     (bin_low, bin_high, matches_winner).  For Polymarket US 2°F bins,
     winning_low=94 winning_high=95 means the bin covers settlement
     values where rounded F ∈ {94, 95}.  A reading rounding to 94 OR
-    95 matches the winner."""
+    95 matches the winner.
+
+    Open-ended bins (None on one edge) are also supported:
+      * '≤X°F': winning_low=None, winning_high=X — matches any value <= X
+      * '≥X°F': winning_low=X, winning_high=None — matches any value >= X
+    """
     rounded = _round_half_up_int(temp_in_settlement_unit)
-    matches = (rounded >= winning_low) and (rounded <= winning_high)
+    if winning_low is None and winning_high is None:
+        # No bin info at all — can't decide.  Caller should record as
+        # a non-match with notes; we return False rather than raising.
+        return float(rounded), float(rounded), False
+    lo_ok = (winning_low is None) or (rounded >= winning_low)
+    hi_ok = (winning_high is None) or (rounded <= winning_high)
+    matches = lo_ok and hi_ok
     # For the audit row, store the bin we assigned the reading to.
     # Polymarket bins are 2-wide on US markets; we record the rounded
     # value as bin_low and the same+1 as bin_high so the audit table

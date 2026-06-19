@@ -89,6 +89,30 @@ class TestBinAssignment:
         assert bin_lo == 95.0   # 94.7 rounds up to 95
         assert bin_hi == 95.0
 
+    def test_open_ended_below_bin(self):
+        """'≤80°F' bin: winning_low=None, winning_high=80.  Anything
+        rounding to ≤80 matches."""
+        _, _, m1 = assign_bin_in_settlement_unit(75.0, None, 80.0)
+        _, _, m2 = assign_bin_in_settlement_unit(80.0, None, 80.0)
+        _, _, m3 = assign_bin_in_settlement_unit(81.0, None, 80.0)
+        assert m1 is True and m2 is True and m3 is False
+
+    def test_open_ended_above_bin(self):
+        """'≥100°F' bin: winning_low=100, winning_high=None.  Anything
+        rounding to ≥100 matches."""
+        _, _, m1 = assign_bin_in_settlement_unit(99.0, 100.0, None)
+        _, _, m2 = assign_bin_in_settlement_unit(100.0, 100.0, None)
+        _, _, m3 = assign_bin_in_settlement_unit(110.0, 100.0, None)
+        assert m1 is False and m2 is True and m3 is True
+
+    def test_missing_both_edges_returns_no_match_no_crash(self):
+        """Regression: LA 2026-06-10 crashed with NoneType comparison
+        when both winning edges were missing.  Must return
+        (rounded, rounded, False) instead of raising."""
+        bin_lo, bin_hi, m = assign_bin_in_settlement_unit(75.0, None, None)
+        assert m is False
+        assert bin_lo == 75.0 and bin_hi == 75.0
+
 
 # ============================================================
 # Unit conversion — TWC may return °C even when we asked for °F
