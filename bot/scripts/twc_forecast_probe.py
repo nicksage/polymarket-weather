@@ -226,26 +226,89 @@ def fetch_event_bins(conn: sqlite3.Connection,
 
 
 # ============================================================
+# Synthesize Polymarket-style bins from TWC's forecast distribution.
+# Used when no DB bins exist for the (city, event_date) — e.g.,
+# future dates where the bot hasn't scanned yet, or events that aren't
+# resolved markets.  Lets us still print TWC's view of the day.
+# ============================================================
+
+def synthesize_bins_from_samples(
+    sample_maxes: list[float], unit: str = "fahrenheit",
+) -> list[dict]:
+    """Generate Polymarket-style 2°F bins spanning the prototype range.
+
+    For US °F: bins are (lo, lo+1) with lo even, covering
+    [floor(P05)-aligned_even .. ceil(P95)-aligned_even+2].  Matches
+    Polymarket's '90-91°F' style — each bin covers a 2°F settlement
+    window via half-up rounding.
+
+    For non-US: returns 1°C bins."""
+    if not sample_maxes:
+        return []
+    sm = sorted(sample_maxes)
+    n = len(sm)
+    p05 = sm[max(0, int(0.05 * n))]
+    p95 = sm[min(n - 1, int(0.95 * n))]
+    # Widen by 2 units on each side so the tails of the distribution
+    # are visible, not clipped to the edge bins.
+    lo_int = int(p05) - 2
+    hi_int = int(p95) + 2
+
+    bins: list[dict] = []
+    if (unit or "").lower() == "fahrenheit":
+        # Align lo to an even integer (Polymarket US bins are 90-91, 92-93, ...)
+        if lo_int % 2 != 0:
+            lo_int -= 1
+        if hi_int % 2 == 0:
+            hi_int += 1
+        for lo in range(lo_int, hi_int + 1, 2):
+            hi = lo + 1
+            bins.append({
+                "label":      f"{lo}-{hi}°F",
+                "range_low":  float(lo),
+                "range_high": float(hi),
+                "unit":       "fahrenheit",
+                "our_prob":   None,
+                "market_prob": None,
+            })
+    else:
+        for c in range(lo_int, hi_int + 1):
+            bins.append({
+                "label":      f"{c}°C",
+                "range_low":  float(c),
+                "range_high": float(c),
+                "unit":       "celsius",
+                "our_prob":   None,
+                "market_prob": None,
+            })
+    return bins
+
+
+# ============================================================
 # Per-city probe
 # ============================================================
 
 def probe_city(conn: sqlite3.Connection,
                  city: str, event_date: str) -> dict:
     """Run the probe for one (city, event_date) and print results.
-    Returns a small summary dict for the final overview table."""
+    Returns a small summary dict for the final overview table.
+
+    Two display modes:
+      * 'compare' — DB bins exist for this event_date.  Print
+                     Our P / Mkt P / TWC P side by side per bin.
+      * 'twc_only' — no DB bins.  Synthesize 2°F bins from TWC's
+                      forecast range and show TWC P only.  Used for
+                      future dates the bot hasn't scanned yet.
+    """
     meta = CITY_STATIONS.get(city)
     if not meta:
         print(f"\n{city}: no ICAO mapping in station_meta — skipping")
         return {"city": city, "status": "no_icao"}
     icao, _net, tz_str = meta[0], meta[1], meta[2]
 
-    bins = fetch_event_bins(conn, city, event_date)
-    if not bins:
-        print(f"\n{city} {event_date} ({icao}): no signals in DB — skipping "
-              f"(event_date may be outside the scan window)")
-        return {"city": city, "status": "no_bins"}
-
-    unit = (bins[0].get("unit") or "fahrenheit").lower()
+    # Always fetch TWC first so we have a forecast regardless of DB state
+    db_bins = fetch_event_bins(conn, city, event_date)
+    unit = (db_bins[0].get("unit") if db_bins else "fahrenheit").lower()
     unit_sym = "°F" if unit == "fahrenheit" else "°C"
 
     try:
@@ -261,49 +324,71 @@ def probe_city(conn: sqlite3.Connection,
               f"Event may be outside the 72h forecast horizon.")
         return {"city": city, "status": "out_of_window"}
 
-    twc_probs = bin_probabilities(samples, bins)
-
-    # Distribution stats from the 50 samples
     sm = sorted(samples)
     def _p(q): return sm[min(len(sm)-1, max(0, int(q * len(sm))))]
     p10, p50, p90 = _p(0.10), _p(0.50), _p(0.90)
     mean = sum(samples) / len(samples)
 
-    # Identify the top-probability bin per source for the verdict line
     def _top(d: dict) -> Optional[str]:
-        if not d:
-            return None
+        if not d: return None
         return max(d, key=d.get)
-    our_top   = _top({b["label"]: (b.get("our_prob") or 0)    for b in bins})
-    mkt_top   = _top({b["label"]: (b.get("market_prob") or 0) for b in bins})
+
+    # --- Decide display mode ---
+    if db_bins:
+        # Compare mode: use real Polymarket bins from DB
+        bins = db_bins
+        mode = "compare"
+    else:
+        # TWC-only mode: synthesize bins from forecast range
+        bins = synthesize_bins_from_samples(samples, unit=unit)
+        mode = "twc_only"
+
+    twc_probs = bin_probabilities(samples, bins)
     twc_top   = _top(twc_probs)
 
-    print(f"\n{city}  {event_date}  ({icao}, {tz_str})")
+    # --- Header (common to both modes) ---
+    print(f"\n{city}  {event_date}  ({icao}, {tz_str})  [{mode}]")
     print(f"  TWC: {len(samples)} prototypes × {n_hours} hours of event_date")
     print(f"  TWC daily-max dist: mean={mean:.1f}{unit_sym}  "
           f"P10/P50/P90 = {p10:.1f} / {p50:.1f} / {p90:.1f}{unit_sym}")
-    print(f"  top-P bin:  Our={our_top}   Mkt={mkt_top}   TWC={twc_top}")
-    print(f"  {'bin':<14} {'Our P':>7} {'Mkt P':>7} {'TWC P':>7} "
-          f"{'TWC-Mkt':>9} {'TWC-Our':>9}")
-    print(f"  " + "-" * 64)
-    for b in bins:
-        lbl = b["label"]
-        our_p = float(b.get("our_prob")    or 0.0)
-        mkt_p = float(b.get("market_prob") or 0.0)
-        twc_p = twc_probs.get(lbl, 0.0)
-        d_mkt = twc_p - mkt_p
-        d_our = twc_p - our_p
-        # Mark top-P rows with a *
-        marker = ""
-        if lbl == twc_top: marker += "*"
-        print(f"  {lbl:<14} {our_p*100:>6.1f}% {mkt_p*100:>6.1f}% "
-              f"{twc_p*100:>6.1f}% {d_mkt*100:>+7.1f}pp {d_our*100:>+7.1f}pp"
-              f" {marker}")
-    return {
-        "city": city, "status": "ok",
-        "twc_top": twc_top, "mkt_top": mkt_top, "our_top": our_top,
-        "twc_mean": mean,
-    }
+
+    # --- Per-bin table ---
+    if mode == "compare":
+        our_top = _top({b["label"]: (b.get("our_prob") or 0)    for b in bins})
+        mkt_top = _top({b["label"]: (b.get("market_prob") or 0) for b in bins})
+        print(f"  top-P bin:  Our={our_top}   Mkt={mkt_top}   TWC={twc_top}")
+        print(f"  {'bin':<14} {'Our P':>7} {'Mkt P':>7} {'TWC P':>7} "
+              f"{'TWC-Mkt':>9} {'TWC-Our':>9}")
+        print(f"  " + "-" * 64)
+        for b in bins:
+            lbl = b["label"]
+            our_p = float(b.get("our_prob")    or 0.0)
+            mkt_p = float(b.get("market_prob") or 0.0)
+            twc_p = twc_probs.get(lbl, 0.0)
+            marker = "*" if lbl == twc_top else ""
+            print(f"  {lbl:<14} {our_p*100:>6.1f}% {mkt_p*100:>6.1f}% "
+                  f"{twc_p*100:>6.1f}% "
+                  f"{(twc_p-mkt_p)*100:>+7.1f}pp "
+                  f"{(twc_p-our_p)*100:>+7.1f}pp {marker}")
+        return {"city": city, "status": "ok", "mode": mode,
+                "twc_top": twc_top, "mkt_top": mkt_top, "our_top": our_top,
+                "twc_mean": mean}
+    else:
+        # TWC-only: just show synthesized bins + TWC P
+        print(f"  top-P bin:  TWC={twc_top}  (no DB bins to compare)")
+        print(f"  {'bin (synth)':<14} {'TWC P':>7}")
+        print(f"  " + "-" * 26)
+        for b in bins:
+            lbl = b["label"]
+            twc_p = twc_probs.get(lbl, 0.0)
+            marker = "*" if lbl == twc_top else ""
+            # Skip near-zero bins to keep output compact
+            if twc_p < 0.005:
+                continue
+            print(f"  {lbl:<14} {twc_p*100:>6.1f}% {marker}")
+        return {"city": city, "status": "ok", "mode": mode,
+                "twc_top": twc_top, "mkt_top": None, "our_top": None,
+                "twc_mean": mean}
 
 
 # ============================================================
@@ -357,19 +442,24 @@ def main(argv: Optional[list] = None) -> int:
     print("=" * 72)
     print("OVERVIEW")
     print("=" * 72)
-    print(f"{'city':<14} {'status':<14} {'TWC top-P':<12} "
+    print(f"{'city':<14} {'mode':<10} {'TWC top-P':<12} "
           f"{'Mkt top-P':<12} {'agree?':<8}")
     print("-" * 72)
     for s in summaries:
-        agree = ""
-        if s.get("status") == "ok":
-            if s.get("twc_top") == s.get("mkt_top"):
-                agree = "yes"
-            else:
-                agree = "NO"
-        print(f"{s['city']:<14} {s.get('status',''):<14} "
-              f"{(s.get('twc_top') or '--'):<12} "
-              f"{(s.get('mkt_top') or '--'):<12} "
+        mkt_top = s.get("mkt_top")
+        twc_top = s.get("twc_top")
+        if s.get("status") != "ok":
+            agree = ""
+        elif mkt_top is None:
+            agree = "n/a"   # twc_only mode — nothing to compare
+        elif twc_top == mkt_top:
+            agree = "yes"
+        else:
+            agree = "NO"
+        mode = s.get("mode") or s.get("status", "")
+        print(f"{s['city']:<14} {mode:<10} "
+              f"{(twc_top or '--'):<12} "
+              f"{(mkt_top or '--'):<12} "
               f"{agree:<8}")
 
     return 0
