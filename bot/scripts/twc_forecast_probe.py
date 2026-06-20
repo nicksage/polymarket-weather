@@ -362,7 +362,8 @@ def synthesize_bins_from_samples(
 
 def probe_city(conn: sqlite3.Connection,
                  city: str, event_date: str,
-                 n_prototypes: int = N_PROTOTYPES_DEFAULT) -> dict:
+                 n_prototypes: int = N_PROTOTYPES_DEFAULT,
+                 no_fusion: bool = False) -> dict:
     """Run the probe for one (city, event_date) and print results.
     Returns a small summary dict for the final overview table.
 
@@ -405,7 +406,9 @@ def probe_city(conn: sqlite3.Connection,
     floor: Optional[float] = None
     current_obs: Optional[dict] = None
     fusion_note = "skipped (event_date is not today in station-local time)"
-    if is_event_today_in_tz(event_date, tz_str):
+    if no_fusion:
+        fusion_note = "disabled by --no-fusion"
+    elif is_event_today_in_tz(event_date, tz_str):
         try:
             current_obs = fetch_current_conditions(icao, unit)
             mx = current_obs.get("max_since_7am")
@@ -524,6 +527,11 @@ def main(argv: Optional[list] = None) -> int:
                        help=f"YYYY-MM-DD (default: today = {today_iso})")
     ap.add_argument("--city", default=None,
                        help="single-city filter (default: all US cities)")
+    ap.add_argument("--no-fusion", action="store_true",
+                       help="Skip the observed-max floor fusion entirely.  "
+                            "By default the script fuses with temperatureMax"
+                            "Since7Am when event_date is today.  Use this to "
+                            "see the raw prototype-derived distribution.")
     ap.add_argument("--n-prototypes", type=int, default=N_PROTOTYPES_DEFAULT,
                        help=(f"how many prototypes TWC returns per station "
                              f"(default: {N_PROTOTYPES_DEFAULT}, hard cap: "
@@ -564,7 +572,8 @@ def main(argv: Optional[list] = None) -> int:
     with sqlite3.connect(args.db, timeout=30.0) as conn:
         for city in cities:
             s = probe_city(conn, city, args.event_date,
-                              n_prototypes=args.n_prototypes)
+                              n_prototypes=args.n_prototypes,
+                              no_fusion=args.no_fusion)
             summaries.append(s)
 
     # Final overview
