@@ -94,12 +94,46 @@ N_PROTOTYPES_MAX = int(os.getenv("TWC_N_PROTOTYPES_MAX", "100"))
 
 
 # ============================================================
-# TWC API
+# TWC API + per-city helpers
 # ============================================================
 
 def _units_for(settlement_unit: str) -> str:
     """TWC units code: 'e' = English (°F), 'm' = Metric (°C)."""
     return "e" if (settlement_unit or "").lower() == "fahrenheit" else "m"
+
+
+def is_domestic_icao(icao: str) -> bool:
+    """K-prefixed ICAOs are continental US (Polymarket settles °F)."""
+    return bool(icao) and icao.upper().startswith("K")
+
+
+def default_settlement_unit_for_icao(icao: str) -> str:
+    """Best-guess settlement unit when no DB bins exist (twc_only mode).
+    Polymarket convention: US markets settle in °F, international in °C.
+    Used as the unit for the TWC API call (units=e or m) AND as the
+    label for synthesized bins."""
+    return "fahrenheit" if is_domestic_icao(icao) else "celsius"
+
+
+def filter_cities_by_scope(cities_dict: dict, scope: str) -> list[str]:
+    """Pick cities to probe based on --scope:
+        domestic       -> K-prefixed ICAOs only (continental US)
+        international  -> non-K ICAOs
+        all            -> everything mapped"""
+    s = (scope or "all").lower()
+    out = []
+    for city, meta in cities_dict.items():
+        if not meta or not isinstance(meta[0], str):
+            continue
+        icao = meta[0]
+        dom = is_domestic_icao(icao)
+        if s == "domestic" and dom:
+            out.append(city)
+        elif s == "international" and not dom:
+            out.append(city)
+        elif s == "all":
+            out.append(city)
+    return sorted(out)
 
 
 def fetch_probabilistic(icao: str, settlement_unit: str,
@@ -382,7 +416,12 @@ def probe_city(conn: sqlite3.Connection,
 
     # Always fetch TWC first so we have a forecast regardless of DB state
     db_bins = fetch_event_bins(conn, city, event_date)
-    unit = (db_bins[0].get("unit") if db_bins else "fahrenheit").lower()
+    # Pick settlement unit.  When DB bins exist, use what Polymarket says.
+    # In twc_only mode, fall back to the per-ICAO heuristic (K=°F, else=°C).
+    if db_bins:
+        unit = (db_bins[0].get("unit") or "fahrenheit").lower()
+    else:
+        unit = default_settlement_unit_for_icao(icao)
     unit_sym = "°F" if unit == "fahrenheit" else "°C"
 
     try:
@@ -526,7 +565,14 @@ def main(argv: Optional[list] = None) -> int:
     ap.add_argument("--event-date", default=today_iso,
                        help=f"YYYY-MM-DD (default: today = {today_iso})")
     ap.add_argument("--city", default=None,
-                       help="single-city filter (default: all US cities)")
+                       help="single-city override.  When set, --scope is "
+                            "ignored and only this city is probed.")
+    ap.add_argument("--scope", choices=["domestic", "international", "all"],
+                       default="all",
+                       help="which station set to probe (default: all).  "
+                            "'domestic' = continental US (K-prefixed ICAOs); "
+                            "'international' = everything else; "
+                            "'all' = both.")
     ap.add_argument("--no-fusion", action="store_true",
                        help="Skip the observed-max floor fusion entirely.  "
                             "By default the script fuses with temperatureMax"
@@ -556,16 +602,14 @@ def main(argv: Optional[list] = None) -> int:
 
     if args.city:
         cities = [args.city]
+        scope_desc = f"single city: {args.city}"
     else:
-        # All US cities (K-prefixed ICAOs) with mappings
-        cities = sorted(
-            c for c, m in CITY_STATIONS.items()
-            if m and isinstance(m[0], str) and m[0].startswith("K")
-        )
+        cities = filter_cities_by_scope(CITY_STATIONS, args.scope)
+        scope_desc = f"scope={args.scope}"
 
     print(f"=== TWC probabilistic forecast probe ===")
     print(f"event_date: {args.event_date}")
-    print(f"cities ({len(cities)}): {', '.join(cities)}")
+    print(f"{scope_desc}: {len(cities)} cities ({', '.join(cities)})")
     print(f"horizon: {HOURS_DEFAULT}h forecast, {args.n_prototypes} prototypes per station")
 
     summaries: list[dict] = []
