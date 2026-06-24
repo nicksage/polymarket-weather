@@ -62,6 +62,10 @@ if _BOT_DIR not in sys.path:
 
 from station_meta import CITY_STATIONS, get_station  # type: ignore
 from polymarket  import search_temp_high_events       # type: ignore
+from scripts.lockin_refinements import (              # type: ignore
+    boundary_distance, compute_net_edge,
+    compute_lockin_probability, DEFAULT_FEE_RATE,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -218,8 +222,29 @@ def _bin_label(low, high, unit: str) -> str:
 # ---------------------------------------------------------------------------
 
 def evaluate_event(event: dict, threshold: float, hours_after_peak: int,
-                    min_liquidity: float) -> dict | None:
-    """Return a signal dict if the event meets all gates, else None."""
+                    min_liquidity: float,
+                    *,
+                    static_p_lockin: float = 0.97,
+                    min_boundary_distance: float = 0.5,
+                    min_net_edge: float = 0.03,
+                    fee_rate: float = DEFAULT_FEE_RATE,
+                    ) -> dict | None:
+    """Return a signal dict if the event meets all gates, else None.
+
+    Phase 5 gates layered on top of the original lock-in logic:
+      * static_p_lockin       : prior probability of post-peak hold —
+                                used when no prototype samples are
+                                wired in yet.  Empirical: ~0.97 at
+                                peak+1h, ~0.998 at 19:00 local.
+      * min_boundary_distance : observed_max must be at least this far
+                                (in settlement units) from the nearest
+                                bin edge.  0.5°F is the strictest sane
+                                value for US 2°F bins (full half-up
+                                interval).
+      * min_net_edge          : EV threshold against ask + Polymarket
+                                taker fee.  0.03 = require 3¢/$1 staked.
+      * fee_rate              : Polymarket taker fee on PROFIT
+                                (default 10%, per execution.py:1511)."""
     city = event.get("city")
     date_str = event.get("date")
     if not city or city not in CITY_STATIONS or not date_str:
@@ -318,6 +343,46 @@ def evaluate_event(event: dict, threshold: float, hours_after_peak: int,
     bin_label = _bin_label(target_bin["range_low"], target_bin["range_high"],
                             target_bin["unit"])
 
+    # ---- Phase 5 gates ------------------------------------------------
+    # Convert observed_max_so_far (°C) into the bin's settlement unit
+    # so boundary-distance and lock-in-probability are in matching units.
+    bin_unit = (target_bin.get("unit") or "celsius").lower()
+    if bin_unit == "fahrenheit":
+        obs_in_unit = observed_max_so_far * 9.0 / 5.0 + 32.0
+    else:
+        obs_in_unit = observed_max_so_far
+
+    # 5b. Boundary-distance gate.  Cheap insurance against a late-day
+    # 0.1-0.3° flip that crosses the settlement bin.
+    bd = boundary_distance(
+        obs_in_unit, target_bin.get("range_low"), target_bin.get("range_high"))
+    if bd < min_boundary_distance:
+        return {"city": city, "date": date_str,
+                "reason": f"too_close_to_boundary "
+                          f"(obs={obs_in_unit:.2f} → bd={bd:.2f} < "
+                          f"{min_boundary_distance:.2f})",
+                "target_bin": bin_label,
+                "observed_max_so_far": round(observed_max_so_far, 2)}
+
+    # 5a. Distribution-driven lock-in probability.  Falls back to the
+    # static prior (empirical post-peak hold rate) until prototype
+    # samples are plumbed in from TWC.  When a caller passes
+    # remaining_day_max_samples into evaluate_event(), prefer that.
+    p_lockin = static_p_lockin
+
+    # 5c. Net-edge gate against ask + fees.  yes_price is the best price
+    # we have until a real ASK is wired in (TODO: replace with order
+    # book ask when execution.py exposes it).
+    ne = compute_net_edge(p_lockin, yes_price, fee_rate=fee_rate)
+    if ne < min_net_edge:
+        return {"city": city, "date": date_str,
+                "reason": f"insufficient_net_edge "
+                          f"(p={p_lockin:.2f}, ask={yes_price:.3f}, "
+                          f"fee={fee_rate:.2f} → ne={ne:.3f} < "
+                          f"{min_net_edge:.3f})",
+                "target_bin": bin_label,
+                "yes_price": round(yes_price, 4)}
+
     # Market-sanity gate: if the bin we're confident in is priced very
     # cheap, the market has fresher data than our Mesonet feed (which
     # can lag by ~30-60 min).  Don't trade against a strongly-disagreeing
@@ -408,6 +473,19 @@ def main() -> int:
                    help="Emit JSON instead of formatted text")
     p.add_argument("--include-skipped", action="store_true",
                    help="Show events that were filtered out, with reason")
+    p.add_argument("--static-p-lockin", type=float, default=0.97,
+                   help="Prior P(lock-in) used when no prototype samples "
+                        "are wired in (default: 0.97 = empirical post-peak "
+                        "hold rate)")
+    p.add_argument("--min-boundary-distance", type=float, default=0.5,
+                   help="Min distance from observed_max to nearest bin "
+                        "boundary (settlement units; default: 0.5)")
+    p.add_argument("--min-net-edge", type=float, default=0.03,
+                   help="Min expected-value edge against ask + fee "
+                        "(default: 0.03 = 3 cents per $1 staked)")
+    p.add_argument("--fee-rate", type=float, default=DEFAULT_FEE_RATE,
+                   help=f"Polymarket taker fee on PROFIT "
+                        f"(default: {DEFAULT_FEE_RATE} = 10%%)")
     args = p.parse_args()
 
     log.info("Discovering active Polymarket weather markets…")
@@ -424,7 +502,11 @@ def main() -> int:
         r = evaluate_event(ev,
                             threshold        = args.threshold,
                             hours_after_peak = args.hours_after_peak,
-                            min_liquidity    = args.min_liquidity)
+                            min_liquidity    = args.min_liquidity,
+                            static_p_lockin       = args.static_p_lockin,
+                            min_boundary_distance = args.min_boundary_distance,
+                            min_net_edge          = args.min_net_edge,
+                            fee_rate              = args.fee_rate)
         if r:
             results.append(r)
 

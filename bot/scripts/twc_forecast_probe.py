@@ -227,6 +227,104 @@ def apply_observed_floor(samples: list[float], floor: float) -> list[float]:
     return [max(floor, s) for s in samples]
 
 
+def _c_to_unit(temp_c: float, settlement_unit: str) -> float:
+    """Convert Celsius to the settlement unit (fahrenheit or celsius)."""
+    if (settlement_unit or "").lower() == "fahrenheit":
+        return temp_c * 9.0 / 5.0 + 32.0
+    return temp_c
+
+
+def _query_metar_calendar_day_max_c(
+    conn: sqlite3.Connection, icao: str, event_date: str, tz_str: str,
+) -> Optional[float]:
+    """Return the highest temp_c in raw_metar_log for (icao, event_date)
+    over the station-local calendar day so far.  None if no rows.
+
+    Filters by BOTH raw_metar_log.event_date AND by
+    cycle_timestamp_utc-converted-to-local — defensive against UTC vs
+    local-date edge cases at midnight (a UTC-day row may land on the
+    prior local day, and vice versa)."""
+    try:
+        rows = conn.execute(
+            """SELECT cycle_timestamp_utc, temp_c
+               FROM raw_metar_log
+               WHERE icao = ? AND event_date = ? AND temp_c IS NOT NULL""",
+            (icao, event_date),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    if not rows:
+        return None
+    try:
+        tz = ZoneInfo(tz_str)
+        target_date = datetime.strptime(event_date, "%Y-%m-%d").date()
+    except Exception:
+        return None
+    best: Optional[float] = None
+    for r in rows:
+        try:
+            ts_utc = datetime.fromisoformat(
+                str(r[0]).replace("Z", "+00:00"))
+            ts_local = ts_utc.astimezone(tz)
+        except (ValueError, TypeError):
+            continue
+        if ts_local.date() != target_date:
+            continue
+        t = float(r[1])
+        if best is None or t > best:
+            best = t
+    return best
+
+
+def compute_calendar_day_floor(
+    conn: sqlite3.Connection, icao: str, event_date: str, tz_str: str,
+    twc_max_since_7am: Optional[float], settlement_unit: str,
+) -> tuple[Optional[float], str]:
+    """Compute the observed-max floor over the station-local CALENDAR DAY
+    (00:00 → now local), addressing Polymarket's settlement convention
+    which is calendar-day — not the 7am-anchored window TWC's
+    `temperatureMaxSince7Am` exposes.
+
+    Returns (floor, source_note).  Floor is in `settlement_unit`.
+
+    Strategy:
+        - METAR floor: max(raw_metar_log.temp_c) over the local calendar
+          day so far (covers the full 00:00→now window, including
+          overnight cycles before 07:00).
+        - TWC floor: `temperatureMaxSince7Am` (covers 07:00→now, but may
+          be fresher than the latest METAR cycle we've persisted).
+        - Combined: max(METAR, TWC).  If neither is available, None.
+
+    Rationale: on rare days the daily max occurs overnight (cold front
+    passage, marine layer break, etc.).  `temperatureMaxSince7Am` misses
+    those entirely; the METAR-day floor catches them.  Conversely,
+    TWC's CC endpoint may be minutes fresher than our latest persisted
+    METAR cycle, so we don't discard it."""
+    metar_max_c = _query_metar_calendar_day_max_c(
+        conn, icao, event_date, tz_str)
+    metar_floor: Optional[float] = (
+        _c_to_unit(metar_max_c, settlement_unit)
+        if metar_max_c is not None else None)
+    twc_floor: Optional[float] = (
+        float(twc_max_since_7am) if twc_max_since_7am is not None else None)
+
+    candidates = [(metar_floor, "metar_calendar_day"),
+                    (twc_floor, "twc_since7am")]
+    candidates = [(v, src) for (v, src) in candidates if v is not None]
+    if not candidates:
+        return None, "no observed-max source available"
+    best_v, _ = max(candidates, key=lambda x: x[0])
+
+    unit_sym = "°F" if (settlement_unit or "").lower() == "fahrenheit" else "°C"
+    parts = []
+    if metar_floor is not None:
+        parts.append(f"metar={metar_floor:.1f}{unit_sym}")
+    if twc_floor is not None:
+        parts.append(f"twc7am={twc_floor:.1f}{unit_sym}")
+    note = f"floor={best_v:.1f}{unit_sym} (calendar-day; {', '.join(parts)})"
+    return best_v, note
+
+
 # ============================================================
 # Daily-max derivation (prototype ensemble → bin probabilities)
 # ============================================================
@@ -442,22 +540,26 @@ def probe_city(conn: sqlite3.Connection,
     # Future dates: skipped (no observed yet).  Past dates: skipped
     # (Current Conditions doesn't have history; backtest path uses
     # final values differently anyway).
+    #
+    # Floor uses CALENDAR-DAY window (00:00→now local) — matches
+    # Polymarket settlement, not TWC's 7am-anchored field alone.
+    # See compute_calendar_day_floor() docstring for rationale.
     floor: Optional[float] = None
     current_obs: Optional[dict] = None
     fusion_note = "skipped (event_date is not today in station-local time)"
     if no_fusion:
         fusion_note = "disabled by --no-fusion"
     elif is_event_today_in_tz(event_date, tz_str):
+        twc_since7am: Optional[float] = None
         try:
             current_obs = fetch_current_conditions(icao, unit)
             mx = current_obs.get("max_since_7am")
             if mx is not None:
-                floor = float(mx)
-                fusion_note = f"floor={floor:.1f}{unit_sym} from temperatureMaxSince7Am"
-            else:
-                fusion_note = "no temperatureMaxSince7Am in response"
+                twc_since7am = float(mx)
         except Exception as e:
             fusion_note = f"current-conditions fetch failed: {e}"
+        floor, fusion_note = compute_calendar_day_floor(
+            conn, icao, event_date, tz_str, twc_since7am, unit)
 
     samples = (apply_observed_floor(raw_samples, floor)
                if floor is not None else raw_samples)
