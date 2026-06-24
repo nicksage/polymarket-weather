@@ -152,6 +152,11 @@ def discover_resolved_events(
      AND ls.max_ts = s.scanned_at_utc
     WHERE s.market_prob >= 0.99
       AND s.event_id IS NOT NULL
+      -- Skip open-ended bins ('>=X' / '<=X' style).  The rounding test
+      -- is about half-degree boundaries between closed bins; open-ended
+      -- winners are a different question handled separately.
+      AND s.bin_range_low IS NOT NULL
+      AND s.bin_range_high IS NOT NULL
     ORDER BY s.event_date DESC, s.city ASC
     """
     winner_rows = conn.execute(winners_sql, cte_args).fetchall()
@@ -174,6 +179,7 @@ def discover_resolved_events(
             WHERE city = ? AND event_date = ?
               AND scanned_at_utc = (SELECT max_ts FROM ls)
               AND bin_range_low IS NOT NULL
+              AND bin_range_high IS NOT NULL
             ORDER BY bin_range_low ASC
         """, (city, event_date, city, event_date)).fetchall()
 
