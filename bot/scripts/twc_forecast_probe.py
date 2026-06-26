@@ -80,6 +80,13 @@ TWC_PROBABILISTIC_PATH = os.getenv(
     "TWC_PROBABILISTIC_PATH", "/v3/wx/forecast/probabilistic")
 TWC_CURRENT_CONDITIONS_PATH = os.getenv(
     "TWC_CURRENT_CONDITIONS_PATH", "/v3/wx/observations/current")
+# Deterministic daily forecast — TWC's public-facing product (the one
+# end-users see in The Weather Channel app).  Independent of the
+# probabilistic BMA pipeline, so agreement between the two is a real
+# signal (not a circular check).  Falls back to P50 of the probabilistic
+# distribution if this endpoint isn't entitled.
+TWC_DAILY_FORECAST_PATH = os.getenv(
+    "TWC_DAILY_FORECAST_PATH", "/v3/wx/forecast/daily/15day")
 TWC_LANGUAGE  = os.getenv("TWC_LANGUAGE", "en-US")
 TWC_TIMEOUT_S = float(os.getenv("TWC_TIMEOUT_S", "30"))
 N_PROTOTYPES_DEFAULT = int(os.getenv("TWC_N_PROTOTYPES", "100"))
@@ -199,6 +206,185 @@ def fetch_current_conditions(icao: str, settlement_unit: str) -> dict:
         "min_24h":          data.get("temperatureMin24Hour"),
         "valid_time_local": data.get("validTimeLocal"),
         "notes":            "",
+    }
+
+
+# ============================================================
+# Deterministic daily-max forecast — independent product for confidence
+# ============================================================
+
+def fetch_deterministic_daily_max(
+    icao: str, settlement_unit: str, event_date: str, tz_str: str,
+) -> dict:
+    """Call /v3/wx/forecast/daily/15day and return TWC's deterministic
+    daily-max for `event_date`.  This is INDEPENDENT of the probabilistic
+    BMA pipeline — it's the forecast end-users see in TWC's apps — so
+    agreement between the two is a meaningful confidence signal.
+
+    Returns dict:
+        {
+          "status":          "ok" | "not_entitled" | "no_data" | "error",
+          "today_max":       float | None  (in settlement_unit)
+          "narrative":       str | None
+          "valid_time_local": str | None
+          "err":             str | None
+        }
+
+    On HTTP 401/403 returns status='not_entitled' instead of raising —
+    lets the probe gracefully fall back to using the probabilistic P50."""
+    if not TWC_API_KEY:
+        return {"status": "error", "today_max": None,
+                "narrative": None, "valid_time_local": None,
+                "err": "TWC_API_KEY env var not set"}
+    params = {
+        "icaoCode": icao,
+        "units":    _units_for(settlement_unit),
+        "language": TWC_LANGUAGE,
+        "format":   "json",
+        "apiKey":   TWC_API_KEY,
+    }
+    url = f"{TWC_API_BASE}{TWC_DAILY_FORECAST_PATH}"
+    try:
+        resp = httpx.get(url, params=params, timeout=TWC_TIMEOUT_S)
+    except Exception as e:
+        return {"status": "error", "today_max": None,
+                "narrative": None, "valid_time_local": None,
+                "err": f"{type(e).__name__}: {e}"}
+
+    if resp.status_code in (401, 403):
+        return {"status": "not_entitled", "today_max": None,
+                "narrative": None, "valid_time_local": None,
+                "err": f"HTTP {resp.status_code}"}
+    if resp.status_code != 200:
+        return {"status": "error", "today_max": None,
+                "narrative": None, "valid_time_local": None,
+                "err": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        return {"status": "error", "today_max": None,
+                "narrative": None, "valid_time_local": None,
+                "err": f"json decode: {e}"}
+
+    # The 15-day product has both a flat wrapper shape and a nested-by-
+    # product-name shape across TWC variants.  Try both.
+    payload = data
+    if not data.get("temperatureMax") and not data.get("validTimeLocal"):
+        # Look one level down for the first dict child with these keys
+        for v in data.values():
+            if isinstance(v, dict) and (
+                v.get("temperatureMax") or v.get("validTimeLocal")):
+                payload = v
+                break
+
+    max_arr = payload.get("temperatureMax") or []
+    valid_arr = payload.get("validTimeLocal") or []
+    narrative_arr = payload.get("narrative") or []
+
+    if not max_arr or not valid_arr:
+        return {"status": "no_data", "today_max": None,
+                "narrative": None, "valid_time_local": None,
+                "err": "no temperatureMax/validTimeLocal arrays in response"}
+
+    # Find the index whose validTimeLocal's local date matches event_date.
+    # validTimeLocal entries look like '2026-06-26T07:00:00-0400' — the
+    # date prefix already encodes the station-local day.
+    target_idx: Optional[int] = None
+    for i, vt in enumerate(valid_arr):
+        if isinstance(vt, str) and vt[:10] == event_date:
+            target_idx = i
+            break
+    if target_idx is None:
+        return {"status": "no_data", "today_max": None,
+                "narrative": None, "valid_time_local": None,
+                "err": f"no entry for event_date={event_date} in 15-day forecast"}
+
+    raw_max = max_arr[target_idx] if target_idx < len(max_arr) else None
+    if raw_max is None:
+        return {"status": "no_data", "today_max": None,
+                "narrative": None, "valid_time_local": None,
+                "err": f"temperatureMax is null at index {target_idx} "
+                       f"(today's max may already be in the past — "
+                       f"TWC drops it from the forecast post-peak)"}
+
+    return {
+        "status":           "ok",
+        "today_max":        float(raw_max),
+        "narrative":        (narrative_arr[target_idx]
+                              if target_idx < len(narrative_arr) else None),
+        "valid_time_local": valid_arr[target_idx],
+        "err":              None,
+    }
+
+
+def deterministic_max_from_p50(samples: list[float]) -> Optional[float]:
+    """Fallback when the daily/15day endpoint isn't entitled or has
+    dropped today's entry — use the P50 of the prototype-derived daily-max
+    distribution as the 'deterministic' point estimate.
+
+    Less independent than the daily forecast (computed from the same BMA
+    pipeline), but still useful when the agreement signal is taken with a
+    grain of salt."""
+    if not samples:
+        return None
+    s = sorted(samples)
+    return float(s[len(s) // 2])
+
+
+def compute_forecast_agreement_confidence(
+    deterministic_max: float, bin_probs: dict[str, float], bins: list[dict],
+) -> dict:
+    """Option A — confidence = P(bin containing deterministic forecast).
+
+    Interpretation: 'TWC's probabilistic distribution puts X% mass on the
+    bin TWC's deterministic forecast points to.'  High = the two TWC
+    products agree → high confidence.  Low = internal disagreement.
+
+    Half-up rounding matches Polymarket settlement convention (Phase 1
+    backtest: 91.0% match vs 69.2% for truncation).
+
+    Returns:
+        {
+          "confidence":      float in [0, 1]   — Option A score
+          "det_bin_label":   str | None        — bin det_max falls in
+          "det_bin_prob":    float | None      — same as confidence;
+                                                  exposed for symmetry
+          "mode_bin_label":  str | None        — highest-prob bin
+          "mode_bin_prob":   float | None
+          "det_rounded":     int               — det_max under half-up
+        }
+    Returns confidence=0.0 if det_max rounds outside every bin (open-ended
+    bins should prevent this in practice)."""
+    if deterministic_max is None or not bin_probs or not bins:
+        return {"confidence": 0.0, "det_bin_label": None,
+                "det_bin_prob": None, "mode_bin_label": None,
+                "mode_bin_prob": None, "det_rounded": None}
+
+    det_rounded = _round_half_up(float(deterministic_max))
+
+    # Mode bin = highest-probability bin
+    mode_lbl = max(bin_probs, key=bin_probs.get)
+    mode_p = bin_probs[mode_lbl]
+
+    # Find the bin whose [lo, hi] range contains det_rounded
+    det_bin_label: Optional[str] = None
+    for b in bins:
+        lo, hi = b.get("range_low"), b.get("range_high")
+        lo_ok = (lo is None) or (det_rounded >= lo)
+        hi_ok = (hi is None) or (det_rounded <= hi)
+        if lo_ok and hi_ok:
+            det_bin_label = b["label"]
+            break
+
+    det_bin_prob = bin_probs.get(det_bin_label, 0.0) if det_bin_label else 0.0
+    return {
+        "confidence":     det_bin_prob,
+        "det_bin_label":  det_bin_label,
+        "det_bin_prob":   det_bin_prob,
+        "mode_bin_label": mode_lbl,
+        "mode_bin_prob":  mode_p,
+        "det_rounded":    det_rounded,
     }
 
 
@@ -594,6 +780,23 @@ def probe_city(conn: sqlite3.Connection,
     twc_probs = bin_probabilities(samples, bins)
     twc_top   = _top(twc_probs)
 
+    # --- Deterministic forecast + agreement confidence (Option A) ---
+    det = fetch_deterministic_daily_max(icao, unit, event_date, tz_str)
+    det_max: Optional[float] = det.get("today_max")
+    det_source = "daily/15day"
+    if det_max is None:
+        fallback = deterministic_max_from_p50(samples)
+        if fallback is not None:
+            det_max = fallback
+            det_source = f"P50 fallback ({det.get('status')})"
+    conf_info = compute_forecast_agreement_confidence(
+        det_max, twc_probs, bins) if det_max is not None else {
+            "confidence": 0.0, "det_bin_label": None, "det_bin_prob": None,
+            "mode_bin_label": _top(twc_probs), "mode_bin_prob":
+            (twc_probs.get(_top(twc_probs), 0.0) if twc_probs else 0.0),
+            "det_rounded": None,
+        }
+
     # --- Header (common to both modes) ---
     print(f"\n{city}  {event_date}  ({icao}, {tz_str})  [{mode}]")
     print(f"  TWC: {len(samples)} prototypes × {n_hours} hours of event_date")
@@ -604,6 +807,19 @@ def probe_city(conn: sqlite3.Connection,
         print(f"  TWC current obs: {tn}{unit_sym} now, "
               f"max-since-7am = {mx}{unit_sym}  (valid {vt})")
     print(f"  fusion: {fusion_note}")
+    # Deterministic line — always emit, even when fetch failed
+    if det_max is not None:
+        print(f"  TWC deterministic max: {det_max:.1f}{unit_sym}  "
+              f"[source: {det_source}]")
+        if conf_info.get("det_bin_label"):
+            print(f"  confidence: {conf_info['confidence']*100:>5.1f}%  "
+                  f"(det rounds to {conf_info['det_rounded']}{unit_sym} → "
+                  f"bin {conf_info['det_bin_label']}; "
+                  f"mode {conf_info['mode_bin_label']} @ "
+                  f"{conf_info['mode_bin_prob']*100:.1f}%)")
+    else:
+        print(f"  TWC deterministic max: UNAVAILABLE  "
+              f"[{det.get('status')}: {det.get('err','')[:80]}]")
     if floor is not None:
         print(f"  TWC daily-max BEFORE fusion: mean={raw_mean:.1f}{unit_sym}  "
               f"P10/P50/P90 = {raw_p10:.1f} / {raw_p50:.1f} / {raw_p90:.1f}{unit_sym}")
@@ -633,7 +849,13 @@ def probe_city(conn: sqlite3.Connection,
                   f"{(twc_p-our_p)*100:>+7.1f}pp {marker}")
         return {"city": city, "status": "ok", "mode": mode,
                 "twc_top": twc_top, "mkt_top": mkt_top, "our_top": our_top,
-                "twc_mean": mean}
+                "twc_mean": mean,
+                "det_max": det_max, "det_source": det_source,
+                "confidence": conf_info.get("confidence", 0.0),
+                "det_bin_label": conf_info.get("det_bin_label"),
+                "mode_bin_label": conf_info.get("mode_bin_label"),
+                "mode_bin_prob": conf_info.get("mode_bin_prob"),
+                "unit_sym": unit_sym}
     else:
         # TWC-only: just show synthesized bins + TWC P
         print(f"  top-P bin:  TWC={twc_top}  (no DB bins to compare)")
@@ -649,7 +871,13 @@ def probe_city(conn: sqlite3.Connection,
             print(f"  {lbl:<14} {twc_p*100:>6.1f}% {marker}")
         return {"city": city, "status": "ok", "mode": mode,
                 "twc_top": twc_top, "mkt_top": None, "our_top": None,
-                "twc_mean": mean}
+                "twc_mean": mean,
+                "det_max": det_max, "det_source": det_source,
+                "confidence": conf_info.get("confidence", 0.0),
+                "det_bin_label": conf_info.get("det_bin_label"),
+                "mode_bin_label": conf_info.get("mode_bin_label"),
+                "mode_bin_prob": conf_info.get("mode_bin_prob"),
+                "unit_sym": unit_sym}
 
 
 # ============================================================
@@ -746,6 +974,38 @@ def main(argv: Optional[list] = None) -> int:
               f"{(twc_top or '--'):<12} "
               f"{(mkt_top or '--'):<12} "
               f"{agree:<8}")
+
+    # --- Confidence ranking (Option A: P(bin containing deterministic)) ---
+    rankable = [s for s in summaries if s.get("status") == "ok"
+                  and s.get("confidence") is not None
+                  and s.get("det_max") is not None]
+    rankable.sort(key=lambda s: -float(s.get("confidence") or 0.0))
+    print()
+    print("=" * 90)
+    print("CITIES BY FORECAST CONFIDENCE (most → least)")
+    print("  confidence = P(probabilistic bin containing TWC's deterministic forecast)")
+    print("=" * 90)
+    print(f"{'city':<14} {'det max':>8} {'det bin':<12} "
+          f"{'mode bin':<12} {'mode P':>7} {'conf':>7}  {'src'}")
+    print("-" * 90)
+    for s in rankable:
+        usym = s.get("unit_sym", "")
+        det_max = s.get("det_max")
+        conf = float(s.get("confidence") or 0.0)
+        mode_p = float(s.get("mode_bin_prob") or 0.0)
+        marker = "✓" if conf >= 0.50 else (
+            "●" if conf >= 0.30 else "⚠")
+        det_str = f"{det_max:.1f}{usym}" if det_max is not None else "--"
+        src = s.get("det_source", "")
+        # Tag the row by whether deterministic came from the independent
+        # daily/15day endpoint or the (less independent) P50 fallback.
+        src_short = "ind" if "15day" in src else "p50"
+        print(f"{s['city']:<14} {det_str:>8} "
+              f"{(s.get('det_bin_label') or '--'):<12} "
+              f"{(s.get('mode_bin_label') or '--'):<12} "
+              f"{mode_p*100:>6.1f}% {conf*100:>6.1f}% {marker}  {src_short}")
+    if not rankable:
+        print("  (no cities with successful TWC fetch)")
 
     return 0
 
