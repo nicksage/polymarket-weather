@@ -87,6 +87,13 @@ TWC_CURRENT_CONDITIONS_PATH = os.getenv(
 # distribution if this endpoint isn't entitled.
 TWC_DAILY_FORECAST_PATH = os.getenv(
     "TWC_DAILY_FORECAST_PATH", "/v3/wx/forecast/daily/15day")
+# 15-min short-range nowcast — 28 quarter-hour slots = 7h horizon.
+# At <7h this is TWC's freshest product (HRRR/RAP-blended with radar);
+# when it diverges from the longer-horizon probabilistic forecast, the
+# nowcast usually has newer information (afternoon cloud cover, cold
+# airmass arrival, etc.).  Used for intraday peak confirmation.
+TWC_FIFTEENMIN_PATH = os.getenv(
+    "TWC_FIFTEENMIN_PATH", "/v3/wx/forecast/fifteenminute")
 TWC_LANGUAGE  = os.getenv("TWC_LANGUAGE", "en-US")
 TWC_TIMEOUT_S = float(os.getenv("TWC_TIMEOUT_S", "30"))
 N_PROTOTYPES_DEFAULT = int(os.getenv("TWC_N_PROTOTYPES", "100"))
@@ -385,6 +392,188 @@ def compute_forecast_agreement_confidence(
         "mode_bin_label": mode_lbl,
         "mode_bin_prob":  mode_p,
         "det_rounded":    det_rounded,
+    }
+
+
+# ============================================================
+# 15-min nowcast peak — intraday peak confirmation (7h horizon)
+# ============================================================
+
+def fetch_15min_peak(
+    icao: str, settlement_unit: str, event_date: str, tz_str: str,
+) -> dict:
+    """Call /v3/wx/forecast/fifteenminute and return the highest forecast
+    temperature across the slots whose station-local date == event_date.
+
+    TWC's 15-min product covers 28 slots × 15 min = 7 hours.  At that
+    horizon it's the freshest signal we have — HRRR/RAP-blended with
+    radar — and consistently beats the longer-horizon hourly forecast
+    inside 6h.  Use it to confirm (or override) the longer-horizon
+    probabilistic peak estimate.
+
+    Returns dict:
+        {
+          "status":          "ok" | "not_entitled" | "no_data" | "error"
+          "peak_temp":       float | None   (settlement_unit)
+          "peak_local_hour": int | None     (0-23, station-local)
+          "n_slots_today":   int            (of the 28, how many fell on event_date)
+          "horizon_hours":   float          (n_slots_today * 0.25)
+          "err":             str | None
+        }
+    On 401/403 returns status='not_entitled' instead of raising."""
+    if not TWC_API_KEY:
+        return {"status": "error", "peak_temp": None,
+                "peak_local_hour": None, "n_slots_today": 0,
+                "horizon_hours": 0.0,
+                "err": "TWC_API_KEY env var not set"}
+    params = {
+        "icaoCode": icao,
+        "units":    _units_for(settlement_unit),
+        "language": TWC_LANGUAGE,
+        "format":   "json",
+        "apiKey":   TWC_API_KEY,
+    }
+    url = f"{TWC_API_BASE}{TWC_FIFTEENMIN_PATH}"
+    try:
+        resp = httpx.get(url, params=params, timeout=TWC_TIMEOUT_S)
+    except Exception as e:
+        return {"status": "error", "peak_temp": None,
+                "peak_local_hour": None, "n_slots_today": 0,
+                "horizon_hours": 0.0,
+                "err": f"{type(e).__name__}: {e}"}
+    if resp.status_code in (401, 403):
+        return {"status": "not_entitled", "peak_temp": None,
+                "peak_local_hour": None, "n_slots_today": 0,
+                "horizon_hours": 0.0,
+                "err": f"HTTP {resp.status_code}"}
+    if resp.status_code != 200:
+        return {"status": "error", "peak_temp": None,
+                "peak_local_hour": None, "n_slots_today": 0,
+                "horizon_hours": 0.0,
+                "err": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+    try:
+        data = resp.json()
+    except Exception as e:
+        return {"status": "error", "peak_temp": None,
+                "peak_local_hour": None, "n_slots_today": 0,
+                "horizon_hours": 0.0,
+                "err": f"json decode: {e}"}
+
+    # The 15-min product also has both flat and nested-by-product shapes
+    # across TWC variants.  Try flat first; fall through to nested.
+    payload = data
+    if not data.get("temperature") and not data.get("validTimeLocal"):
+        for v in data.values():
+            if isinstance(v, dict) and (
+                v.get("temperature") or v.get("validTimeLocal")):
+                payload = v
+                break
+
+    temps = payload.get("temperature") or []
+    valid = payload.get("validTimeLocal") or []
+    if not temps or not valid:
+        return {"status": "no_data", "peak_temp": None,
+                "peak_local_hour": None, "n_slots_today": 0,
+                "horizon_hours": 0.0,
+                "err": "no temperature/validTimeLocal in response"}
+
+    # Filter to slots whose local date matches event_date.  validTimeLocal
+    # already encodes station-local time so we can substring-match the
+    # date prefix without timezone math.
+    best_t: Optional[float] = None
+    best_hour: Optional[int] = None
+    n_today = 0
+    for i, vt in enumerate(valid):
+        if not isinstance(vt, str) or vt[:10] != event_date:
+            continue
+        if i >= len(temps) or temps[i] is None:
+            continue
+        n_today += 1
+        t = float(temps[i])
+        if best_t is None or t > best_t:
+            best_t = t
+            try:
+                best_hour = int(vt[11:13])
+            except (ValueError, IndexError):
+                best_hour = None
+
+    if best_t is None:
+        return {"status": "no_data", "peak_temp": None,
+                "peak_local_hour": None, "n_slots_today": 0,
+                "horizon_hours": 0.0,
+                "err": f"no slots on event_date={event_date} within 7h horizon"}
+
+    return {
+        "status":          "ok",
+        "peak_temp":       best_t,
+        "peak_local_hour": best_hour,
+        "n_slots_today":   n_today,
+        "horizon_hours":   n_today * 0.25,
+        "err":             None,
+    }
+
+
+def compute_intraday_agreement(
+    nowcast_peak: Optional[float],
+    probabilistic_p50: Optional[float],
+    observed_max_so_far: Optional[float],
+    settlement_unit: str,
+) -> dict:
+    """Three-way agreement between TWC's freshest short-range nowcast,
+    the longer-horizon probabilistic P50, and the actual observed max
+    so far.
+
+    Both forecasts are floored by observed_max (a forecast can't undercut
+    what already happened) before comparison.  Spread = |nowcast - prob|
+    in settlement units.
+
+    Returns:
+        {
+          "nowcast_adj":     float | None
+          "prob_adj":        float | None
+          "spread":          float | None
+          "observed_max":    float | None
+          "tight_threshold": float
+          "verdict":         "tight" | "loose" | "diverged" | "no_nowcast"
+        }
+
+    Verdict tiers (per Polymarket bin width):
+        US 2°F bins: tight ≤ 1.0°F, loose ≤ 2.0°F, diverged > 2.0°F
+        Intl 1°C bins: tight ≤ 0.5°C, loose ≤ 1.0°C, diverged > 1.0°C"""
+    is_fahrenheit = (settlement_unit or "").lower() == "fahrenheit"
+    tight = 1.0 if is_fahrenheit else 0.5
+
+    if nowcast_peak is None:
+        return {"nowcast_adj": None, "prob_adj": probabilistic_p50,
+                "spread": None, "observed_max": observed_max_so_far,
+                "tight_threshold": tight, "verdict": "no_nowcast"}
+
+    nowcast_adj = nowcast_peak
+    prob_adj = probabilistic_p50
+    if observed_max_so_far is not None:
+        nowcast_adj = max(nowcast_adj, observed_max_so_far)
+        if prob_adj is not None:
+            prob_adj = max(prob_adj, observed_max_so_far)
+
+    if prob_adj is None:
+        return {"nowcast_adj": nowcast_adj, "prob_adj": None,
+                "spread": None, "observed_max": observed_max_so_far,
+                "tight_threshold": tight, "verdict": "no_nowcast"}
+
+    spread = abs(nowcast_adj - prob_adj)
+    if spread <= tight:
+        verdict = "tight"
+    elif spread <= 2 * tight:
+        verdict = "loose"
+    else:
+        verdict = "diverged"
+    return {
+        "nowcast_adj":      nowcast_adj,
+        "prob_adj":         prob_adj,
+        "spread":           spread,
+        "observed_max":     observed_max_so_far,
+        "tight_threshold":  tight,
+        "verdict":          verdict,
     }
 
 
@@ -797,6 +986,25 @@ def probe_city(conn: sqlite3.Connection,
             "det_rounded": None,
         }
 
+    # --- 15-min nowcast peak + 3-way intraday agreement ---
+    # Only meaningful when event_date is today (the 7h horizon can't see
+    # tomorrow).  Skip otherwise — the value of nowcast comes from its
+    # freshness, not from being a long-horizon prediction.
+    nowcast: dict = {"status": "skipped_future_date"}
+    intraday: dict = {"verdict": "no_nowcast", "nowcast_adj": None,
+                      "prob_adj": None, "spread": None,
+                      "tight_threshold": (1.0 if unit == "fahrenheit" else 0.5)}
+    if is_event_today_in_tz(event_date, tz_str):
+        nowcast = fetch_15min_peak(icao, unit, event_date, tz_str)
+        # P50 for the agreement comparison is computed from the FUSED
+        # samples (already floored), so it represents the model's CURRENT
+        # best median estimate of today's max.
+        intraday = compute_intraday_agreement(
+            nowcast.get("peak_temp"),
+            float(p50),
+            floor,
+            unit)
+
     # --- Header (common to both modes) ---
     print(f"\n{city}  {event_date}  ({icao}, {tz_str})  [{mode}]")
     print(f"  TWC: {len(samples)} prototypes × {n_hours} hours of event_date")
@@ -820,6 +1028,28 @@ def probe_city(conn: sqlite3.Connection,
     else:
         print(f"  TWC deterministic max: UNAVAILABLE  "
               f"[{det.get('status')}: {det.get('err','')[:80]}]")
+
+    # 15-min nowcast + 3-way agreement
+    if nowcast.get("status") == "ok":
+        peak_t = nowcast.get("peak_temp")
+        peak_h = nowcast.get("peak_local_hour")
+        horizon = nowcast.get("horizon_hours", 0.0)
+        print(f"  TWC 15-min nowcast peak: {peak_t:.1f}{unit_sym} @ "
+              f"{peak_h:02d}:00 local  ({horizon:.1f}h of event_date in horizon)")
+        if intraday.get("spread") is not None:
+            verdict = intraday["verdict"]
+            sym = {"tight": "✓", "loose": "●", "diverged": "⚠"}.get(
+                verdict, "·")
+            print(f"  intraday agreement: nowcast={intraday['nowcast_adj']:.1f} "
+                  f"vs probP50={intraday['prob_adj']:.1f}  "
+                  f"spread={intraday['spread']:.2f}{unit_sym}  "
+                  f"[{verdict} {sym}]")
+    elif nowcast.get("status") == "skipped_future_date":
+        # Quiet skip — expected for non-today event dates
+        pass
+    else:
+        print(f"  TWC 15-min nowcast peak: UNAVAILABLE  "
+              f"[{nowcast.get('status')}: {nowcast.get('err','')[:80]}]")
     if floor is not None:
         print(f"  TWC daily-max BEFORE fusion: mean={raw_mean:.1f}{unit_sym}  "
               f"P10/P50/P90 = {raw_p10:.1f} / {raw_p50:.1f} / {raw_p90:.1f}{unit_sym}")
@@ -855,7 +1085,11 @@ def probe_city(conn: sqlite3.Connection,
                 "det_bin_label": conf_info.get("det_bin_label"),
                 "mode_bin_label": conf_info.get("mode_bin_label"),
                 "mode_bin_prob": conf_info.get("mode_bin_prob"),
-                "unit_sym": unit_sym}
+                "unit_sym": unit_sym,
+                "nowcast_peak": nowcast.get("peak_temp"),
+                "nowcast_status": nowcast.get("status"),
+                "intraday_spread": intraday.get("spread"),
+                "intraday_verdict": intraday.get("verdict")}
     else:
         # TWC-only: just show synthesized bins + TWC P
         print(f"  top-P bin:  TWC={twc_top}  (no DB bins to compare)")
@@ -877,7 +1111,11 @@ def probe_city(conn: sqlite3.Connection,
                 "det_bin_label": conf_info.get("det_bin_label"),
                 "mode_bin_label": conf_info.get("mode_bin_label"),
                 "mode_bin_prob": conf_info.get("mode_bin_prob"),
-                "unit_sym": unit_sym}
+                "unit_sym": unit_sym,
+                "nowcast_peak": nowcast.get("peak_temp"),
+                "nowcast_status": nowcast.get("status"),
+                "intraday_spread": intraday.get("spread"),
+                "intraday_verdict": intraday.get("verdict")}
 
 
 # ============================================================
@@ -981,13 +1219,16 @@ def main(argv: Optional[list] = None) -> int:
                   and s.get("det_max") is not None]
     rankable.sort(key=lambda s: -float(s.get("confidence") or 0.0))
     print()
-    print("=" * 90)
+    print("=" * 112)
     print("CITIES BY FORECAST CONFIDENCE (most → least)")
     print("  confidence = P(probabilistic bin containing TWC's deterministic forecast)")
-    print("=" * 90)
+    print("  intraday   = |15-min nowcast peak − probabilistic P50|  "
+          "(tight ≤ 1°F/0.5°C; diverged > 2°F/1°C)")
+    print("=" * 112)
     print(f"{'city':<14} {'det max':>8} {'det bin':<12} "
-          f"{'mode bin':<12} {'mode P':>7} {'conf':>7}  {'src'}")
-    print("-" * 90)
+          f"{'mode bin':<12} {'mode P':>7} {'conf':>7}   "
+          f"{'nowcast':>8} {'spread':>7}  {'intraday':<9}  {'src'}")
+    print("-" * 112)
     for s in rankable:
         usym = s.get("unit_sym", "")
         det_max = s.get("det_max")
@@ -997,13 +1238,22 @@ def main(argv: Optional[list] = None) -> int:
             "●" if conf >= 0.30 else "⚠")
         det_str = f"{det_max:.1f}{usym}" if det_max is not None else "--"
         src = s.get("det_source", "")
-        # Tag the row by whether deterministic came from the independent
-        # daily/15day endpoint or the (less independent) P50 fallback.
         src_short = "ind" if "15day" in src else "p50"
+
+        nc_peak = s.get("nowcast_peak")
+        nc_str = f"{nc_peak:.1f}{usym}" if nc_peak is not None else "--"
+        spr = s.get("intraday_spread")
+        spr_str = f"{spr:.2f}{usym}" if spr is not None else "--"
+        verdict = s.get("intraday_verdict") or "-"
+        v_sym = {"tight": "✓", "loose": "●",
+                  "diverged": "⚠", "no_nowcast": "·"}.get(verdict, "·")
+        verdict_disp = f"{verdict} {v_sym}"
+
         print(f"{s['city']:<14} {det_str:>8} "
               f"{(s.get('det_bin_label') or '--'):<12} "
               f"{(s.get('mode_bin_label') or '--'):<12} "
-              f"{mode_p*100:>6.1f}% {conf*100:>6.1f}% {marker}  {src_short}")
+              f"{mode_p*100:>6.1f}% {conf*100:>6.1f}% {marker}  "
+              f"{nc_str:>8} {spr_str:>7}  {verdict_disp:<9}  {src_short}")
     if not rankable:
         print("  (no cities with successful TWC fetch)")
 
