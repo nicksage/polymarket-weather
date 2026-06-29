@@ -224,14 +224,22 @@ def fetch_deterministic_daily_max(
     icao: str, settlement_unit: str, event_date: str, tz_str: str,
 ) -> dict:
     """Call /v3/wx/forecast/daily/15day and return TWC's deterministic
-    daily-max for `event_date`.  This is INDEPENDENT of the probabilistic
-    BMA pipeline — it's the forecast end-users see in TWC's apps — so
-    agreement between the two is a meaningful confidence signal.
+    daily-max for `event_date`.  Independent of the probabilistic BMA
+    pipeline (the forecast end-users see in TWC's apps), so agreement
+    between the two is a meaningful confidence signal.
+
+    Prefers `calendarDayTemperatureMax` (midnight-to-midnight, matches
+    Polymarket settlement convention, persists all day).  Falls back to
+    `temperatureMax` (7AM-7PM daypart high, goes null after 3PM LAT) if
+    the calendar-day field isn't populated.  See docs:
+        https://developer.weather.com/docs/openapi/daily-forecast-3-0-0
 
     Returns dict:
         {
           "status":          "ok" | "not_entitled" | "no_data" | "error",
           "today_max":       float | None  (in settlement_unit)
+          "source_field":    "calendarDayTemperatureMax" |
+                              "temperatureMax" | None
           "narrative":       str | None
           "valid_time_local": str | None
           "err":             str | None
@@ -241,6 +249,7 @@ def fetch_deterministic_daily_max(
     lets the probe gracefully fall back to using the probabilistic P50."""
     if not TWC_API_KEY:
         return {"status": "error", "today_max": None,
+                "source_field": None,
                 "narrative": None, "valid_time_local": None,
                 "err": "TWC_API_KEY env var not set"}
     params = {
@@ -255,15 +264,18 @@ def fetch_deterministic_daily_max(
         resp = httpx.get(url, params=params, timeout=TWC_TIMEOUT_S)
     except Exception as e:
         return {"status": "error", "today_max": None,
+                "source_field": None,
                 "narrative": None, "valid_time_local": None,
                 "err": f"{type(e).__name__}: {e}"}
 
     if resp.status_code in (401, 403):
         return {"status": "not_entitled", "today_max": None,
+                "source_field": None,
                 "narrative": None, "valid_time_local": None,
                 "err": f"HTTP {resp.status_code}"}
     if resp.status_code != 200:
         return {"status": "error", "today_max": None,
+                "source_field": None,
                 "narrative": None, "valid_time_local": None,
                 "err": f"HTTP {resp.status_code}: {resp.text[:200]}"}
 
@@ -271,28 +283,36 @@ def fetch_deterministic_daily_max(
         data = resp.json()
     except Exception as e:
         return {"status": "error", "today_max": None,
+                "source_field": None,
                 "narrative": None, "valid_time_local": None,
                 "err": f"json decode: {e}"}
 
     # The 15-day product has both a flat wrapper shape and a nested-by-
-    # product-name shape across TWC variants.  Try both.
+    # product-name shape across TWC variants.  Try both.  Recognize either
+    # the calendar-day or the 7am-anchored max field as a valid payload.
+    def _looks_like_payload(d: dict) -> bool:
+        return bool(d.get("calendarDayTemperatureMax")
+                    or d.get("temperatureMax")
+                    or d.get("validTimeLocal"))
+
     payload = data
-    if not data.get("temperatureMax") and not data.get("validTimeLocal"):
-        # Look one level down for the first dict child with these keys
+    if not _looks_like_payload(data):
         for v in data.values():
-            if isinstance(v, dict) and (
-                v.get("temperatureMax") or v.get("validTimeLocal")):
+            if isinstance(v, dict) and _looks_like_payload(v):
                 payload = v
                 break
 
-    max_arr = payload.get("temperatureMax") or []
+    cal_arr   = payload.get("calendarDayTemperatureMax") or []
+    max_arr   = payload.get("temperatureMax") or []
     valid_arr = payload.get("validTimeLocal") or []
     narrative_arr = payload.get("narrative") or []
 
-    if not max_arr or not valid_arr:
+    if not valid_arr or (not cal_arr and not max_arr):
         return {"status": "no_data", "today_max": None,
+                "source_field": None,
                 "narrative": None, "valid_time_local": None,
-                "err": "no temperatureMax/validTimeLocal arrays in response"}
+                "err": "no calendarDayTemperatureMax / temperatureMax / "
+                       "validTimeLocal arrays in response"}
 
     # Find the index whose validTimeLocal's local date matches event_date.
     # validTimeLocal entries look like '2026-06-26T07:00:00-0400' — the
@@ -304,20 +324,33 @@ def fetch_deterministic_daily_max(
             break
     if target_idx is None:
         return {"status": "no_data", "today_max": None,
+                "source_field": None,
                 "narrative": None, "valid_time_local": None,
                 "err": f"no entry for event_date={event_date} in 15-day forecast"}
 
-    raw_max = max_arr[target_idx] if target_idx < len(max_arr) else None
+    # Prefer calendar-day field: matches Polymarket settlement AND persists
+    # all day (vs temperatureMax which goes null after 3PM LAT).
+    raw_max: Optional[float] = None
+    source_field: Optional[str] = None
+    if target_idx < len(cal_arr) and cal_arr[target_idx] is not None:
+        raw_max = float(cal_arr[target_idx])
+        source_field = "calendarDayTemperatureMax"
+    elif target_idx < len(max_arr) and max_arr[target_idx] is not None:
+        raw_max = float(max_arr[target_idx])
+        source_field = "temperatureMax"
+
     if raw_max is None:
         return {"status": "no_data", "today_max": None,
+                "source_field": None,
                 "narrative": None, "valid_time_local": None,
-                "err": f"temperatureMax is null at index {target_idx} "
-                       f"(today's max may already be in the past — "
-                       f"TWC drops it from the forecast post-peak)"}
+                "err": f"both calendarDayTemperatureMax and temperatureMax "
+                       f"are null at index {target_idx} (unusual — most "
+                       f"likely a response variant without these fields)"}
 
     return {
         "status":           "ok",
-        "today_max":        float(raw_max),
+        "today_max":        raw_max,
+        "source_field":     source_field,
         "narrative":        (narrative_arr[target_idx]
                               if target_idx < len(narrative_arr) else None),
         "valid_time_local": valid_arr[target_idx],
@@ -972,7 +1005,11 @@ def probe_city(conn: sqlite3.Connection,
     # --- Deterministic forecast + agreement confidence (Option A) ---
     det = fetch_deterministic_daily_max(icao, unit, event_date, tz_str)
     det_max: Optional[float] = det.get("today_max")
-    det_source = "daily/15day"
+    # Surface which field drove the value so post-3PM-LAT cases (where
+    # temperatureMax goes null but calendarDayTemperatureMax persists)
+    # are visible in the diagnostic line.
+    det_source = (f"daily/15day:{det.get('source_field')}"
+                  if det.get("source_field") else "daily/15day")
     if det_max is None:
         fallback = deterministic_max_from_p50(samples)
         if fallback is not None:
@@ -1238,7 +1275,17 @@ def main(argv: Optional[list] = None) -> int:
             "●" if conf >= 0.30 else "⚠")
         det_str = f"{det_max:.1f}{usym}" if det_max is not None else "--"
         src = s.get("det_source", "")
-        src_short = "ind" if "15day" in src else "p50"
+        # cday = calendarDayTemperatureMax (best — matches settlement,
+        #        persists all day);  7am = temperatureMax fallback (goes
+        #        null after 3PM LAT);  p50 = probabilistic median fallback
+        if "calendarDayTemperatureMax" in src:
+            src_short = "cday"
+        elif "temperatureMax" in src:
+            src_short = "7am"
+        elif "15day" in src:
+            src_short = "ind"
+        else:
+            src_short = "p50"
 
         nc_peak = s.get("nowcast_peak")
         nc_str = f"{nc_peak:.1f}{usym}" if nc_peak is not None else "--"

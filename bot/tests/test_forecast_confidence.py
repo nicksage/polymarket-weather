@@ -178,7 +178,49 @@ def _mock_httpx_response(status_code: int, json_body: dict | None = None,
 
 class TestFetchDeterministic:
 
-    def test_flat_shape_picks_event_date(self):
+    def test_prefers_calendar_day_field(self):
+        """When both fields are present, calendarDayTemperatureMax wins
+        (matches Polymarket settlement convention)."""
+        body = {
+            "calendarDayTemperatureMax": [85.0, 92.0, 88.0],
+            "temperatureMax":            [84.0, 91.0, 87.0],
+            "validTimeLocal":            ["2026-06-25T07:00:00-0400",
+                                            "2026-06-26T07:00:00-0400",
+                                            "2026-06-27T07:00:00-0400"],
+            "narrative":                 ["a", "b", "c"],
+        }
+        with patch("scripts.twc_forecast_probe.TWC_API_KEY", "fake"), \
+             patch("scripts.twc_forecast_probe.httpx.get",
+                    return_value=_mock_httpx_response(200, body)):
+            out = fetch_deterministic_daily_max(
+                "KMIA", "fahrenheit", "2026-06-26", "America/New_York")
+        assert out["status"] == "ok"
+        assert out["today_max"] == 92.0
+        assert out["source_field"] == "calendarDayTemperatureMax"
+        assert out["narrative"] == "b"
+
+    def test_calendar_day_null_falls_back_to_temperatureMax(self):
+        """Post-3PM-LAT: temperatureMax goes null but calendarDay should
+        still be set.  This test covers the reverse edge: if for some
+        reason cal-day is null, fall back gracefully to the 7am-anchored."""
+        body = {
+            "calendarDayTemperatureMax": [None, 91.0],
+            "temperatureMax":            [85.0, 90.0],
+            "validTimeLocal":            ["2026-06-26T07:00:00-0400",
+                                            "2026-06-27T07:00:00-0400"],
+        }
+        with patch("scripts.twc_forecast_probe.TWC_API_KEY", "fake"), \
+             patch("scripts.twc_forecast_probe.httpx.get",
+                    return_value=_mock_httpx_response(200, body)):
+            out = fetch_deterministic_daily_max(
+                "KMIA", "fahrenheit", "2026-06-26", "America/New_York")
+        assert out["status"] == "ok"
+        assert out["today_max"] == 85.0
+        assert out["source_field"] == "temperatureMax"
+
+    def test_flat_shape_picks_event_date_no_cal_field(self):
+        """Older response variants without calendarDayTemperatureMax —
+        must still parse via temperatureMax."""
         body = {
             "temperatureMax":   [85.0, 91.0, 88.0],
             "validTimeLocal":   ["2026-06-25T07:00:00-0400",
@@ -193,14 +235,16 @@ class TestFetchDeterministic:
                 "KMIA", "fahrenheit", "2026-06-26", "America/New_York")
         assert out["status"] == "ok"
         assert out["today_max"] == 91.0
+        assert out["source_field"] == "temperatureMax"
         assert out["narrative"] == "b"
 
     def test_nested_shape_picks_event_date(self):
         body = {
             "forecastDaily15Day": {
-                "temperatureMax":   [85.0, 91.0],
-                "validTimeLocal":   ["2026-06-25T07:00:00-0400",
-                                      "2026-06-26T07:00:00-0400"],
+                "calendarDayTemperatureMax": [85.0, 92.0],
+                "temperatureMax":            [84.0, 91.0],
+                "validTimeLocal":            ["2026-06-25T07:00:00-0400",
+                                                "2026-06-26T07:00:00-0400"],
             }
         }
         with patch("scripts.twc_forecast_probe.TWC_API_KEY", "fake"), \
@@ -209,12 +253,14 @@ class TestFetchDeterministic:
             out = fetch_deterministic_daily_max(
                 "KMIA", "fahrenheit", "2026-06-26", "America/New_York")
         assert out["status"] == "ok"
-        assert out["today_max"] == 91.0
+        assert out["today_max"] == 92.0
+        assert out["source_field"] == "calendarDayTemperatureMax"
 
     def test_event_date_not_in_response(self):
         body = {
-            "temperatureMax":  [85.0],
-            "validTimeLocal":  ["2026-06-25T07:00:00-0400"],
+            "calendarDayTemperatureMax": [85.0],
+            "temperatureMax":            [84.0],
+            "validTimeLocal":            ["2026-06-25T07:00:00-0400"],
         }
         with patch("scripts.twc_forecast_probe.TWC_API_KEY", "fake"), \
              patch("scripts.twc_forecast_probe.httpx.get",
@@ -224,12 +270,33 @@ class TestFetchDeterministic:
         assert out["status"] == "no_data"
         assert out["today_max"] is None
 
-    def test_temperatureMax_null_post_peak(self):
-        """After today's peak, TWC drops the entry (sets to null)."""
+    def test_post_3pm_cal_day_persists_temperatureMax_null(self):
+        """The key scenario this whole change fixes: after 3PM LAT,
+        temperatureMax goes null but calendarDayTemperatureMax persists.
+        OLD code returned no_data + 'post-peak'.  NEW code returns ok."""
         body = {
-            "temperatureMax":  [None, 91.0],
-            "validTimeLocal":  ["2026-06-26T07:00:00-0400",
-                                 "2026-06-27T07:00:00-0400"],
+            "calendarDayTemperatureMax": [91.0, 88.0],   # persists
+            "temperatureMax":            [None, 88.0],    # null post-3PM
+            "validTimeLocal":            ["2026-06-26T07:00:00-0400",
+                                            "2026-06-27T07:00:00-0400"],
+        }
+        with patch("scripts.twc_forecast_probe.TWC_API_KEY", "fake"), \
+             patch("scripts.twc_forecast_probe.httpx.get",
+                    return_value=_mock_httpx_response(200, body)):
+            out = fetch_deterministic_daily_max(
+                "KMIA", "fahrenheit", "2026-06-26", "America/New_York")
+        assert out["status"] == "ok"
+        assert out["today_max"] == 91.0
+        assert out["source_field"] == "calendarDayTemperatureMax"
+
+    def test_both_fields_null_returns_no_data(self):
+        """If BOTH calendar-day and temperatureMax are null at the target
+        index, we genuinely have no data — return no_data."""
+        body = {
+            "calendarDayTemperatureMax": [None, 91.0],
+            "temperatureMax":            [None, 90.0],
+            "validTimeLocal":            ["2026-06-26T07:00:00-0400",
+                                            "2026-06-27T07:00:00-0400"],
         }
         with patch("scripts.twc_forecast_probe.TWC_API_KEY", "fake"), \
              patch("scripts.twc_forecast_probe.httpx.get",
@@ -238,7 +305,7 @@ class TestFetchDeterministic:
                 "KMIA", "fahrenheit", "2026-06-26", "America/New_York")
         assert out["status"] == "no_data"
         assert out["today_max"] is None
-        assert "post-peak" in (out.get("err") or "")
+        assert "both" in (out.get("err") or "").lower()
 
     def test_403_returns_not_entitled(self):
         with patch("scripts.twc_forecast_probe.TWC_API_KEY", "fake"), \
