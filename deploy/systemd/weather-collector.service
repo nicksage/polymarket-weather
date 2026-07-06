@@ -1,5 +1,5 @@
 [Unit]
-Description=Weather API Collector (NOAA / Tomorrow.io / VisualCrossing / TWC) - PLACEHOLDER
+Description=Weather API Collector (NWS / Tomorrow.io / VisualCrossing / TWC)
 After=network-online.target
 Wants=network-online.target
 
