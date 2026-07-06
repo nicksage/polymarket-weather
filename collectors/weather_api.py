@@ -939,6 +939,16 @@ def _log_run_summary(exit_reason: str):
     )
 
 
+def _next_aligned(now_ts):
+    """Epoch of the next wall-clock boundary strictly after now_ts.
+
+    WEATHER_INTERVAL (1800s) evenly divides an hour and the Unix epoch is
+    aligned to :00:00 UTC, so multiples of it land exactly on :00 and :30 of
+    every hour (globally, since minute boundaries are timezone-independent).
+    """
+    return (int(now_ts) // WEATHER_INTERVAL + 1) * WEATHER_INTERVAL
+
+
 def main():
     parser = argparse.ArgumentParser(description="Weather API collector")
     parser.add_argument("--once", action="store_true",
@@ -956,7 +966,7 @@ def main():
                 f"prob({PROB_HOURS}h,{len(PROB_PARAMS)}params) (ICAO)")
     logger.info(f"  twc key:  {'y' if TWC_API_KEY else 'n'}   (nws=no-key)")
     if not args.once:
-        logger.info(f"  cycle every {WEATHER_INTERVAL}s")
+        logger.info("  cycle aligned to wall clock :00 and :30 (after startup cycle)")
     _install_signal_handlers()
 
     exit_reason = "unknown"
@@ -974,7 +984,7 @@ def main():
         return
 
     now = time.time()
-    next_cycle = now + WEATHER_INTERVAL
+    next_cycle = _next_aligned(now)
     next_health = now + HEALTH_LOG_INTERVAL
 
     try:
@@ -987,7 +997,7 @@ def main():
                 except Exception as e:
                     logger.warning(f"Cycle error: {e}")
                     _session["cycle_errors"] += 1
-                next_cycle = time.time() + WEATHER_INTERVAL
+                next_cycle = _next_aligned(time.time())
             if now >= next_health:
                 _log_health()
                 next_health = time.time() + HEALTH_LOG_INTERVAL
