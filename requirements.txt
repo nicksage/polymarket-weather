@@ -1,0 +1,8 @@
+# Runtime dependencies for the polymarket-weather platform
+httpx>=0.27
+python-dotenv>=1.0
+python-dateutil>=2.8
+
+# Analytics — optional at runtime, but useful for local analysis scripts
+pandas>=2.2
+numpy>=1.26

@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# SQLite databases (data lives on the box, not in git)
+db/*.db
+db/*.db-journal
+db/*.db-wal
+db/*.db-shm
+
+# Logs
+logs/*.log
+
+# Environment (secrets)
+.env
+.env.*
+!.env.example
+
+# OS/editor cruft
+.DS_Store
+*.swp

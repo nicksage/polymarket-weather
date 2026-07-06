@@ -1,0 +1,17 @@
+[Unit]
+Description=Polymarket Price Collector (highest-temperature markets)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/apps/polymarket-weather
+ExecStart=/home/ubuntu/apps/polymarket-weather/venv/bin/python /home/ubuntu/apps/polymarket-weather/collectors/polymarket_prices.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
