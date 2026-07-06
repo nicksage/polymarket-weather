@@ -25,3 +25,4 @@ logs/*.log
 # OS/editor cruft
 .DS_Store
 *.swp
+archive/
