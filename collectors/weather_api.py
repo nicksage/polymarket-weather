@@ -289,8 +289,73 @@ def _parse_icao(event):
     return m.group(1) if m else None
 
 
+# Sentinels for open-ended market bins ("X or below/above"), in Celsius.
+PROB_TEMP_SENT_LO = -100.0
+PROB_TEMP_SENT_HI = 100.0
+
+
+def _parse_range(question: str):
+    """Parse a Polymarket temp-market question into whole-degree (low, high).
+
+    Mirrors collectors/polymarket_prices.py. Either bound may be None
+    (open-ended). A single value like "be 16" returns (16, 16).
+    """
+    q = question
+    m = re.search(r"between\s+(-?\d+\.?\d*)\s*°?\s*[CF]?\s+and\s+(-?\d+\.?\d*)", q, re.IGNORECASE)
+    if m: return float(m.group(1)), float(m.group(2))
+    m = re.search(r"(-?\d+\.?\d*)\s*°?\s*[CF]?\s*[-–—]\s*(-?\d+\.?\d*)\s*°?\s*[CF]?", q, re.IGNORECASE)
+    if m: return float(m.group(1)), float(m.group(2))
+    m = re.search(r"(-?\d+\.?\d*)\s*°?\s*[CF]?\s+or\s+(?:above|higher|more|greater|over)", q, re.IGNORECASE)
+    if m: return float(m.group(1)), None
+    m = re.search(r"at least\s+(-?\d+\.?\d*)", q, re.IGNORECASE)
+    if m: return float(m.group(1)), None
+    m = re.search(r"(-?\d+\.?\d*)\s*°?\s*[CF]?\s+or\s+(?:below|lower|less|under)", q, re.IGNORECASE)
+    if m: return None, float(m.group(1))
+    m = re.search(r"at most\s+(-?\d+\.?\d*)", q, re.IGNORECASE)
+    if m: return None, float(m.group(1))
+    m = re.search(r"be\s+(?:exactly\s+)?(-?\d+\.?\d*)\s*°?\s*[CF]?(?:\s+on|\?|$)", q, re.IGNORECASE)
+    if m:
+        v = float(m.group(1))
+        return v, v
+    return None, None
+
+
+def _market_temp_bins_celsius(markets):
+    """Continuous Celsius (lb, ub) ranges for a market's temperature bins.
+
+    Polymarket resolves to whole degrees, so a "16°C" bin means the high rounds
+    to 16 -> [15.5, 16.5); a "64-65°F" bin -> [63.5, 65.5)°F. We expand each
+    whole-degree label by ±0.5, convert Fahrenheit markets to Celsius (TWC is
+    requested in metric), and use sentinels for open-ended bins. Returns a set
+    of (lb, ub) tuples so P(high in bin) matches each contract's resolution.
+    """
+    bins = set()
+    for mkt in markets or []:
+        q = mkt.get("question", "") or ""
+        lo, hi = _parse_range(q)
+        if lo is None and hi is None:
+            continue
+        is_f = ("fahrenheit" in q.lower()) or ("°f" in q.lower()) or ("ºf" in q.lower())
+        lb = lo - 0.5 if lo is not None else None
+        ub = hi + 0.5 if hi is not None else None
+        if is_f:
+            lb = f_to_c(lb) if lb is not None else None
+            ub = f_to_c(ub) if ub is not None else None
+        lb = round(lb, 1) if lb is not None else PROB_TEMP_SENT_LO
+        ub = round(ub, 1) if ub is not None else PROB_TEMP_SENT_HI
+        if lb < ub:
+            bins.add((lb, ub))
+    return bins
+
+
 def discover_targets():
-    """Return list of {city, icao, lat, lon, is_us} for active temp markets."""
+    """Return list of {city, icao, lat, lon, is_us, temp_bins} for active markets.
+
+    temp_bins is the union (across all of the city's active events) of the
+    continuous Celsius ranges corresponding to that city's Polymarket
+    temperature contracts — used to request the `probabilities` product on the
+    exact bins in play.
+    """
     events = _fetch_gamma_events()
     seen = {}
     for e in events:
@@ -299,12 +364,17 @@ def discover_targets():
             continue
         city = m.group(1).strip()
         icao = _parse_icao(e) or CITY_ICAO_OVERRIDE.get(city)
+        bins = _market_temp_bins_celsius(e.get("markets", []))
         if city not in seen:
             lat, lon, is_us = CITIES.get(city, (None, None, False))
-            seen[city] = {"city": city, "icao": icao,
-                          "lat": lat, "lon": lon, "is_us": is_us}
-        elif icao and not seen[city]["icao"]:
-            seen[city]["icao"] = icao
+            seen[city] = {"city": city, "icao": icao, "lat": lat, "lon": lon,
+                          "is_us": is_us, "temp_bins": set(bins)}
+        else:
+            if icao and not seen[city]["icao"]:
+                seen[city]["icao"] = icao
+            seen[city]["temp_bins"] |= bins
+    for t in seen.values():
+        t["temp_bins"] = sorted(t["temp_bins"])
     targets = sorted(seen.values(), key=lambda t: t["city"])
     no_icao = [t["city"] for t in targets if not t["icao"]]
     no_coord = [t["city"] for t in targets if t["is_us"] and t["lat"] is None]
@@ -611,17 +681,34 @@ PROB_BANDS = {
     "visibility":          [(0, 1), (1, 5), (5, 10), (10, 20)],
 }
 
-# (short product name, API query-param, response key, spec string)
+# Static products (same spec every call). (short name, query-param, response key, spec)
 PROB_PRODUCTS = [
     ("pdf", "discretePdfs", "discretePdfs",
      ";".join(f"{p}:{PROB_RESOLUTION}" for p in PROB_PARAMS)),
     ("percentiles", "percentiles", "percentiles",
      ";".join(f"{p}:{PROB_RESOLUTION}" for p in PROB_PARAMS)),
-    ("probabilities", "probabilities", "probabilities",
-     ";".join(p + ":" + ":".join(f"{lb},{ub}" for lb, ub in PROB_BANDS[p]) for p in PROB_PARAMS)),
     ("prototypes", "prototypes", "prototypes",
      ";".join(f"{p}:{PROB_PROTOTYPE_N}" for p in PROB_PARAMS)),
 ]
+
+
+def _fmt_band(lb, ub):
+    """Format a band edge without trailing .0 (keeps the spec string compact)."""
+    def f(x):
+        return str(int(x)) if float(x).is_integer() else str(x)
+    return f"{f(lb)},{f(ub)}"
+
+
+def _prob_probabilities_spec(temp_bins):
+    """Build the `probabilities` spec: temperature uses the live Polymarket
+    market bins for this city (Celsius); the other params use generic bands."""
+    temp_pairs = temp_bins if temp_bins else PROB_BANDS["temperature"]
+    parts = ["temperature:" + ":".join(_fmt_band(lb, ub) for lb, ub in temp_pairs)]
+    for p in PROB_PARAMS:
+        if p == "temperature":
+            continue
+        parts.append(p + ":" + ":".join(_fmt_band(lb, ub) for lb, ub in PROB_BANDS[p]))
+    return ";".join(parts)
 
 PROB_META_FIELDS = [
     ("initTime", "init_time"), ("procTime", "proc_time"),
@@ -708,10 +795,18 @@ def _store_prob(conn, city, icao, product_short, resp_key, resp, fetched_at):
     return len(rows)
 
 
-def collect_prob(conn, city, icao, fetched_at):
-    """Fetch all 4 probabilistic products (each a separate call) for one ICAO."""
+def collect_prob(conn, city, icao, temp_bins, fetched_at):
+    """Fetch all 4 probabilistic products (each a separate call) for one ICAO.
+
+    The `probabilities` product requests temperature on this city's live
+    Polymarket market bins; the other three products use static specs.
+    """
+    products = list(PROB_PRODUCTS) + [
+        ("probabilities", "probabilities", "probabilities",
+         _prob_probabilities_spec(temp_bins)),
+    ]
     added = 0
-    for product_short, api_param, resp_key, spec in PROB_PRODUCTS:
+    for product_short, api_param, resp_key, spec in products:
         if _stop.is_set():
             break
         resp = _get(f"{TWC_BASE}/wx/forecast/probabilistic", params={
@@ -781,7 +876,7 @@ def collect_twc(targets, fetched_at):
             if _stop.is_set():
                 break
 
-            n_prob += collect_prob(conn, city, icao, fetched_at)
+            n_prob += collect_prob(conn, city, icao, t.get("temp_bins"), fetched_at)
         conn.commit()
     finally:
         conn.close()
