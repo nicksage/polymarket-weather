@@ -4,10 +4,12 @@ have active Polymarket highest-temperature markets, and write daily-high/low
 forecasts + current observations to db/main.db.
 
 Sources:
-    nws            — api.weather.gov  (US cities only, no key, User-Agent required)
-    tomorrowio     — api.tomorrow.io  (global, TOMORROWIO_API_KEY)
-    visualcrossing — weather.visualcrossing.com (global, VISUAL_CROSSING_API_KEY)
-    twc            — api.weather.com  (global, TWC_API_KEY)
+    nws  — api.weather.gov  (US cities only, no key, User-Agent required)
+    twc  — api.weather.com   (global, TWC_API_KEY)
+
+(Tomorrow.io and Visual Crossing were removed 2026-07-06: their free-tier
+quotas can't sustain 30-min polling of ~49 cities. TWC coverage will be
+expanded instead.)
 
 City list is derived dynamically each cycle from the `events` table (only
 cities with markets on/after today). Cities are mapped to coordinates via the
@@ -32,10 +34,7 @@ import httpx
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
-from config.env_loader import (
-    DB_PATH, LOG_DIR,
-    TOMORROWIO_API_KEY, VISUAL_CROSSING_API_KEY, TWC_API_KEY,
-)
+from config.env_loader import DB_PATH, LOG_DIR, TWC_API_KEY
 
 LOG_PATH = os.path.join(LOG_DIR, "weather_collector.log")
 ACTIVITY_LOG_PATH = os.path.join(LOG_DIR, "activity.log")
@@ -115,7 +114,7 @@ CITIES = {
     "Zhengzhou":     (34.7466, 113.6254, False),
 }
 
-SOURCES = ["nws", "tomorrowio", "visualcrossing", "twc"]
+SOURCES = ["nws", "twc"]
 
 _session = {
     "started_at": None, "startup_ok": False, "cycles": 0, "cycle_errors": 0,
@@ -318,91 +317,6 @@ def fetch_nws(city, lat, lon, today):
 
 
 # ------------------------------------------------------------------
-# Source: Tomorrow.io — global
-# ------------------------------------------------------------------
-def fetch_tomorrowio(city, lat, lon, today):
-    if not TOMORROWIO_API_KEY:
-        return [], None
-    forecasts, obs = [], None
-    loc = f"{lat},{lon}"
-    # daily forecast (metric: C, wind m/s)
-    data = _get("https://api.tomorrow.io/v4/weather/forecast",
-                params={"location": loc, "apikey": TOMORROWIO_API_KEY, "units": "metric"})
-    daily = ((data or {}).get("timelines") or {}).get("daily") or []
-    for day in daily:
-        d = (day.get("time") or "")[:10]
-        v = day.get("values") or {}
-        high_c = _num(v.get("temperatureMax"))
-        low_c = _num(v.get("temperatureMin"))
-        wind_ms = _num(v.get("windSpeedAvg"))
-        forecasts.append({
-            "target_date": d,
-            "high_c": high_c, "low_c": low_c,
-            "high_f": c_to_f(high_c), "low_f": c_to_f(low_c),
-            "precip_prob": _num(v.get("precipitationProbabilityMax")
-                                or v.get("precipitationProbabilityAvg")),
-            "humidity": _num(v.get("humidityAvg")),
-            "wind_kph": round(wind_ms * 3.6, 1) if wind_ms is not None else None,
-        })
-    # current observation
-    rt = _get("https://api.tomorrow.io/v4/weather/realtime",
-              params={"location": loc, "apikey": TOMORROWIO_API_KEY, "units": "metric"})
-    v = ((rt or {}).get("data") or {}).get("values") or {}
-    if v:
-        temp_c = _num(v.get("temperature"))
-        wind_ms = _num(v.get("windSpeed"))
-        obs = {
-            "temp_c": temp_c, "temp_f": c_to_f(temp_c),
-            "humidity": _num(v.get("humidity")),
-            "wind_kph": round(wind_ms * 3.6, 1) if wind_ms is not None else None,
-            "conditions": None,
-            "observed_at": ((rt or {}).get("data") or {}).get("time"),
-        }
-    return forecasts, obs
-
-
-# ------------------------------------------------------------------
-# Source: Visual Crossing — global
-# ------------------------------------------------------------------
-def fetch_visualcrossing(city, lat, lon, today):
-    if not VISUAL_CROSSING_API_KEY:
-        return [], None
-    forecasts, obs = [], None
-    # limit records: today .. today+MAX_LEAD_DAYS
-    end = date.fromordinal(today.toordinal() + MAX_LEAD_DAYS).isoformat()
-    url = ("https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/"
-           f"timeline/{lat},{lon}/{today.isoformat()}/{end}")
-    data = _get(url, params={
-        "key": VISUAL_CROSSING_API_KEY, "unitGroup": "metric",
-        "include": "days,current",
-        "elements": "datetime,tempmax,tempmin,temp,humidity,windspeed,precipprob,conditions",
-    })
-    for day in (data or {}).get("days") or []:
-        d = day.get("datetime")
-        high_c = _num(day.get("tempmax"))
-        low_c = _num(day.get("tempmin"))
-        forecasts.append({
-            "target_date": d,
-            "high_c": high_c, "low_c": low_c,
-            "high_f": c_to_f(high_c), "low_f": c_to_f(low_c),
-            "precip_prob": _num(day.get("precipprob")),
-            "humidity": _num(day.get("humidity")),
-            "wind_kph": _num(day.get("windspeed")),  # metric = km/h
-        })
-    cc = (data or {}).get("currentConditions") or {}
-    if cc:
-        temp_c = _num(cc.get("temp"))
-        obs = {
-            "temp_c": temp_c, "temp_f": c_to_f(temp_c),
-            "humidity": _num(cc.get("humidity")),
-            "wind_kph": _num(cc.get("windspeed")),
-            "conditions": cc.get("conditions"),
-            "observed_at": cc.get("datetime"),
-        }
-    return forecasts, obs
-
-
-# ------------------------------------------------------------------
 # Source: The Weather Company (api.weather.com) — global
 # ------------------------------------------------------------------
 def fetch_twc(city, lat, lon, today):
@@ -452,8 +366,6 @@ def fetch_twc(city, lat, lon, today):
 
 FETCHERS = {
     "nws": fetch_nws,
-    "tomorrowio": fetch_tomorrowio,
-    "visualcrossing": fetch_visualcrossing,
     "twc": fetch_twc,
 }
 
@@ -586,9 +498,7 @@ def main():
     logger.info(f"  db path:  {DB_PATH}")
     logger.info(f"  log dir:  {LOG_DIR}")
     logger.info(f"  sources:  {', '.join(SOURCES)}")
-    logger.info(f"  keys:     tomorrowio={'y' if TOMORROWIO_API_KEY else 'n'} "
-                f"visualcrossing={'y' if VISUAL_CROSSING_API_KEY else 'n'} "
-                f"twc={'y' if TWC_API_KEY else 'n'} (nws=no-key)")
+    logger.info(f"  keys:     twc={'y' if TWC_API_KEY else 'n'} (nws=no-key)")
     if not args.once:
         logger.info(f"  cycle every {WEATHER_INTERVAL}s")
     _install_signal_handlers()
