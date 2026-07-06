@@ -58,7 +58,8 @@ CREATE INDEX IF NOT EXISTS idx_bins_event
 -- ============================================================
 -- Weather data (Phase 2)
 -- Written by collectors/weather_api.py every ~30 min.
--- source is one of: nws | tomorrowio | visualcrossing | twc
+-- These coarse ensemble tables are fed by NWS only (api.weather.gov,
+-- US cities). TWC data lives in the full-fidelity twc_* tables below.
 -- city matches events.city verbatim (e.g. "NYC", "Sao Paulo").
 -- Temps stored in BOTH Celsius and Fahrenheit (canonical = Celsius).
 -- ============================================================
@@ -107,3 +108,155 @@ CREATE TABLE IF NOT EXISTS weather_sources (
     name    TEXT UNIQUE NOT NULL,
     notes   TEXT
 );
+
+-- ============================================================
+-- The Weather Company (TWC) full-fidelity capture.
+-- Keyed by ICAO airport code = the exact station Polymarket resolves
+-- against (parsed from each market's Wunderground resolutionSource,
+-- e.g. .../jinan/ZSJN -> ZSJN). All values are metric (units="m":
+-- temps degC, wind km/h, pressure hPa, precip mm, visibility km).
+-- Every forecast period and every field is stored on every poll --
+-- not just the current/most-recent value.
+-- ============================================================
+
+-- Current observations by ICAO. One row per (icao) per poll.
+CREATE TABLE IF NOT EXISTS twc_current (
+    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+    city                       TEXT,
+    icao                       TEXT NOT NULL,
+    units                      TEXT,
+    valid_time_local           TEXT,
+    valid_time_utc             INTEGER,
+    expiration_time_utc        INTEGER,
+    day_of_week                TEXT,
+    day_or_night               TEXT,
+    temperature                REAL,
+    temperature_feels_like     REAL,
+    temperature_dew_point      REAL,
+    temperature_heat_index     REAL,
+    temperature_wind_chill     REAL,
+    temperature_wet_bulb_globe REAL,
+    temperature_max_24hour     REAL,
+    temperature_min_24hour     REAL,
+    temperature_max_since_7am  REAL,
+    temperature_change_24hour  REAL,
+    relative_humidity          REAL,
+    precip_1hour               REAL,
+    precip_6hour               REAL,
+    precip_24hour              REAL,
+    snow_1hour                 REAL,
+    snow_6hour                 REAL,
+    snow_24hour                REAL,
+    wind_speed                 REAL,
+    wind_direction             REAL,
+    wind_direction_cardinal    TEXT,
+    wind_gust                  REAL,
+    pressure_altimeter         REAL,
+    pressure_mean_sea_level    REAL,
+    pressure_change            REAL,
+    pressure_tendency_code     INTEGER,
+    pressure_tendency_trend    TEXT,
+    cloud_cover                REAL,
+    cloud_cover_phrase         TEXT,
+    cloud_ceiling              REAL,
+    visibility                 REAL,
+    uv_index                   REAL,
+    uv_description             TEXT,
+    icon_code                  INTEGER,
+    icon_code_extend           INTEGER,
+    wx_phrase_long             TEXT,
+    wx_phrase_medium           TEXT,
+    wx_phrase_short            TEXT,
+    obs_qualifier_code         TEXT,
+    obs_qualifier_severity     INTEGER,
+    sunrise_time_local         TEXT,
+    sunrise_time_utc           INTEGER,
+    sunset_time_local          TEXT,
+    sunset_time_utc            INTEGER,
+    fetched_at                 TEXT NOT NULL
+);
+
+-- Enterprise hourly forecast by ICAO. One row per forecast hour per poll.
+CREATE TABLE IF NOT EXISTS twc_hourly (
+    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+    city                       TEXT,
+    icao                       TEXT NOT NULL,
+    units                      TEXT,
+    duration                   TEXT,   -- e.g. "2day"
+    valid_time_local           TEXT,
+    valid_time_utc             INTEGER,
+    expiration_time_utc        INTEGER,
+    day_of_week                TEXT,
+    day_or_night               TEXT,
+    temperature                REAL,
+    temperature_dew_point      REAL,
+    temperature_feels_like     REAL,
+    temperature_heat_index     REAL,
+    temperature_wind_chill     REAL,
+    temperature_wet_bulb_globe REAL,
+    relative_humidity          REAL,
+    precip_chance              REAL,
+    precip_type                TEXT,
+    qpf                        REAL,
+    qpf_rain                   REAL,
+    qpf_snow                   REAL,
+    qpf_ice                    REAL,
+    cond_prob_rain             REAL,
+    cond_prob_snow             REAL,
+    cond_prob_sleet            REAL,
+    cond_prob_freezing_rain    REAL,
+    cond_prob_thunder          REAL,
+    wind_speed                 REAL,
+    wind_direction             REAL,
+    wind_direction_cardinal    TEXT,
+    wind_gust                  REAL,
+    pressure_altimeter         REAL,
+    pressure_mean_sea_level    REAL,
+    cloud_cover                REAL,
+    ceiling                    REAL,
+    scattered_cloud_base_height REAL,
+    visibility                 REAL,
+    uv_index                   REAL,
+    uv_description             TEXT,
+    icon_code                  INTEGER,
+    icon_code_extend           INTEGER,
+    wx_phrase_long             TEXT,
+    wx_phrase_short            TEXT,
+    wx_string                  TEXT,
+    wx_severity                INTEGER,
+    qualifier_set              TEXT,   -- JSON array as returned
+    fetched_at                 TEXT NOT NULL
+);
+
+-- 15-minute forecast (next ~7 hours). One row per 15-min period per poll.
+CREATE TABLE IF NOT EXISTS twc_fifteenminute (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    city                    TEXT,
+    icao                    TEXT NOT NULL,
+    units                   TEXT,
+    valid_time_local        TEXT,
+    day_of_week             TEXT,
+    temperature             REAL,
+    temperature_feels_like  REAL,
+    relative_humidity       REAL,
+    precip_chance           REAL,
+    precip_rate             REAL,
+    precip_type             TEXT,
+    snow_rate               REAL,
+    wind_speed              REAL,
+    wind_direction          REAL,
+    wind_direction_cardinal TEXT,
+    icon_code               INTEGER,
+    icon_code_extend        INTEGER,
+    wx_phrase_long          TEXT,
+    wx_phrase_short         TEXT,
+    wx_severity             INTEGER,
+    fetched_at              TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_twc_cur_icao
+    ON twc_current(icao, fetched_at);
+CREATE INDEX IF NOT EXISTS idx_twc_hr_icao
+    ON twc_hourly(icao, valid_time_utc, fetched_at);
+CREATE INDEX IF NOT EXISTS idx_twc_15_icao
+    ON twc_fifteenminute(icao, valid_time_local, fetched_at);

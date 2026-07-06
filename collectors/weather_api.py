@@ -1,27 +1,34 @@
 """
-weather_api.py — Poll 4 weather sources every ~30 min for the cities that
-have active Polymarket highest-temperature markets, and write daily-high/low
-forecasts + current observations to db/main.db.
+weather_api.py — Poll weather sources every ~30 min for the cities that have
+active Polymarket highest-temperature markets, and persist to db/main.db.
 
-Sources:
-    nws  — api.weather.gov  (US cities only, no key, User-Agent required)
-    twc  — api.weather.com   (global, TWC_API_KEY)
+Two data streams:
 
-(Tomorrow.io and Visual Crossing were removed 2026-07-06: their free-tier
-quotas can't sustain 30-min polling of ~49 cities. TWC coverage will be
-expanded instead.)
+  NWS (api.weather.gov, US cities only, no key) -> the coarse ensemble tables
+      weather_forecasts (daily high/low) + weather_observations (current).
 
-City list is derived dynamically each cycle from the `events` table (only
-cities with markets on/after today). Cities are mapped to coordinates via the
-static gazetteer below; unknown cities are logged and skipped until added.
+  TWC (api.weather.com, enterprise key) -> full-fidelity per-station tables,
+      keyed by the ICAO airport code Polymarket actually resolves against:
+        - twc_current        current observations by ICAO (48 fields)
+        - twc_hourly         enterprise hourly forecast by ICAO (2day, 42 fields)
+        - twc_fifteenminute  15-minute forecast, next ~7h by ICAO (17 fields)
+      EVERY forecast period and EVERY field is stored on every poll, not just
+      the current/most-recent value.
+
+Discovery: each cycle queries the Polymarket Gamma API for active
+highest-temperature events, parses the city from the title and the ICAO code
+from the market's Wunderground resolutionSource (e.g. .../jinan/ZSJN -> ZSJN).
+City -> (lat, lon, is_us) for NWS comes from the static gazetteer below.
 
 Runs as systemd service weather-collector.service. Handles SIGTERM/SIGINT
 gracefully so `systemctl stop` produces clean RUN SUMMARY entries in the log.
 Run a single cycle for testing with:  python collectors/weather_api.py --once
 """
 import argparse
+import json
 import logging
 import os
+import re
 import signal
 import sqlite3
 import sys
@@ -39,12 +46,17 @@ from config.env_loader import DB_PATH, LOG_DIR, TWC_API_KEY
 LOG_PATH = os.path.join(LOG_DIR, "weather_collector.log")
 ACTIVITY_LOG_PATH = os.path.join(LOG_DIR, "activity.log")
 
-WEATHER_INTERVAL = 1800     # 30 minutes — forecasts + observations each cycle
+WEATHER_INTERVAL = 1800     # 30 minutes
 HEALTH_LOG_INTERVAL = 300   # 5 minutes
-MAX_LEAD_DAYS = 7           # store daily forecasts out to +7 days
+MAX_LEAD_DAYS = 7           # store NWS daily forecasts out to +7 days
 PER_CALL_PAUSE = 0.4        # polite gap between HTTP calls (seconds)
 
 NWS_USER_AGENT = "polymarket-weather/1.0 (nickrable@gmail.com)"
+
+GAMMA_BASE = "https://gamma-api.polymarket.com"
+TWC_BASE = "https://api.weather.com/v3"
+TWC_UNITS = "m"             # metric: degC, km/h, hPa, mm, km
+TWC_HOURLY_DURATION = "2day"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,8 +69,9 @@ logging.basicConfig(
 logger = logging.getLogger("weather_api")
 
 # ------------------------------------------------------------------
-# City gazetteer: exact events.city string -> (lat, lon, is_us)
-# is_us gates the NWS source (api.weather.gov covers the US only).
+# City gazetteer: exact Polymarket city string -> (lat, lon, is_us).
+# Only used for NWS (api.weather.gov needs lat/lon and covers the US only).
+# TWC needs no coords — it is keyed by the market's ICAO code.
 # ------------------------------------------------------------------
 CITIES = {
     "Amsterdam":     (52.3728,   4.8936, False),
@@ -114,12 +127,26 @@ CITIES = {
     "Zhengzhou":     (34.7466, 113.6254, False),
 }
 
-SOURCES = ["nws", "twc"]
+# Nearest-major-airport ICAO for cities whose Polymarket market resolves against
+# a national observatory (not a Wunderground airport), so no ICAO is parseable.
+# These are APPROXIMATIONS — the TWC station is not the exact resolution source,
+# so treat forecasts/obs for these ICAOs as "near the city" rather than "the
+# resolving station". Better than no TWC coverage at all.
+CITY_ICAO_OVERRIDE = {
+    "Hong Kong": "VHHH",   # resolves via Hong Kong Observatory
+    "Istanbul":  "LTFM",   # Istanbul Airport
+    "Moscow":    "UUEE",   # Sheremetyevo
+    "Tel Aviv":  "LLBG",   # Ben Gurion
+}
+
+# Streams tracked in health/summary output.
+STREAMS = ["nws", "twc_current", "twc_hourly", "twc_15min"]
 
 _session = {
     "started_at": None, "startup_ok": False, "cycles": 0, "cycle_errors": 0,
     "forecasts_written": 0, "observations_written": 0,
-    "src_ok": {s: 0 for s in SOURCES}, "src_err": {s: 0 for s in SOURCES},
+    "twc_current_rows": 0, "twc_hourly_rows": 0, "twc_15min_rows": 0,
+    "src_ok": {s: 0 for s in STREAMS}, "src_err": {s: 0 for s in STREAMS},
     "last_cycle_at": None, "shutdown_signal": None,
 }
 _stop = threading.Event()
@@ -182,12 +209,13 @@ def _log_health():
     uptime = _fmt_duration((datetime.now(timezone.utc) - started).total_seconds()) if started else "?"
     last = _session["last_cycle_at"]
     since = _fmt_duration((datetime.now(timezone.utc) - last).total_seconds()) if last else "never"
-    src = " ".join(f"{s}={_session['src_ok'][s]}/{_session['src_err'][s]}" for s in SOURCES)
+    src = " ".join(f"{s}={_session['src_ok'][s]}/{_session['src_err'][s]}" for s in STREAMS)
     logger.info(
         f"HEALTH | uptime={uptime} | cycles={_session['cycles']} "
         f"(errors={_session['cycle_errors']}, last {since} ago) | "
-        f"forecasts={_session['forecasts_written']} obs={_session['observations_written']} | "
-        f"src ok/err {src}"
+        f"nws_fc={_session['forecasts_written']} nws_obs={_session['observations_written']} "
+        f"twc_rows(cur/hr/15m)={_session['twc_current_rows']}/{_session['twc_hourly_rows']}/{_session['twc_15min_rows']} | "
+        f"ok/err {src}"
     )
 
 
@@ -208,36 +236,71 @@ def _get(url, params=None, headers=None, timeout=20):
 
 
 # ------------------------------------------------------------------
-# City discovery from the events table
+# Discovery: active markets -> city + ICAO (from Gamma API)
 # ------------------------------------------------------------------
-def active_cities():
-    """Distinct events.city with a market on/after today, mapped to coords.
+_ICAO_RE = re.compile(r"/([A-Z]{4})(?:[/\s\).?]|$)")
+_CITY_RE = re.compile(r"temperature in (.+?) on", re.IGNORECASE)
 
-    Returns list of (city, lat, lon, is_us). Unknown cities are logged once
-    per cycle and skipped.
-    """
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        rows = conn.execute(
-            "SELECT DISTINCT city FROM events WHERE date >= date('now') AND city IS NOT NULL"
-        ).fetchall()
-    finally:
-        conn.close()
-    out, unknown = [], []
-    for (city,) in rows:
-        meta = CITIES.get(city)
-        if meta is None:
-            unknown.append(city)
+
+def _fetch_gamma_events():
+    all_events, offset = [], 0
+    while not _stop.is_set():
+        data = _get(f"{GAMMA_BASE}/events", params={
+            "tag_slug": "highest-temperature",
+            "active": "true", "closed": "false",
+            "limit": 100, "offset": offset,
+        })
+        events = data if isinstance(data, list) else []
+        if not events:
+            break
+        all_events.extend(events)
+        if len(events) < 100:
+            break
+        offset += 100
+    return all_events
+
+
+def _parse_icao(event):
+    """Extract the 4-letter ICAO from a market's Wunderground resolution URL."""
+    src = event.get("resolutionSource") or ""
+    if not src:
+        for mkt in event.get("markets", []) or []:
+            m = re.search(r"https?://\S*wunderground\.com/\S+", mkt.get("description") or "")
+            if m:
+                src = m.group(0)
+                break
+    m = _ICAO_RE.search(src)
+    return m.group(1) if m else None
+
+
+def discover_targets():
+    """Return list of {city, icao, lat, lon, is_us} for active temp markets."""
+    events = _fetch_gamma_events()
+    seen = {}
+    for e in events:
+        m = _CITY_RE.search(e.get("title", "") or "")
+        if not m:
             continue
-        lat, lon, is_us = meta
-        out.append((city, lat, lon, is_us))
-    if unknown:
-        logger.warning(f"No gazetteer entry for {len(unknown)} city(ies): {', '.join(sorted(unknown))}")
-    return sorted(out)
+        city = m.group(1).strip()
+        icao = _parse_icao(e) or CITY_ICAO_OVERRIDE.get(city)
+        if city not in seen:
+            lat, lon, is_us = CITIES.get(city, (None, None, False))
+            seen[city] = {"city": city, "icao": icao,
+                          "lat": lat, "lon": lon, "is_us": is_us}
+        elif icao and not seen[city]["icao"]:
+            seen[city]["icao"] = icao
+    targets = sorted(seen.values(), key=lambda t: t["city"])
+    no_icao = [t["city"] for t in targets if not t["icao"]]
+    no_coord = [t["city"] for t in targets if t["is_us"] and t["lat"] is None]
+    if no_icao:
+        logger.warning(f"No ICAO parsed for {len(no_icao)} city(ies): {', '.join(no_icao)}")
+    if no_coord:
+        logger.warning(f"US city without gazetteer coords: {', '.join(no_coord)}")
+    return targets
 
 
 # ------------------------------------------------------------------
-# Source: NWS (api.weather.gov) — US only
+# Source: NWS (api.weather.gov) — US only -> coarse ensemble tables
 # ------------------------------------------------------------------
 def _nws_point(lat, lon):
     key = (round(lat, 4), round(lon, 4))
@@ -272,7 +335,6 @@ def fetch_nws(city, lat, lon, today):
                 continue
             temp_f = _num(p.get("temperature")) if p.get("temperatureUnit") == "F" else None
             if temp_f is None:
-                # some deployments report C; fall back to raw value
                 temp_f = c_to_f(_num(p.get("temperature")))
             pop = ((p.get("probabilityOfPrecipitation") or {}).get("value"))
             slot = by_date.setdefault(d, {"high_f": None, "low_f": None, "pop": None})
@@ -316,64 +378,7 @@ def fetch_nws(city, lat, lon, today):
     return forecasts, obs
 
 
-# ------------------------------------------------------------------
-# Source: The Weather Company (api.weather.com) — global
-# ------------------------------------------------------------------
-def fetch_twc(city, lat, lon, today):
-    if not TWC_API_KEY:
-        return [], None
-    forecasts, obs = [], None
-    geocode = f"{lat},{lon}"
-    # 5-day daily forecast (metric: C, km/h)
-    data = _get("https://api.weather.com/v3/wx/forecast/daily/5day",
-                params={"geocode": geocode, "format": "json", "units": "m",
-                        "language": "en-US", "apiKey": TWC_API_KEY})
-    if data:
-        valid = data.get("validTimeLocal") or []
-        highs = data.get("calendarDayTemperatureMax") or []
-        lows = data.get("calendarDayTemperatureMin") or []
-        dayparts = (data.get("daypart") or [{}])[0] or {}
-        precip = dayparts.get("precipChance") or []
-        for i, vt in enumerate(valid):
-            d = (vt or "")[:10]
-            if not d:
-                continue
-            high_c = _num(highs[i]) if i < len(highs) else None
-            low_c = _num(lows[i]) if i < len(lows) else None
-            # daypart arrays are 2x length (day/night); take the day slot for this date
-            pop = _num(precip[i * 2]) if precip and i * 2 < len(precip) else None
-            forecasts.append({
-                "target_date": d,
-                "high_c": high_c, "low_c": low_c,
-                "high_f": c_to_f(high_c), "low_f": c_to_f(low_c),
-                "precip_prob": pop, "humidity": None, "wind_kph": None,
-            })
-    # current observation
-    cur = _get("https://api.weather.com/v3/wx/observations/current",
-               params={"geocode": geocode, "format": "json", "units": "m",
-                       "language": "en-US", "apiKey": TWC_API_KEY})
-    if cur:
-        temp_c = _num(cur.get("temperature"))
-        obs = {
-            "temp_c": temp_c, "temp_f": c_to_f(temp_c),
-            "humidity": _num(cur.get("relativeHumidity")),
-            "wind_kph": _num(cur.get("windSpeed")),
-            "conditions": cur.get("wxPhraseLong"),
-            "observed_at": cur.get("validTimeLocal"),
-        }
-    return forecasts, obs
-
-
-FETCHERS = {
-    "nws": fetch_nws,
-    "twc": fetch_twc,
-}
-
-
-# ------------------------------------------------------------------
-# Persistence
-# ------------------------------------------------------------------
-def _write(fc_rows, obs_rows):
+def _write_nws(fc_rows, obs_rows):
     conn = sqlite3.connect(DB_PATH)
     try:
         if fc_rows:
@@ -395,65 +400,290 @@ def _write(fc_rows, obs_rows):
     _session["observations_written"] += len(obs_rows)
 
 
+def collect_nws(targets, fetched_at, today):
+    fc_rows, obs_rows = [], []
+    for t in targets:
+        if _stop.is_set():
+            break
+        if not (t["is_us"] and t["lat"] is not None):
+            continue
+        city = t["city"]
+        try:
+            forecasts, obs = fetch_nws(city, t["lat"], t["lon"], today)
+        except Exception as e:
+            logger.warning(f"nws fetch failed for {city}: {e}")
+            _session["src_err"]["nws"] += 1
+            continue
+        got = False
+        for f in forecasts:
+            d = f.get("target_date")
+            if not d:
+                continue
+            try:
+                lead = date.fromisoformat(d).toordinal() - today.toordinal()
+            except ValueError:
+                lead = None
+            if lead is not None and (lead < 0 or lead > MAX_LEAD_DAYS):
+                continue
+            fc_rows.append((
+                city, "nws", d, lead,
+                f.get("high_c"), f.get("low_c"), f.get("high_f"), f.get("low_f"),
+                f.get("precip_prob"), f.get("humidity"), f.get("wind_kph"), fetched_at,
+            ))
+            got = True
+        if obs:
+            obs_rows.append((
+                city, "nws", obs.get("temp_c"), obs.get("temp_f"),
+                obs.get("humidity"), obs.get("wind_kph"), obs.get("conditions"),
+                obs.get("observed_at"), fetched_at,
+            ))
+            got = True
+        _session["src_ok"]["nws" ] += 1 if got else 0
+        _session["src_err"]["nws"] += 0 if got else 1
+    _write_nws(fc_rows, obs_rows)
+    return len(fc_rows), len(obs_rows)
+
+
+# ------------------------------------------------------------------
+# Source: TWC (api.weather.com) — full-fidelity capture by ICAO
+# Field maps: (json_key, db_column). Every documented/observed field is kept.
+# ------------------------------------------------------------------
+TWC_CURRENT_FIELDS = [
+    ("validTimeLocal", "valid_time_local"),
+    ("validTimeUtc", "valid_time_utc"),
+    ("expirationTimeUtc", "expiration_time_utc"),
+    ("dayOfWeek", "day_of_week"),
+    ("dayOrNight", "day_or_night"),
+    ("temperature", "temperature"),
+    ("temperatureFeelsLike", "temperature_feels_like"),
+    ("temperatureDewPoint", "temperature_dew_point"),
+    ("temperatureHeatIndex", "temperature_heat_index"),
+    ("temperatureWindChill", "temperature_wind_chill"),
+    ("temperatureWetBulbGlobe", "temperature_wet_bulb_globe"),
+    ("temperatureMax24Hour", "temperature_max_24hour"),
+    ("temperatureMin24Hour", "temperature_min_24hour"),
+    ("temperatureMaxSince7Am", "temperature_max_since_7am"),
+    ("temperatureChange24Hour", "temperature_change_24hour"),
+    ("relativeHumidity", "relative_humidity"),
+    ("precip1Hour", "precip_1hour"),
+    ("precip6Hour", "precip_6hour"),
+    ("precip24Hour", "precip_24hour"),
+    ("snow1Hour", "snow_1hour"),
+    ("snow6Hour", "snow_6hour"),
+    ("snow24Hour", "snow_24hour"),
+    ("windSpeed", "wind_speed"),
+    ("windDirection", "wind_direction"),
+    ("windDirectionCardinal", "wind_direction_cardinal"),
+    ("windGust", "wind_gust"),
+    ("pressureAltimeter", "pressure_altimeter"),
+    ("pressureMeanSeaLevel", "pressure_mean_sea_level"),
+    ("pressureChange", "pressure_change"),
+    ("pressureTendencyCode", "pressure_tendency_code"),
+    ("pressureTendencyTrend", "pressure_tendency_trend"),
+    ("cloudCover", "cloud_cover"),
+    ("cloudCoverPhrase", "cloud_cover_phrase"),
+    ("cloudCeiling", "cloud_ceiling"),
+    ("visibility", "visibility"),
+    ("uvIndex", "uv_index"),
+    ("uvDescription", "uv_description"),
+    ("iconCode", "icon_code"),
+    ("iconCodeExtend", "icon_code_extend"),
+    ("wxPhraseLong", "wx_phrase_long"),
+    ("wxPhraseMedium", "wx_phrase_medium"),
+    ("wxPhraseShort", "wx_phrase_short"),
+    ("obsQualifierCode", "obs_qualifier_code"),
+    ("obsQualifierSeverity", "obs_qualifier_severity"),
+    ("sunriseTimeLocal", "sunrise_time_local"),
+    ("sunriseTimeUtc", "sunrise_time_utc"),
+    ("sunsetTimeLocal", "sunset_time_local"),
+    ("sunsetTimeUtc", "sunset_time_utc"),
+]
+
+TWC_HOURLY_FIELDS = [
+    ("validTimeLocal", "valid_time_local"),
+    ("validTimeUtc", "valid_time_utc"),
+    ("expirationTimeUtc", "expiration_time_utc"),
+    ("dayOfWeek", "day_of_week"),
+    ("dayOrNight", "day_or_night"),
+    ("temperature", "temperature"),
+    ("temperatureDewPoint", "temperature_dew_point"),
+    ("temperatureFeelsLike", "temperature_feels_like"),
+    ("temperatureHeatIndex", "temperature_heat_index"),
+    ("temperatureWindChill", "temperature_wind_chill"),
+    ("temperatureWetBulbGlobe", "temperature_wet_bulb_globe"),
+    ("relativeHumidity", "relative_humidity"),
+    ("precipChance", "precip_chance"),
+    ("precipType", "precip_type"),
+    ("qpf", "qpf"),
+    ("qpfRain", "qpf_rain"),
+    ("qpfSnow", "qpf_snow"),
+    ("qpfIce", "qpf_ice"),
+    ("conditionalProbabilityRain", "cond_prob_rain"),
+    ("conditionalProbabilitySnow", "cond_prob_snow"),
+    ("conditionalProbabilitySleet", "cond_prob_sleet"),
+    ("conditionalProbabilityFreezingRain", "cond_prob_freezing_rain"),
+    ("conditionalProbabilityThunder", "cond_prob_thunder"),
+    ("windSpeed", "wind_speed"),
+    ("windDirection", "wind_direction"),
+    ("windDirectionCardinal", "wind_direction_cardinal"),
+    ("windGust", "wind_gust"),
+    ("pressureAltimeter", "pressure_altimeter"),
+    ("pressureMeanSeaLevel", "pressure_mean_sea_level"),
+    ("cloudCover", "cloud_cover"),
+    ("ceiling", "ceiling"),
+    ("scatteredCloudBaseHeight", "scattered_cloud_base_height"),
+    ("visibility", "visibility"),
+    ("uvIndex", "uv_index"),
+    ("uvDescription", "uv_description"),
+    ("iconCode", "icon_code"),
+    ("iconCodeExtend", "icon_code_extend"),
+    ("wxPhraseLong", "wx_phrase_long"),
+    ("wxPhraseShort", "wx_phrase_short"),
+    ("wxString", "wx_string"),
+    ("wxSeverity", "wx_severity"),
+    ("qualifierSet", "qualifier_set"),
+]
+
+TWC_FIFTEEN_FIELDS = [
+    ("validTimeLocal", "valid_time_local"),
+    ("dayOfWeek", "day_of_week"),
+    ("temperature", "temperature"),
+    ("temperatureFeelsLike", "temperature_feels_like"),
+    ("relativeHumidity", "relative_humidity"),
+    ("precipChance", "precip_chance"),
+    ("precipRate", "precip_rate"),
+    ("precipType", "precip_type"),
+    ("snowRate", "snow_rate"),
+    ("windSpeed", "wind_speed"),
+    ("windDirection", "wind_direction"),
+    ("windDirectionCardinal", "wind_direction_cardinal"),
+    ("iconCode", "icon_code"),
+    ("iconCodeExtend", "icon_code_extend"),
+    ("wxPhraseLong", "wx_phrase_long"),
+    ("wxPhraseShort", "wx_phrase_short"),
+    ("wxSeverity", "wx_severity"),
+]
+
+
+def _twc_val(v):
+    return json.dumps(v, separators=(",", ":")) if isinstance(v, (list, dict)) else v
+
+
+def _twc_get(path, icao):
+    return _get(f"{TWC_BASE}{path}", params={
+        "icaoCode": icao, "units": TWC_UNITS,
+        "language": "en-US", "format": "json", "apiKey": TWC_API_KEY,
+    })
+
+
+def _insert_series(conn, table, static, field_map, data):
+    """Insert one row per forecast period from a dict of parallel arrays."""
+    length = 0
+    for jk, _ in field_map:
+        v = data.get(jk)
+        if isinstance(v, list):
+            length = max(length, len(v))
+    if not length:
+        return 0
+    cols = list(static.keys()) + [c for _, c in field_map]
+    placeholders = ",".join("?" * len(cols))
+    base = list(static.values())
+    rows = []
+    for i in range(length):
+        vals = list(base)
+        for jk, _ in field_map:
+            arr = data.get(jk)
+            vals.append(_twc_val(arr[i]) if isinstance(arr, list) and i < len(arr) else None)
+        rows.append(vals)
+    conn.executemany(f"INSERT INTO {table} ({','.join(cols)}) VALUES ({placeholders})", rows)
+    return len(rows)
+
+
+def _insert_one(conn, table, static, field_map, data):
+    """Insert a single row from a dict of scalar fields."""
+    cols = list(static.keys()) + [c for _, c in field_map]
+    placeholders = ",".join("?" * len(cols))
+    vals = list(static.values()) + [_twc_val(data.get(jk)) for jk, _ in field_map]
+    conn.execute(f"INSERT INTO {table} ({','.join(cols)}) VALUES ({placeholders})", vals)
+    return 1
+
+
+def collect_twc(targets, fetched_at):
+    if not TWC_API_KEY:
+        logger.warning("TWC_API_KEY not set — skipping TWC")
+        return 0, 0, 0
+    n_cur = n_hr = n_15 = 0
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        for t in targets:
+            if _stop.is_set():
+                break
+            icao, city = t["icao"], t["city"]
+            if not icao:
+                continue
+            base = {"city": city, "icao": icao, "units": TWC_UNITS}
+
+            cur = _twc_get("/wx/observations/current", icao)
+            if isinstance(cur, dict) and cur:
+                n_cur += _insert_one(conn, "twc_current",
+                                     {**base, "fetched_at": fetched_at},
+                                     TWC_CURRENT_FIELDS, cur)
+                _session["src_ok"]["twc_current"] += 1
+            else:
+                _session["src_err"]["twc_current"] += 1
+            if _stop.is_set():
+                break
+
+            hourly = _twc_get(f"/wx/forecast/hourly/{TWC_HOURLY_DURATION}/enterprise", icao)
+            if isinstance(hourly, dict) and hourly:
+                added = _insert_series(conn, "twc_hourly",
+                                       {**base, "duration": TWC_HOURLY_DURATION,
+                                        "fetched_at": fetched_at},
+                                       TWC_HOURLY_FIELDS, hourly)
+                n_hr += added
+                _session["src_ok"]["twc_hourly"] += 1 if added else 0
+                _session["src_err"]["twc_hourly"] += 0 if added else 1
+            else:
+                _session["src_err"]["twc_hourly"] += 1
+            if _stop.is_set():
+                break
+
+            fifteen = _twc_get("/wx/forecast/fifteenminute", icao)
+            if isinstance(fifteen, dict) and fifteen:
+                added = _insert_series(conn, "twc_fifteenminute",
+                                       {**base, "fetched_at": fetched_at},
+                                       TWC_FIFTEEN_FIELDS, fifteen)
+                n_15 += added
+                _session["src_ok"]["twc_15min"] += 1 if added else 0
+                _session["src_err"]["twc_15min"] += 0 if added else 1
+            else:
+                _session["src_err"]["twc_15min"] += 1
+        conn.commit()
+    finally:
+        conn.close()
+    _session["twc_current_rows"] += n_cur
+    _session["twc_hourly_rows"] += n_hr
+    _session["twc_15min_rows"] += n_15
+    return n_cur, n_hr, n_15
+
+
 # ------------------------------------------------------------------
 # One collection cycle
 # ------------------------------------------------------------------
 def run_cycle() -> tuple:
     fetched_at = datetime.now(timezone.utc).isoformat()
     today = datetime.now(timezone.utc).date()
-    cities = active_cities()
-    fc_rows, obs_rows = [], []
+    targets = discover_targets()
 
-    for city, lat, lon, is_us in cities:
-        if _stop.is_set():
-            break
-        for source in SOURCES:
-            if _stop.is_set():
-                break
-            if source == "nws" and not is_us:
-                continue  # api.weather.gov is US-only
-            try:
-                forecasts, obs = FETCHERS[source](city, lat, lon, today)
-            except Exception as e:
-                logger.warning(f"{source} fetch failed for {city}: {e}")
-                _session["src_err"][source] += 1
-                continue
-            got_data = False
-            for f in forecasts:
-                d = f.get("target_date")
-                if not d:
-                    continue
-                try:
-                    lead = date.fromisoformat(d).toordinal() - today.toordinal()
-                except ValueError:
-                    lead = None
-                if lead is not None and (lead < 0 or lead > MAX_LEAD_DAYS):
-                    continue
-                fc_rows.append((
-                    city, source, d, lead,
-                    f.get("high_c"), f.get("low_c"), f.get("high_f"), f.get("low_f"),
-                    f.get("precip_prob"), f.get("humidity"), f.get("wind_kph"), fetched_at,
-                ))
-                got_data = True
-            if obs:
-                obs_rows.append((
-                    city, source, obs.get("temp_c"), obs.get("temp_f"),
-                    obs.get("humidity"), obs.get("wind_kph"), obs.get("conditions"),
-                    obs.get("observed_at"), fetched_at,
-                ))
-                got_data = True
-            if got_data:
-                _session["src_ok"][source] += 1
-            else:
-                _session["src_err"][source] += 1
+    n_fc, n_obs = collect_nws(targets, fetched_at, today)
+    n_cur, n_hr, n_15 = collect_twc(targets, fetched_at)
 
-    _write(fc_rows, obs_rows)
     _session["last_cycle_at"] = datetime.now(timezone.utc)
     logger.info(
-        f"Cycle: {len(cities)} cities -> {len(fc_rows)} forecast rows, "
-        f"{len(obs_rows)} observation rows"
+        f"Cycle: {len(targets)} markets | NWS {n_fc} fc / {n_obs} obs | "
+        f"TWC current={n_cur} hourly={n_hr} 15min={n_15}"
     )
-    return len(fc_rows), len(obs_rows)
+    return targets, n_fc, n_obs, n_cur, n_hr, n_15
 
 
 def _log_run_summary(exit_reason: str):
@@ -466,20 +696,24 @@ def _log_run_summary(exit_reason: str):
     logger.info("-" * 72)
     logger.info("  RUN SUMMARY")
     logger.info("-" * 72)
-    logger.info(f"  success:       {success}")
-    logger.info(f"  exit reason:   {exit_reason}")
-    logger.info(f"  cycles:        {_session['cycles']}")
-    logger.info(f"  cycle errors:  {_session['cycle_errors']}")
-    logger.info(f"  forecasts:     {_session['forecasts_written']}")
-    logger.info(f"  observations:  {_session['observations_written']}")
-    for s in SOURCES:
+    logger.info(f"  success:        {success}")
+    logger.info(f"  exit reason:    {exit_reason}")
+    logger.info(f"  cycles:         {_session['cycles']}")
+    logger.info(f"  cycle errors:   {_session['cycle_errors']}")
+    logger.info(f"  nws forecasts:  {_session['forecasts_written']}")
+    logger.info(f"  nws obs:        {_session['observations_written']}")
+    logger.info(f"  twc current:    {_session['twc_current_rows']} rows")
+    logger.info(f"  twc hourly:     {_session['twc_hourly_rows']} rows")
+    logger.info(f"  twc 15-minute:  {_session['twc_15min_rows']} rows")
+    for s in STREAMS:
         logger.info(f"  {s:<14} ok={_session['src_ok'][s]} err={_session['src_err'][s]}")
-    logger.info(f"  uptime:        {uptime}")
+    logger.info(f"  uptime:         {uptime}")
     _append_activity_row(
         "OK" if success else "FAIL",
         uptime=uptime, reason=exit_reason,
-        forecasts=_session["forecasts_written"],
-        observations=_session["observations_written"],
+        nws_fc=_session["forecasts_written"], nws_obs=_session["observations_written"],
+        twc_cur=_session["twc_current_rows"], twc_hr=_session["twc_hourly_rows"],
+        twc_15=_session["twc_15min_rows"],
         cycles=_session["cycles"], cycle_errors=_session["cycle_errors"],
     )
 
@@ -497,8 +731,8 @@ def main():
     logger.info("=" * 72)
     logger.info(f"  db path:  {DB_PATH}")
     logger.info(f"  log dir:  {LOG_DIR}")
-    logger.info(f"  sources:  {', '.join(SOURCES)}")
-    logger.info(f"  keys:     twc={'y' if TWC_API_KEY else 'n'} (nws=no-key)")
+    logger.info(f"  streams:  nws (coarse) + twc current/hourly({TWC_HOURLY_DURATION})/15min (ICAO)")
+    logger.info(f"  twc key:  {'y' if TWC_API_KEY else 'n'}   (nws=no-key)")
     if not args.once:
         logger.info(f"  cycle every {WEATHER_INTERVAL}s")
     _install_signal_handlers()
