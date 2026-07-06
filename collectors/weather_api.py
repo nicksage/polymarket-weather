@@ -593,7 +593,7 @@ PROB_PARAMS = [
 ]
 PROB_HOURS = 72
 PROB_RESOLUTION = "medium"   # discretePdfs / percentiles bin resolution
-PROB_PROTOTYPE_N = 50        # ensemble member traces per parameter (max 100)
+PROB_PROTOTYPE_N = 100        # ensemble member traces per parameter (max 100)
 
 # Generic [lb, ub] bands per parameter for the `probabilities` product
 # (metric units). The PDF also lets any range be computed offline; these are
