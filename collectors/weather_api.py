@@ -12,6 +12,8 @@ Two data streams:
         - twc_current        current observations by ICAO (48 fields)
         - twc_hourly         enterprise hourly forecast by ICAO (2day, 42 fields)
         - twc_fifteenminute  15-minute forecast, next ~7h by ICAO (17 fields)
+        - twc_probabilistic  probabilistic hourly forecast by ICAO (72h; all 10
+                             params x pdf/percentiles/probabilities/prototypes)
       EVERY forecast period and EVERY field is stored on every poll, not just
       the current/most-recent value.
 
@@ -140,12 +142,13 @@ CITY_ICAO_OVERRIDE = {
 }
 
 # Streams tracked in health/summary output.
-STREAMS = ["nws", "twc_current", "twc_hourly", "twc_15min"]
+STREAMS = ["nws", "twc_current", "twc_hourly", "twc_15min", "twc_prob"]
 
 _session = {
     "started_at": None, "startup_ok": False, "cycles": 0, "cycle_errors": 0,
     "forecasts_written": 0, "observations_written": 0,
     "twc_current_rows": 0, "twc_hourly_rows": 0, "twc_15min_rows": 0,
+    "twc_prob_rows": 0,
     "src_ok": {s: 0 for s in STREAMS}, "src_err": {s: 0 for s in STREAMS},
     "last_cycle_at": None, "shutdown_signal": None,
 }
@@ -214,25 +217,38 @@ def _log_health():
         f"HEALTH | uptime={uptime} | cycles={_session['cycles']} "
         f"(errors={_session['cycle_errors']}, last {since} ago) | "
         f"nws_fc={_session['forecasts_written']} nws_obs={_session['observations_written']} "
-        f"twc_rows(cur/hr/15m)={_session['twc_current_rows']}/{_session['twc_hourly_rows']}/{_session['twc_15min_rows']} | "
+        f"twc_rows(cur/hr/15m/prob)={_session['twc_current_rows']}/{_session['twc_hourly_rows']}/"
+        f"{_session['twc_15min_rows']}/{_session['twc_prob_rows']} | "
         f"ok/err {src}"
     )
 
 
-def _get(url, params=None, headers=None, timeout=20):
-    """GET returning parsed JSON, or None on any error. Logs 429 distinctly."""
-    try:
-        r = httpx.get(url, params=params, headers=headers, timeout=timeout)
-        if r.status_code == 429:
-            logger.warning(f"429 rate-limited: {url}")
+def _get(url, params=None, headers=None, timeout=20, tries=1):
+    """GET returning parsed JSON, or None on any error. Logs 429 distinctly.
+
+    Retries up to `tries` times on transient 503s (TWC returns these on large
+    responses) with a short backoff.
+    """
+    for attempt in range(1, tries + 1):
+        try:
+            r = httpx.get(url, params=params, headers=headers, timeout=timeout)
+            if r.status_code == 429:
+                logger.warning(f"429 rate-limited: {url}")
+                return None
+            if r.status_code == 503 and attempt < tries:
+                _stop.wait(timeout=2.0)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            if attempt < tries:
+                _stop.wait(timeout=2.0)
+                continue
+            logger.warning(f"GET failed {url}: {e}")
             return None
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        logger.warning(f"GET failed {url}: {e}")
-        return None
-    finally:
-        _stop.wait(timeout=PER_CALL_PAUSE)
+        finally:
+            _stop.wait(timeout=PER_CALL_PAUSE)
+    return None
 
 
 # ------------------------------------------------------------------
@@ -565,6 +581,57 @@ TWC_FIFTEEN_FIELDS = [
 ]
 
 
+# --- Probabilistic hourly forecast config ---------------------------------
+# All 10 supported parameters, all 4 products, 72h horizon. The endpoint
+# returns nothing unless products are explicitly requested per parameter, and
+# a single all-products request is too large (503), so each product is fetched
+# in its own call. Multiple parameters are separated by ';' in the spec string.
+PROB_PARAMS = [
+    "temperature", "temperatureDewPoint", "relativeHumidity",
+    "qpf", "qpfSnow", "windSpeed", "windGust", "windDirection",
+    "ceiling", "visibility",
+]
+PROB_HOURS = 72
+PROB_RESOLUTION = "medium"   # discretePdfs / percentiles bin resolution
+PROB_PROTOTYPE_N = 50        # ensemble member traces per parameter (max 100)
+
+# Generic [lb, ub] bands per parameter for the `probabilities` product
+# (metric units). The PDF also lets any range be computed offline; these are
+# convenience bands. Polymarket's own bins vary per market, so we use fixed ones.
+PROB_BANDS = {
+    "temperature":         [(-10, 0), (0, 10), (10, 20), (20, 30), (30, 40), (40, 50)],
+    "temperatureDewPoint": [(-10, 0), (0, 10), (10, 20), (20, 30), (30, 40)],
+    "relativeHumidity":    [(0, 20), (20, 40), (40, 60), (60, 80), (80, 100)],
+    "qpf":                 [(0, 1), (1, 5), (5, 10), (10, 25), (25, 50)],
+    "qpfSnow":             [(0, 1), (1, 5), (5, 10), (10, 25)],
+    "windSpeed":           [(0, 10), (10, 20), (20, 40), (40, 60), (60, 100)],
+    "windGust":            [(0, 20), (20, 40), (40, 60), (60, 100)],
+    "windDirection":       [(0, 90), (90, 180), (180, 270), (270, 360)],
+    "ceiling":             [(0, 500), (500, 1000), (1000, 3000), (3000, 10000)],
+    "visibility":          [(0, 1), (1, 5), (5, 10), (10, 20)],
+}
+
+# (short product name, API query-param, response key, spec string)
+PROB_PRODUCTS = [
+    ("pdf", "discretePdfs", "discretePdfs",
+     ";".join(f"{p}:{PROB_RESOLUTION}" for p in PROB_PARAMS)),
+    ("percentiles", "percentiles", "percentiles",
+     ";".join(f"{p}:{PROB_RESOLUTION}" for p in PROB_PARAMS)),
+    ("probabilities", "probabilities", "probabilities",
+     ";".join(p + ":" + ":".join(f"{lb},{ub}" for lb, ub in PROB_BANDS[p]) for p in PROB_PARAMS)),
+    ("prototypes", "prototypes", "prototypes",
+     ";".join(f"{p}:{PROB_PROTOTYPE_N}" for p in PROB_PARAMS)),
+]
+
+PROB_META_FIELDS = [
+    ("initTime", "init_time"), ("procTime", "proc_time"),
+    ("latitude", "latitude"), ("longitude", "longitude"),
+    ("elevation", "elevation"), ("landuse", "landuse"),
+    ("spatialApp", "spatial_app"), ("version", "version"),
+    ("expires", "expires"), ("requestId", "request_id"),
+]
+
+
 def _twc_val(v):
     return json.dumps(v, separators=(",", ":")) if isinstance(v, (list, dict)) else v
 
@@ -608,11 +675,64 @@ def _insert_one(conn, table, static, field_map, data):
     return 1
 
 
+def _store_prob(conn, city, icao, product_short, resp_key, resp, fetched_at):
+    """Store one row per (product, parameter) from a probabilistic response.
+
+    `data` keeps that parameter's full payload as JSON — lossless. probabilities
+    returns several entries per parameter (one per band); they are grouped into
+    a JSON list. pdf/percentiles/prototypes return a single entry per parameter.
+    """
+    md = resp.get("metadata") or {}
+    fc = resp.get("forecasts1Hour") or {}
+    fcst_valid = json.dumps(fc.get("fcstValid") or [], separators=(",", ":"))
+    by_param = {}
+    for e in fc.get(resp_key) or []:
+        p = e.get("parameter")
+        if p is None:
+            continue
+        by_param.setdefault(p, []).append({k: v for k, v in e.items() if k != "parameter"})
+    if not by_param:
+        return 0
+    meta_vals = [md.get(jk) for jk, _ in PROB_META_FIELDS]
+    cols = (["city", "icao", "units", "hours", "product", "parameter"]
+            + [c for _, c in PROB_META_FIELDS] + ["fcst_valid", "data", "fetched_at"])
+    placeholders = ",".join("?" * len(cols))
+    rows = []
+    for p, items in by_param.items():
+        payload = items[0] if len(items) == 1 else items
+        rows.append([city, icao, TWC_UNITS, PROB_HOURS, product_short, p]
+                    + meta_vals
+                    + [fcst_valid, json.dumps(payload, separators=(",", ":")), fetched_at])
+    conn.executemany(
+        f"INSERT INTO twc_probabilistic ({','.join(cols)}) VALUES ({placeholders})", rows)
+    return len(rows)
+
+
+def collect_prob(conn, city, icao, fetched_at):
+    """Fetch all 4 probabilistic products (each a separate call) for one ICAO."""
+    added = 0
+    for product_short, api_param, resp_key, spec in PROB_PRODUCTS:
+        if _stop.is_set():
+            break
+        resp = _get(f"{TWC_BASE}/wx/forecast/probabilistic", params={
+            "icaoCode": icao, "units": TWC_UNITS, "format": "json",
+            "apiKey": TWC_API_KEY, "hours": str(PROB_HOURS), api_param: spec,
+        }, timeout=60, tries=3)
+        if isinstance(resp, dict) and resp.get("forecasts1Hour"):
+            n = _store_prob(conn, city, icao, product_short, resp_key, resp, fetched_at)
+            added += n
+            _session["src_ok"]["twc_prob"] += 1 if n else 0
+            _session["src_err"]["twc_prob"] += 0 if n else 1
+        else:
+            _session["src_err"]["twc_prob"] += 1
+    return added
+
+
 def collect_twc(targets, fetched_at):
     if not TWC_API_KEY:
         logger.warning("TWC_API_KEY not set — skipping TWC")
-        return 0, 0, 0
-    n_cur = n_hr = n_15 = 0
+        return 0, 0, 0, 0
+    n_cur = n_hr = n_15 = n_prob = 0
     conn = sqlite3.connect(DB_PATH)
     try:
         for t in targets:
@@ -658,13 +778,18 @@ def collect_twc(targets, fetched_at):
                 _session["src_err"]["twc_15min"] += 0 if added else 1
             else:
                 _session["src_err"]["twc_15min"] += 1
+            if _stop.is_set():
+                break
+
+            n_prob += collect_prob(conn, city, icao, fetched_at)
         conn.commit()
     finally:
         conn.close()
     _session["twc_current_rows"] += n_cur
     _session["twc_hourly_rows"] += n_hr
     _session["twc_15min_rows"] += n_15
-    return n_cur, n_hr, n_15
+    _session["twc_prob_rows"] += n_prob
+    return n_cur, n_hr, n_15, n_prob
 
 
 # ------------------------------------------------------------------
@@ -676,14 +801,14 @@ def run_cycle() -> tuple:
     targets = discover_targets()
 
     n_fc, n_obs = collect_nws(targets, fetched_at, today)
-    n_cur, n_hr, n_15 = collect_twc(targets, fetched_at)
+    n_cur, n_hr, n_15, n_prob = collect_twc(targets, fetched_at)
 
     _session["last_cycle_at"] = datetime.now(timezone.utc)
     logger.info(
         f"Cycle: {len(targets)} markets | NWS {n_fc} fc / {n_obs} obs | "
-        f"TWC current={n_cur} hourly={n_hr} 15min={n_15}"
+        f"TWC current={n_cur} hourly={n_hr} 15min={n_15} prob={n_prob}"
     )
-    return targets, n_fc, n_obs, n_cur, n_hr, n_15
+    return targets, n_fc, n_obs, n_cur, n_hr, n_15, n_prob
 
 
 def _log_run_summary(exit_reason: str):
@@ -705,6 +830,7 @@ def _log_run_summary(exit_reason: str):
     logger.info(f"  twc current:    {_session['twc_current_rows']} rows")
     logger.info(f"  twc hourly:     {_session['twc_hourly_rows']} rows")
     logger.info(f"  twc 15-minute:  {_session['twc_15min_rows']} rows")
+    logger.info(f"  twc prob:       {_session['twc_prob_rows']} rows")
     for s in STREAMS:
         logger.info(f"  {s:<14} ok={_session['src_ok'][s]} err={_session['src_err'][s]}")
     logger.info(f"  uptime:         {uptime}")
@@ -713,7 +839,7 @@ def _log_run_summary(exit_reason: str):
         uptime=uptime, reason=exit_reason,
         nws_fc=_session["forecasts_written"], nws_obs=_session["observations_written"],
         twc_cur=_session["twc_current_rows"], twc_hr=_session["twc_hourly_rows"],
-        twc_15=_session["twc_15min_rows"],
+        twc_15=_session["twc_15min_rows"], twc_prob=_session["twc_prob_rows"],
         cycles=_session["cycles"], cycle_errors=_session["cycle_errors"],
     )
 
@@ -731,7 +857,8 @@ def main():
     logger.info("=" * 72)
     logger.info(f"  db path:  {DB_PATH}")
     logger.info(f"  log dir:  {LOG_DIR}")
-    logger.info(f"  streams:  nws (coarse) + twc current/hourly({TWC_HOURLY_DURATION})/15min (ICAO)")
+    logger.info(f"  streams:  nws (coarse) + twc current/hourly({TWC_HOURLY_DURATION})/15min/"
+                f"prob({PROB_HOURS}h,{len(PROB_PARAMS)}params) (ICAO)")
     logger.info(f"  twc key:  {'y' if TWC_API_KEY else 'n'}   (nws=no-key)")
     if not args.once:
         logger.info(f"  cycle every {WEATHER_INTERVAL}s")

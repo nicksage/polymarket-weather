@@ -254,9 +254,42 @@ CREATE TABLE IF NOT EXISTS twc_fifteenminute (
     fetched_at              TEXT NOT NULL
 );
 
+-- Probabilistic hourly forecast by ICAO. One row per (icao, product, parameter)
+-- per poll. `data` holds that parameter's full product payload as JSON, so
+-- every returned number is preserved losslessly:
+--   product='pdf'           -> {"binEdges":[[...]], "binValues":[[...]]}
+--   product='percentiles'   -> {"numPoints":N, "percentilePoints":[...], "percentileValues":[[...]]}
+--   product='probabilities' -> [{"lb":..,"ub":..,"probability":[...]}, ...]  (one per requested band)
+--   product='prototypes'    -> {"forecast":[[...]]}                          (ensemble member traces)
+-- fcst_valid is the JSON array of UNIX hour timestamps the arrays index into.
+CREATE TABLE IF NOT EXISTS twc_probabilistic (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    city          TEXT,
+    icao          TEXT NOT NULL,
+    units         TEXT,
+    hours         INTEGER,   -- forecast horizon requested
+    product       TEXT NOT NULL,   -- pdf | percentiles | probabilities | prototypes
+    parameter     TEXT NOT NULL,   -- temperature, windSpeed, relativeHumidity, ...
+    init_time     INTEGER,
+    proc_time     INTEGER,
+    latitude      REAL,
+    longitude     REAL,
+    elevation     REAL,
+    landuse       REAL,
+    spatial_app   INTEGER,
+    version       TEXT,
+    expires       TEXT,
+    request_id    INTEGER,
+    fcst_valid    TEXT,      -- JSON array of UNIX times (hourly steps)
+    data          TEXT,      -- JSON payload for this (product, parameter)
+    fetched_at    TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_twc_cur_icao
     ON twc_current(icao, fetched_at);
 CREATE INDEX IF NOT EXISTS idx_twc_hr_icao
     ON twc_hourly(icao, valid_time_utc, fetched_at);
 CREATE INDEX IF NOT EXISTS idx_twc_15_icao
     ON twc_fifteenminute(icao, valid_time_local, fetched_at);
+CREATE INDEX IF NOT EXISTS idx_twc_prob
+    ON twc_probabilistic(icao, product, parameter, fetched_at);
