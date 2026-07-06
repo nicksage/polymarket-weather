@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS events (
     event_title    TEXT,
     n_bins         INTEGER,
     discovered_at  TEXT,
+    discovered_at_local TEXT,   -- discovered_at rendered in the city's local time
     resolved       INTEGER DEFAULT 0
 );
 
@@ -34,7 +35,8 @@ CREATE TABLE IF NOT EXISTS price_snapshots (
     yes_price     REAL,
     volume_usd    REAL,
     liquidity_usd REAL,
-    recorded_at   TEXT NOT NULL
+    recorded_at   TEXT NOT NULL,
+    recorded_at_local TEXT   -- recorded_at rendered in the event city's local time
 );
 
 CREATE TABLE IF NOT EXISTS resolutions (
@@ -45,7 +47,8 @@ CREATE TABLE IF NOT EXISTS resolutions (
     winning_contract_id   TEXT,
     winning_range_low     REAL,
     winning_range_high    REAL,
-    resolved_at           TEXT
+    resolved_at           TEXT,
+    resolved_at_local     TEXT   -- resolved_at rendered in the city's local time
 );
 
 CREATE INDEX IF NOT EXISTS idx_price_snap_event
@@ -78,7 +81,8 @@ CREATE TABLE IF NOT EXISTS weather_forecasts (
     precip_prob  REAL,            -- daily max probability of precipitation, 0-100
     humidity     REAL,            -- daily avg relative humidity, 0-100 (if available)
     wind_kph     REAL,            -- daily avg/max wind (if available)
-    fetched_at   TEXT NOT NULL
+    fetched_at   TEXT NOT NULL,
+    fetched_at_local TEXT         -- fetched_at rendered in the city's local time
 );
 
 -- Current observed conditions, one row per (city, source) per poll.
@@ -92,7 +96,8 @@ CREATE TABLE IF NOT EXISTS weather_observations (
     wind_kph     REAL,
     conditions   TEXT,            -- text description, e.g. "Partly Cloudy"
     observed_at  TEXT,            -- API-reported observation time (may differ from fetched_at)
-    fetched_at   TEXT NOT NULL
+    fetched_at   TEXT NOT NULL,
+    fetched_at_local TEXT         -- fetched_at rendered in the city's local time
 );
 
 CREATE INDEX IF NOT EXISTS idx_wx_fc_city_date
@@ -173,7 +178,8 @@ CREATE TABLE IF NOT EXISTS twc_current (
     sunrise_time_utc           INTEGER,
     sunset_time_local          TEXT,
     sunset_time_utc            INTEGER,
-    fetched_at                 TEXT NOT NULL
+    fetched_at                 TEXT NOT NULL,
+    fetched_at_local           TEXT   -- fetched_at rendered in the city's local time
 );
 
 -- Enterprise hourly forecast by ICAO. One row per forecast hour per poll.
@@ -225,7 +231,8 @@ CREATE TABLE IF NOT EXISTS twc_hourly (
     wx_string                  TEXT,
     wx_severity                INTEGER,
     qualifier_set              TEXT,   -- JSON array as returned
-    fetched_at                 TEXT NOT NULL
+    fetched_at                 TEXT NOT NULL,
+    fetched_at_local           TEXT   -- fetched_at rendered in the city's local time
 );
 
 -- 15-minute forecast (next ~7 hours). One row per 15-min period per poll.
@@ -251,7 +258,8 @@ CREATE TABLE IF NOT EXISTS twc_fifteenminute (
     wx_phrase_long          TEXT,
     wx_phrase_short         TEXT,
     wx_severity             INTEGER,
-    fetched_at              TEXT NOT NULL
+    fetched_at              TEXT NOT NULL,
+    fetched_at_local        TEXT   -- fetched_at rendered in the city's local time
 );
 
 -- Probabilistic hourly forecast by ICAO. One row per (icao, product, parameter)
@@ -282,7 +290,8 @@ CREATE TABLE IF NOT EXISTS twc_probabilistic (
     request_id    INTEGER,
     fcst_valid    TEXT,      -- JSON array of UNIX times (hourly steps)
     data          TEXT,      -- JSON payload for this (product, parameter)
-    fetched_at    TEXT NOT NULL
+    fetched_at    TEXT NOT NULL,
+    fetched_at_local TEXT     -- fetched_at rendered in the city's local time
 );
 
 CREATE INDEX IF NOT EXISTS idx_twc_cur_icao

@@ -44,6 +44,7 @@ import httpx
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 from config.env_loader import DB_PATH, LOG_DIR, TWC_API_KEY
+from config.cities import local_iso
 
 LOG_PATH = os.path.join(LOG_DIR, "weather_collector.log")
 ACTIVITY_LOG_PATH = os.path.join(LOG_DIR, "activity.log")
@@ -471,14 +472,14 @@ def _write_nws(fc_rows, obs_rows):
             conn.executemany(
                 """INSERT INTO weather_forecasts
                    (city, source, target_date, lead_days, high_c, low_c, high_f, low_f,
-                    precip_prob, humidity, wind_kph, fetched_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", fc_rows)
+                    precip_prob, humidity, wind_kph, fetched_at, fetched_at_local)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""", fc_rows)
         if obs_rows:
             conn.executemany(
                 """INSERT INTO weather_observations
                    (city, source, temp_c, temp_f, humidity, wind_kph, conditions,
-                    observed_at, fetched_at)
-                   VALUES (?,?,?,?,?,?,?,?,?)""", obs_rows)
+                    observed_at, fetched_at, fetched_at_local)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""", obs_rows)
         conn.commit()
     finally:
         conn.close()
@@ -494,6 +495,7 @@ def collect_nws(targets, fetched_at, today):
         if not (t["is_us"] and t["lat"] is not None):
             continue
         city = t["city"]
+        f_local = local_iso(fetched_at, city)
         try:
             forecasts, obs = fetch_nws(city, t["lat"], t["lon"], today)
         except Exception as e:
@@ -514,14 +516,15 @@ def collect_nws(targets, fetched_at, today):
             fc_rows.append((
                 city, "nws", d, lead,
                 f.get("high_c"), f.get("low_c"), f.get("high_f"), f.get("low_f"),
-                f.get("precip_prob"), f.get("humidity"), f.get("wind_kph"), fetched_at,
+                f.get("precip_prob"), f.get("humidity"), f.get("wind_kph"),
+                fetched_at, f_local,
             ))
             got = True
         if obs:
             obs_rows.append((
                 city, "nws", obs.get("temp_c"), obs.get("temp_f"),
                 obs.get("humidity"), obs.get("wind_kph"), obs.get("conditions"),
-                obs.get("observed_at"), fetched_at,
+                obs.get("observed_at"), fetched_at, f_local,
             ))
             got = True
         _session["src_ok"]["nws" ] += 1 if got else 0
@@ -762,7 +765,7 @@ def _insert_one(conn, table, static, field_map, data):
     return 1
 
 
-def _store_prob(conn, city, icao, product_short, resp_key, resp, fetched_at):
+def _store_prob(conn, city, icao, product_short, resp_key, resp, fetched_at, fetched_at_local):
     """Store one row per (product, parameter) from a probabilistic response.
 
     `data` keeps that parameter's full payload as JSON — lossless. probabilities
@@ -782,20 +785,22 @@ def _store_prob(conn, city, icao, product_short, resp_key, resp, fetched_at):
         return 0
     meta_vals = [md.get(jk) for jk, _ in PROB_META_FIELDS]
     cols = (["city", "icao", "units", "hours", "product", "parameter"]
-            + [c for _, c in PROB_META_FIELDS] + ["fcst_valid", "data", "fetched_at"])
+            + [c for _, c in PROB_META_FIELDS]
+            + ["fcst_valid", "data", "fetched_at", "fetched_at_local"])
     placeholders = ",".join("?" * len(cols))
     rows = []
     for p, items in by_param.items():
         payload = items[0] if len(items) == 1 else items
         rows.append([city, icao, TWC_UNITS, PROB_HOURS, product_short, p]
                     + meta_vals
-                    + [fcst_valid, json.dumps(payload, separators=(",", ":")), fetched_at])
+                    + [fcst_valid, json.dumps(payload, separators=(",", ":")),
+                       fetched_at, fetched_at_local])
     conn.executemany(
         f"INSERT INTO twc_probabilistic ({','.join(cols)}) VALUES ({placeholders})", rows)
     return len(rows)
 
 
-def collect_prob(conn, city, icao, temp_bins, fetched_at):
+def collect_prob(conn, city, icao, temp_bins, fetched_at, fetched_at_local):
     """Fetch all 4 probabilistic products (each a separate call) for one ICAO.
 
     The `probabilities` product requests temperature on this city's live
@@ -814,7 +819,8 @@ def collect_prob(conn, city, icao, temp_bins, fetched_at):
             "apiKey": TWC_API_KEY, "hours": str(PROB_HOURS), api_param: spec,
         }, timeout=60, tries=3)
         if isinstance(resp, dict) and resp.get("forecasts1Hour"):
-            n = _store_prob(conn, city, icao, product_short, resp_key, resp, fetched_at)
+            n = _store_prob(conn, city, icao, product_short, resp_key, resp,
+                            fetched_at, fetched_at_local)
             added += n
             _session["src_ok"]["twc_prob"] += 1 if n else 0
             _session["src_err"]["twc_prob"] += 0 if n else 1
@@ -836,12 +842,14 @@ def collect_twc(targets, fetched_at):
             icao, city = t["icao"], t["city"]
             if not icao:
                 continue
+            f_local = local_iso(fetched_at, city)
             base = {"city": city, "icao": icao, "units": TWC_UNITS}
 
             cur = _twc_get("/wx/observations/current", icao)
             if isinstance(cur, dict) and cur:
                 n_cur += _insert_one(conn, "twc_current",
-                                     {**base, "fetched_at": fetched_at},
+                                     {**base, "fetched_at": fetched_at,
+                                      "fetched_at_local": f_local},
                                      TWC_CURRENT_FIELDS, cur)
                 _session["src_ok"]["twc_current"] += 1
             else:
@@ -853,7 +861,8 @@ def collect_twc(targets, fetched_at):
             if isinstance(hourly, dict) and hourly:
                 added = _insert_series(conn, "twc_hourly",
                                        {**base, "duration": TWC_HOURLY_DURATION,
-                                        "fetched_at": fetched_at},
+                                        "fetched_at": fetched_at,
+                                        "fetched_at_local": f_local},
                                        TWC_HOURLY_FIELDS, hourly)
                 n_hr += added
                 _session["src_ok"]["twc_hourly"] += 1 if added else 0
@@ -866,7 +875,8 @@ def collect_twc(targets, fetched_at):
             fifteen = _twc_get("/wx/forecast/fifteenminute", icao)
             if isinstance(fifteen, dict) and fifteen:
                 added = _insert_series(conn, "twc_fifteenminute",
-                                       {**base, "fetched_at": fetched_at},
+                                       {**base, "fetched_at": fetched_at,
+                                        "fetched_at_local": f_local},
                                        TWC_FIFTEEN_FIELDS, fifteen)
                 n_15 += added
                 _session["src_ok"]["twc_15min"] += 1 if added else 0
@@ -876,7 +886,8 @@ def collect_twc(targets, fetched_at):
             if _stop.is_set():
                 break
 
-            n_prob += collect_prob(conn, city, icao, t.get("temp_bins"), fetched_at)
+            n_prob += collect_prob(conn, city, icao, t.get("temp_bins"),
+                                   fetched_at, f_local)
         conn.commit()
     finally:
         conn.close()

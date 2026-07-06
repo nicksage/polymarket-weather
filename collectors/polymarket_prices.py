@@ -22,6 +22,7 @@ import httpx
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 from config.env_loader import DB_PATH, LOG_DIR
+from config.cities import local_iso
 
 LOG_PATH = os.path.join(LOG_DIR, "polymarket_collector.log")
 ACTIVITY_LOG_PATH = os.path.join(LOG_DIR, "activity.log")
@@ -174,9 +175,9 @@ def discover_events() -> int:
         event_id = str(event.get("id", ""))
         conn.execute(
             """INSERT OR IGNORE INTO events
-               (event_id, city, date, event_title, n_bins, discovered_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (event_id, city, event_date, title, len(markets), now),
+               (event_id, city, date, event_title, n_bins, discovered_at, discovered_at_local)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (event_id, city, event_date, title, len(markets), now, local_iso(now, city)),
         )
         for mkt in markets:
             contract_id = mkt.get("conditionId", "")
@@ -211,6 +212,8 @@ def poll_all_prices():
         event_id = str(event.get("id", ""))
         if not event_id:
             continue
+        cm = re.search(r"temperature in (.+?) on", event.get("title", "") or "", re.IGNORECASE)
+        city = cm.group(1).strip() if cm else None
         for mkt in event.get("markets", []):
             contract_id = mkt.get("conditionId", "")
             if not contract_id:
@@ -229,7 +232,7 @@ def poll_all_prices():
                 continue
             volume = float(mkt.get("volumeNum") or 0)
             liquidity = float(mkt.get("liquidityNum") or 0)
-            rows.append((event_id, contract_id, yes_price, volume, liquidity))
+            rows.append((event_id, contract_id, yes_price, volume, liquidity, city))
     return rows
 
 
@@ -237,12 +240,14 @@ def write_price_snapshots(rows):
     if not rows:
         return 0
     now = datetime.now(timezone.utc).isoformat()
-    full = [(eid, cid, yp, vol, liq, now) for eid, cid, yp, vol, liq in rows]
+    full = [(eid, cid, yp, vol, liq, now, local_iso(now, city))
+            for eid, cid, yp, vol, liq, city in rows]
     conn = sqlite3.connect(DB_PATH)
     conn.executemany(
         """INSERT INTO price_snapshots
-           (event_id, contract_id, yes_price, volume_usd, liquidity_usd, recorded_at)
-           VALUES (?, ?, ?, ?, ?, ?)""", full)
+           (event_id, contract_id, yes_price, volume_usd, liquidity_usd,
+            recorded_at, recorded_at_local)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""", full)
     conn.commit()
     conn.close()
     _session["snapshots_written"] += len(full)
@@ -273,13 +278,15 @@ def check_resolutions() -> int:
         ).fetchone()
         if not winner:
             continue
+        res_now = datetime.now(timezone.utc).isoformat()
         conn.execute(
             """INSERT OR IGNORE INTO resolutions
-               (event_id, city, date, winning_contract_id, winning_range_low, winning_range_high, resolved_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+               (event_id, city, date, winning_contract_id, winning_range_low,
+                winning_range_high, resolved_at, resolved_at_local)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (eid, ev["city"], ev["date"], winner["contract_id"],
              winner["range_low"], winner["range_high"],
-             datetime.now(timezone.utc).isoformat()),
+             res_now, local_iso(res_now, ev["city"])),
         )
         conn.execute("UPDATE events SET resolved = 1 WHERE event_id = ?", (eid,))
         found += 1
