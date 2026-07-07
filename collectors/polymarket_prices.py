@@ -268,16 +268,27 @@ _RES_COLS = [
 TWC_BASE = "https://api.weather.com"
 
 
-def _twc_get(path, params):
-    try:
-        r = httpx.get(f"{TWC_BASE}{path}",
-                      params={**params, "language": "en-US", "format": "json", "apiKey": TWC_API_KEY},
-                      timeout=20)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        logger.warning(f"TWC API error {path}: {e}")
-        return None
+def _twc_get(path, params, tries=4):
+    """GET a TWC endpoint. The historical endpoints return 401 (not 429) when
+    called in a rapid burst, so retry those transient statuses with backoff."""
+    for attempt in range(1, tries + 1):
+        try:
+            r = httpx.get(f"{TWC_BASE}{path}",
+                          params={**params, "language": "en-US", "format": "json",
+                                  "apiKey": TWC_API_KEY},
+                          timeout=20)
+            if r.status_code in (401, 429, 503) and attempt < tries:
+                time.sleep(1.0 * attempt)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            if attempt < tries:
+                time.sleep(1.0 * attempt)
+                continue
+            logger.warning(f"TWC API error {path}: {e}")
+            return None
+    return None
 
 
 def _icao_for(conn, city, event_json):
