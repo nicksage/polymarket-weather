@@ -187,7 +187,7 @@ def main():
     ap = argparse.ArgumentParser(description="Build the daily-max edge table")
     ap.add_argument("--db", default=DB_PATH, help="SQLite DB path (default: env DB_PATH)")
     args = ap.parse_args()
-    con = sqlite3.connect(args.db)
+    con = sqlite3.connect(args.db, timeout=30)
     n_rows, n_events, skipped = build_edge(con)
     con.close()
     print(f"edge: wrote {n_rows} rows across {n_events} events -> {args.db}")
