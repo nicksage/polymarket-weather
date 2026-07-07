@@ -5,6 +5,7 @@ one row per bin per poll to db/main.db.
 Runs as systemd service polymarket-collector.service. Handles SIGTERM/SIGINT
 gracefully so systemctl stop produces clean RUN SUMMARY entries in the log.
 """
+import argparse
 import json
 import logging
 import os
@@ -255,47 +256,182 @@ def write_price_snapshots(rows):
     return len(full)
 
 
-def check_resolutions() -> int:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    past = conn.execute(
-        """SELECT event_id, city, date FROM events
-           WHERE resolved = 0 AND date < date('now')"""
-    ).fetchall()
-    if not past:
-        conn.close()
-        return 0
-    found = 0
-    for ev in past:
-        eid = ev["event_id"]
-        winner = conn.execute(
-            """SELECT ps.contract_id, MAX(ps.yes_price) AS peak,
-                      b.range_low, b.range_high
-               FROM price_snapshots ps JOIN bins b ON ps.contract_id = b.contract_id
-               WHERE ps.event_id = ? AND ps.yes_price >= 0.95
-               GROUP BY ps.contract_id ORDER BY peak DESC LIMIT 1""",
-            (eid,),
-        ).fetchone()
-        if not winner:
+# ------------------------------------------------------------------
+# Resolution: authoritative Polymarket outcome + measured high temp
+# ------------------------------------------------------------------
+_RES_COLS = [
+    "event_id", "city", "date", "winning_contract_id", "winning_range_low",
+    "winning_range_high", "resolved_at", "resolved_at_local", "outcome_source",
+    "actual_high_c", "actual_high_f", "actual_high_obs",
+]
+
+
+def _gamma_winner(event_json):
+    """Winning conditionId from a resolved event, or None if not yet settled.
+    A contract is settled when the event is closed and its Yes outcomePrice==1."""
+    if not event_json or not event_json.get("closed"):
+        return None
+    winners = []
+    for m in event_json.get("markets", []) or []:
+        op = m.get("outcomePrices")
+        if isinstance(op, str):
+            try:
+                op = json.loads(op)
+            except json.JSONDecodeError:
+                continue
+        if not op:
             continue
-        res_now = datetime.now(timezone.utc).isoformat()
-        conn.execute(
-            """INSERT OR IGNORE INTO resolutions
-               (event_id, city, date, winning_contract_id, winning_range_low,
-                winning_range_high, resolved_at, resolved_at_local)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (eid, ev["city"], ev["date"], winner["contract_id"],
-             winner["range_low"], winner["range_high"],
-             res_now, local_iso(res_now, ev["city"])),
-        )
-        conn.execute("UPDATE events SET resolved = 1 WHERE event_id = ?", (eid,))
-        found += 1
-    conn.commit()
-    conn.close()
+        try:
+            yes = float(op[0])
+        except (ValueError, TypeError):
+            continue
+        if yes > 0.99:
+            winners.append(m.get("conditionId"))
+    return winners[0] if len(winners) == 1 else None
+
+
+def _price_winner(conn, event_id):
+    """Fallback: the bin whose price peaked >= 0.95 (highest peak wins)."""
+    return conn.execute(
+        """SELECT ps.contract_id, b.range_low, b.range_high
+           FROM price_snapshots ps JOIN bins b ON ps.contract_id = b.contract_id
+           WHERE ps.event_id = ? AND ps.yes_price >= 0.95
+           GROUP BY ps.contract_id ORDER BY MAX(ps.yes_price) DESC LIMIT 1""",
+        (event_id,)).fetchone()
+
+
+def _bin_range(conn, contract_id):
+    r = conn.execute("SELECT range_low, range_high FROM bins WHERE contract_id = ?",
+                     (contract_id,)).fetchone()
+    return (r["range_low"], r["range_high"]) if r else (None, None)
+
+
+def _measured_high(conn, city, date):
+    """Measured daily high (Celsius) from TWC observations on the resolution
+    local date: the max of the sampled temperature and temperature_max_since_7am
+    (post-7am observations, which capture the peak even if we didn't sample its
+    exact minute). Returns (high_c, high_f, n_obs). (None, None, 0) if no obs."""
+    rows = conn.execute(
+        """SELECT temperature, temperature_max_since_7am, valid_time_local
+           FROM twc_current WHERE city = ? AND substr(valid_time_local,1,10) = ?""",
+        (city, date)).fetchall()
+    if not rows:
+        return (None, None, 0)
+    highs = []
+    for r in rows:
+        if r["temperature"] is not None:
+            highs.append(r["temperature"])
+        ms, vtl = r["temperature_max_since_7am"], r["valid_time_local"]
+        if ms is not None and vtl and len(vtl) >= 13:
+            try:
+                hour = int(vtl[11:13])
+            except ValueError:
+                hour = None
+            if hour is not None and hour >= 7:
+                highs.append(ms)
+    if not highs:
+        return (None, None, len(rows))
+    hc = round(max(highs), 1)
+    return (hc, round(hc * 9 / 5 + 32, 1), len(rows))
+
+
+def _resolve_event(conn, event_id, city, date):
+    """Resolve one event via the authoritative Gamma outcome (primary) or price
+    convergence (fallback). Returns a record dict, or None if not yet resolvable."""
+    contract_id = _gamma_winner(_gamma_get(f"/events/{event_id}", {}))
+    if contract_id:
+        source = "gamma"
+        rl, rh = _bin_range(conn, contract_id)
+    else:
+        w = _price_winner(conn, event_id)
+        if not w:
+            return None
+        contract_id, rl, rh, source = w["contract_id"], w["range_low"], w["range_high"], "price_convergence"
+    hc, hf, nobs = _measured_high(conn, city, date)
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "event_id": event_id, "city": city, "date": date,
+        "winning_contract_id": contract_id, "winning_range_low": rl, "winning_range_high": rh,
+        "resolved_at": now, "resolved_at_local": local_iso(now, city),
+        "outcome_source": source, "actual_high_c": hc, "actual_high_f": hf, "actual_high_obs": nobs,
+    }
+
+
+def _write_resolution(conn, rec, upsert=False):
+    cols = ",".join(_RES_COLS)
+    ph = ",".join("?" * len(_RES_COLS))
+    vals = [rec[c] for c in _RES_COLS]
+    if upsert:
+        setc = ",".join(f"{c}=excluded.{c}" for c in _RES_COLS if c != "event_id")
+        conn.execute(f"INSERT INTO resolutions ({cols}) VALUES ({ph}) "
+                     f"ON CONFLICT(event_id) DO UPDATE SET {setc}", vals)
+    else:
+        conn.execute(f"INSERT OR IGNORE INTO resolutions ({cols}) VALUES ({ph})", vals)
+
+
+def check_resolutions() -> int:
+    """Resolve past events each poll. Also re-checks events still on the
+    price-convergence fallback so they upgrade to the authoritative Gamma
+    outcome (and refresh the measured high) once Polymarket settles them."""
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    found = 0
+    try:
+        events = conn.execute(
+            """SELECT e.event_id, e.city, e.date, e.resolved,
+                      COALESCE(r.outcome_source, '') AS src
+               FROM events e LEFT JOIN resolutions r ON e.event_id = r.event_id
+               WHERE e.date < date('now')
+                 AND (e.resolved = 0 OR r.outcome_source = 'price_convergence')"""
+        ).fetchall()
+        for ev in events:
+            rec = _resolve_event(conn, ev["event_id"], ev["city"], ev["date"])
+            if not rec:
+                continue
+            if ev["src"] == "gamma" and rec["outcome_source"] != "gamma":
+                continue  # never downgrade an authoritative resolution
+            _write_resolution(conn, rec, upsert=True)
+            conn.execute("UPDATE events SET resolved = 1 WHERE event_id = ?", (ev["event_id"],))
+            if not ev["resolved"] or (ev["src"] == "price_convergence"
+                                      and rec["outcome_source"] == "gamma"):
+                found += 1
+                logger.info(f"Resolved {ev['city']} {ev['date']} via {rec['outcome_source']}")
+        conn.commit()
+    finally:
+        conn.close()
     if found:
         _session["resolutions"] += found
-        logger.info(f"Resolved {found} event(s)")
     return found
+
+
+def backfill_resolutions() -> int:
+    """One-time: re-resolve every past event (resolved or not) with the
+    authoritative Gamma outcome + measured high, upserting into resolutions."""
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    n = 0
+    try:
+        past = conn.execute(
+            "SELECT event_id, city, date FROM events WHERE date < date('now') ORDER BY date, city"
+        ).fetchall()
+        logger.info(f"backfill_resolutions: {len(past)} past event(s)")
+        for ev in past:
+            rec = _resolve_event(conn, ev["event_id"], ev["city"], ev["date"])
+            if not rec:
+                logger.info(f"backfill: {ev['city']} {ev['date']} -> UNRESOLVED (no Gamma/price signal)")
+                continue
+            _write_resolution(conn, rec, upsert=True)
+            conn.execute("UPDATE events SET resolved = 1 WHERE event_id = ?", (ev["event_id"],))
+            n += 1
+            logger.info(
+                f"backfill: {ev['city']:<12} {ev['date']} -> {rec['outcome_source']:<16} "
+                f"bin=[{rec['winning_range_low']},{rec['winning_range_high']}] "
+                f"high={rec['actual_high_c']}C (obs={rec['actual_high_obs']})")
+        conn.commit()
+    finally:
+        conn.close()
+    logger.info(f"backfill_resolutions: wrote {n} resolution(s)")
+    return n
 
 
 def _log_run_summary(exit_reason: str):
@@ -326,6 +462,15 @@ def _log_run_summary(exit_reason: str):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Polymarket price collector")
+    parser.add_argument("--backfill-resolutions", action="store_true",
+                        help="Re-resolve all past events via Gamma + measured high, then exit")
+    args = parser.parse_args()
+    if args.backfill_resolutions:
+        n = backfill_resolutions()
+        print(f"backfilled {n} resolution(s)")
+        return
+
     _session["started_at"] = datetime.now(timezone.utc)
     _append_activity_row("START", pid=os.getpid())
     logger.info("=" * 72)

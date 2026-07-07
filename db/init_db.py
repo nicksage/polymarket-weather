@@ -21,6 +21,10 @@ COLUMN_MIGRATIONS = [
     ("twc_hourly",          "fetched_at_local",    "TEXT"),
     ("twc_fifteenminute",   "fetched_at_local",    "TEXT"),
     ("twc_probabilistic",   "fetched_at_local",    "TEXT"),
+    ("resolutions",         "outcome_source",      "TEXT"),
+    ("resolutions",         "actual_high_c",       "REAL"),
+    ("resolutions",         "actual_high_f",       "REAL"),
+    ("resolutions",         "actual_high_obs",     "INTEGER"),
 ]
 
 

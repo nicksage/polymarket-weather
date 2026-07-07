@@ -48,7 +48,11 @@ CREATE TABLE IF NOT EXISTS resolutions (
     winning_range_low     REAL,
     winning_range_high    REAL,
     resolved_at           TEXT,
-    resolved_at_local     TEXT   -- resolved_at rendered in the city's local time
+    resolved_at_local     TEXT,  -- resolved_at rendered in the city's local time
+    outcome_source        TEXT,  -- 'gamma' (settled outcomePrices) | 'price_convergence'
+    actual_high_c         REAL,  -- measured daily high (Celsius) from TWC observations
+    actual_high_f         REAL,
+    actual_high_obs       INTEGER -- number of TWC observations used for the measured high
 );
 
 CREATE INDEX IF NOT EXISTS idx_price_snap_event
