@@ -22,7 +22,7 @@ import httpx
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
-from config.env_loader import DB_PATH, LOG_DIR
+from config.env_loader import DB_PATH, LOG_DIR, TWC_API_KEY
 from config.cities import local_iso
 
 LOG_PATH = os.path.join(LOG_DIR, "polymarket_collector.log")
@@ -262,8 +262,60 @@ def write_price_snapshots(rows):
 _RES_COLS = [
     "event_id", "city", "date", "winning_contract_id", "winning_range_low",
     "winning_range_high", "resolved_at", "resolved_at_local", "outcome_source",
-    "actual_high_c", "actual_high_f", "actual_high_obs",
+    "actual_high_c", "actual_high_f", "actual_high_source", "actual_high_obs",
 ]
+
+TWC_BASE = "https://api.weather.com"
+
+
+def _twc_get(path, params):
+    try:
+        r = httpx.get(f"{TWC_BASE}{path}",
+                      params={**params, "language": "en-US", "format": "json", "apiKey": TWC_API_KEY},
+                      timeout=20)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.warning(f"TWC API error {path}: {e}")
+        return None
+
+
+def _icao_for(conn, city, event_json):
+    """The market's ICAO station — from our TWC data (authoritative, already
+    parsed) or, failing that, parsed from the event's Wunderground resolution URL."""
+    r = conn.execute(
+        "SELECT icao FROM twc_current WHERE city = ? AND icao IS NOT NULL "
+        "ORDER BY fetched_at DESC LIMIT 1", (city,)).fetchone()
+    if r and r["icao"]:
+        return r["icao"]
+    src = (event_json or {}).get("resolutionSource") or ""
+    if not src:
+        for m in (event_json or {}).get("markets", []) or []:
+            mm = re.search(r"https?://\S*wunderground\.com/\S+", m.get("description") or "")
+            if mm:
+                src = mm.group(0)
+                break
+    m = re.search(r"/([A-Z]{4})(?:[/\s\).?]|$)", src)
+    return m.group(1) if m else None
+
+
+def _daily_summary_high(icao, date, unit):
+    """Authoritative measured daily high from TWC's historical daily-summary
+    (temperatureMax) for the resolution date, requested in the market's unit
+    (F for US markets, C otherwise). Returns the native-unit value or None."""
+    if not icao:
+        return None
+    units = "e" if str(unit or "").lower().startswith("f") else "m"
+    data = _twc_get("/v3/wx/conditions/historical/dailysummary/30day",
+                    {"icaoCode": icao, "units": units})
+    if not data:
+        return None
+    vtl = data.get("validTimeLocal") or []
+    tmax = data.get("temperatureMax") or []
+    for i, t in enumerate(vtl):
+        if t and t[:10] == date and i < len(tmax) and tmax[i] is not None:
+            return float(tmax[i])
+    return None
 
 
 def _gamma_winner(event_json):
@@ -338,7 +390,8 @@ def _measured_high(conn, city, date):
 def _resolve_event(conn, event_id, city, date):
     """Resolve one event via the authoritative Gamma outcome (primary) or price
     convergence (fallback). Returns a record dict, or None if not yet resolvable."""
-    contract_id = _gamma_winner(_gamma_get(f"/events/{event_id}", {}))
+    ev = _gamma_get(f"/events/{event_id}", {})
+    contract_id = _gamma_winner(ev)
     if contract_id:
         source = "gamma"
         rl, rh = _bin_range(conn, contract_id)
@@ -347,13 +400,29 @@ def _resolve_event(conn, event_id, city, date):
         if not w:
             return None
         contract_id, rl, rh, source = w["contract_id"], w["range_low"], w["range_high"], "price_convergence"
-    hc, hf, nobs = _measured_high(conn, city, date)
+
+    # Measured daily high: authoritative TWC daily-summary temperatureMax
+    # (requested in the market's unit), falling back to our sampled observations.
+    unit_row = conn.execute("SELECT unit FROM bins WHERE event_id = ? LIMIT 1", (event_id,)).fetchone()
+    unit = (unit_row["unit"] if unit_row else "celsius") or "celsius"
+    high_native = _daily_summary_high(_icao_for(conn, city, ev), date, unit)
+    if high_native is not None:
+        if str(unit).lower().startswith("f"):
+            hf, hc = round(high_native, 1), round((high_native - 32) * 5 / 9, 1)
+        else:
+            hc, hf = round(high_native, 1), round(high_native * 9 / 5 + 32, 1)
+        high_source, nobs = "twc_daily_summary", None
+    else:
+        hc, hf, nobs = _measured_high(conn, city, date)
+        high_source = "twc_observed" if hc is not None else None
+
     now = datetime.now(timezone.utc).isoformat()
     return {
         "event_id": event_id, "city": city, "date": date,
         "winning_contract_id": contract_id, "winning_range_low": rl, "winning_range_high": rh,
         "resolved_at": now, "resolved_at_local": local_iso(now, city),
-        "outcome_source": source, "actual_high_c": hc, "actual_high_f": hf, "actual_high_obs": nobs,
+        "outcome_source": source, "actual_high_c": hc, "actual_high_f": hf,
+        "actual_high_source": high_source, "actual_high_obs": nobs,
     }
 
 
@@ -392,11 +461,11 @@ def check_resolutions() -> int:
                 continue  # never downgrade an authoritative resolution
             _write_resolution(conn, rec, upsert=True)
             conn.execute("UPDATE events SET resolved = 1 WHERE event_id = ?", (ev["event_id"],))
+            conn.commit()  # per event: don't hold the write lock across API calls
             if not ev["resolved"] or (ev["src"] == "price_convergence"
                                       and rec["outcome_source"] == "gamma"):
                 found += 1
                 logger.info(f"Resolved {ev['city']} {ev['date']} via {rec['outcome_source']}")
-        conn.commit()
     finally:
         conn.close()
     if found:
@@ -422,11 +491,12 @@ def backfill_resolutions() -> int:
                 continue
             _write_resolution(conn, rec, upsert=True)
             conn.execute("UPDATE events SET resolved = 1 WHERE event_id = ?", (ev["event_id"],))
+            conn.commit()  # per event: don't hold the write lock across API calls
             n += 1
             logger.info(
                 f"backfill: {ev['city']:<12} {ev['date']} -> {rec['outcome_source']:<16} "
                 f"bin=[{rec['winning_range_low']},{rec['winning_range_high']}] "
-                f"high={rec['actual_high_c']}C (obs={rec['actual_high_obs']})")
+                f"high={rec['actual_high_c']}C/{rec['actual_high_f']}F ({rec['actual_high_source']})")
         conn.commit()
     finally:
         conn.close()

@@ -25,6 +25,7 @@ COLUMN_MIGRATIONS = [
     ("resolutions",         "actual_high_c",       "REAL"),
     ("resolutions",         "actual_high_f",       "REAL"),
     ("resolutions",         "actual_high_obs",     "INTEGER"),
+    ("resolutions",         "actual_high_source",  "TEXT"),
 ]
 
 
