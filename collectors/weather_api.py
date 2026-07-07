@@ -12,7 +12,7 @@ Two data streams:
         - twc_current        current observations by ICAO (48 fields)
         - twc_hourly         enterprise hourly forecast by ICAO (2day, 42 fields)
         - twc_fifteenminute  15-minute forecast, next ~7h by ICAO (17 fields)
-        - twc_probabilistic  probabilistic hourly forecast by ICAO (72h; all 10
+        - twc_probabilistic  probabilistic hourly forecast by ICAO (48h; all 10
                              params x pdf/percentiles/probabilities/prototypes)
       EVERY forecast period and EVERY field is stored on every poll, not just
       the current/most-recent value.
@@ -655,7 +655,7 @@ TWC_FIFTEEN_FIELDS = [
 
 
 # --- Probabilistic hourly forecast config ---------------------------------
-# All 10 supported parameters, all 4 products, 72h horizon. The endpoint
+# All 10 supported parameters, all 4 products, 48h horizon. The endpoint
 # returns nothing unless products are explicitly requested per parameter, and
 # a single all-products request is too large (503), so each product is fetched
 # in its own call. Multiple parameters are separated by ';' in the spec string.
@@ -664,7 +664,7 @@ PROB_PARAMS = [
     "qpf", "qpfSnow", "windSpeed", "windGust", "windDirection",
     "ceiling", "visibility",
 ]
-PROB_HOURS = 72
+PROB_HOURS = 48             # forecast horizon; 48h covers today + tomorrow's markets
 PROB_RESOLUTION = "medium"   # discretePdfs / percentiles bin resolution
 PROB_PROTOTYPE_N = 100        # ensemble member traces per parameter (max 100)
 
@@ -977,23 +977,25 @@ def main():
                 f"prob({PROB_HOURS}h,{len(PROB_PARAMS)}params) (ICAO)")
     logger.info(f"  twc key:  {'y' if TWC_API_KEY else 'n'}   (nws=no-key)")
     if not args.once:
-        logger.info("  cycle aligned to wall clock :00 and :30 (after startup cycle)")
+        logger.info("  cycle aligned to wall clock :00 and :30 (first run at next boundary)")
     _install_signal_handlers()
 
     exit_reason = "unknown"
-    try:
-        run_cycle()
-        _session["cycles"] += 1
-        _session["startup_ok"] = True
-    except Exception as e:
-        logger.exception(f"Startup FAILED: {e}")
-        _log_run_summary("startup_failed")
-        raise
-
     if args.once:
+        try:
+            run_cycle()
+            _session["cycles"] += 1
+            _session["startup_ok"] = True
+        except Exception as e:
+            logger.exception(f"Startup FAILED: {e}")
+            _log_run_summary("startup_failed")
+            raise
         _log_run_summary("once")
         return
 
+    # Loop mode: no immediate startup cycle — the first run fires at the next
+    # aligned :00/:30 boundary, so every stored row lands on the cadence.
+    _session["startup_ok"] = True
     now = time.time()
     next_cycle = _next_aligned(now)
     next_health = now + HEALTH_LOG_INTERVAL
