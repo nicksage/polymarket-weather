@@ -1,6 +1,6 @@
 """
-polymarket_prices.py — Poll Polymarket Gamma REST every 2 min, write
-one row per bin per poll to db/main.db.
+polymarket_prices.py — Poll Polymarket Gamma REST every 15 min (aligned to
+:00/:15/:30/:45), writing one row per bin per poll to db/main.db.
 
 Runs as systemd service polymarket-collector.service. Handles SIGTERM/SIGINT
 gracefully so systemctl stop produces clean RUN SUMMARY entries in the log.
@@ -28,7 +28,7 @@ from config.cities import local_iso
 LOG_PATH = os.path.join(LOG_DIR, "polymarket_collector.log")
 ACTIVITY_LOG_PATH = os.path.join(LOG_DIR, "activity.log")
 GAMMA_BASE = "https://gamma-api.polymarket.com"
-SNAPSHOT_INTERVAL = 120     # 2 minutes
+SNAPSHOT_INTERVAL = 900     # 15 minutes (prices aren't very volatile)
 DISCOVERY_INTERVAL = 14400  # 4 hours
 HEALTH_LOG_INTERVAL = 300   # 5 minutes
 
@@ -542,6 +542,13 @@ def _log_run_summary(exit_reason: str):
     )
 
 
+def _next_aligned(now_ts):
+    """Epoch of the next wall-clock boundary strictly after now_ts. Multiples of
+    SNAPSHOT_INTERVAL (900s) land on :00/:15/:30/:45 (the Unix epoch is aligned
+    to :00:00 UTC and 15 min divides the hour), matching the weather cadence."""
+    return (int(now_ts) // SNAPSHOT_INTERVAL + 1) * SNAPSHOT_INTERVAL
+
+
 def main():
     parser = argparse.ArgumentParser(description="Polymarket price collector")
     parser.add_argument("--backfill-resolutions", action="store_true",
@@ -559,7 +566,8 @@ def main():
     logger.info("=" * 72)
     logger.info(f"  db path:  {DB_PATH}")
     logger.info(f"  log dir:  {LOG_DIR}")
-    logger.info(f"  poll every {SNAPSHOT_INTERVAL}s, discovery every {DISCOVERY_INTERVAL}s")
+    logger.info(f"  poll every {SNAPSHOT_INTERVAL}s aligned to :00/:15/:30/:45, "
+                f"discovery every {DISCOVERY_INTERVAL}s")
     _install_signal_handlers()
 
     exit_reason = "unknown"
@@ -577,7 +585,7 @@ def main():
         raise
 
     now = time.time()
-    next_poll = now + SNAPSHOT_INTERVAL
+    next_poll = _next_aligned(now)
     next_discovery = now + DISCOVERY_INTERVAL
     next_health = now + HEALTH_LOG_INTERVAL
 
@@ -594,7 +602,7 @@ def main():
                 except Exception as e:
                     logger.warning(f"Poll error: {e}")
                     _session["poll_errors"] += 1
-                next_poll = time.time() + SNAPSHOT_INTERVAL
+                next_poll = _next_aligned(time.time())
             if now >= next_discovery:
                 try:
                     discover_events()
