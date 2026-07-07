@@ -888,6 +888,10 @@ def collect_twc(targets, fetched_at):
 
             n_prob += collect_prob(conn, city, icao, t.get("temp_bins"),
                                    fetched_at, f_local)
+            # Commit per city so the single SQLite write lock is released ~51x
+            # per cycle instead of held for the whole ~5-min cycle — otherwise
+            # the price collector's writes fail with "database is locked".
+            conn.commit()
         conn.commit()
     finally:
         conn.close()
